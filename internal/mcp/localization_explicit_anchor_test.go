@@ -4,10 +4,19 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 
+	mcpgo "github.com/mark3labs/mcp-go/mcp"
+	"github.com/stretchr/testify/require"
+	"go.uber.org/zap"
+
+	"github.com/zzet/gortex/internal/config"
 	"github.com/zzet/gortex/internal/graph"
+	"github.com/zzet/gortex/internal/graph/store_sqlite"
+	"github.com/zzet/gortex/internal/indexer"
 	"github.com/zzet/gortex/internal/query"
 	"github.com/zzet/gortex/internal/search/rerank"
 )
@@ -122,6 +131,106 @@ func TestExploreQualifiedMemberSurvivesLongIssueShaping(t *testing.T) {
 	if len(envelope.Evidence) == 0 || envelope.Evidence[0].ID != member.ID || strings.TrimSpace(envelope.Evidence[0].Source) == "" {
 		t.Fatalf("packed evidence = %#v, want qualified member with source first", envelope.Evidence)
 	}
+}
+
+func TestExploreInlineQualifiedMemberPrescribesPackedSource(t *testing.T) {
+	task := `HipChatHandler: Parameter validation/handling. The HipChat API has a limit of 15 characters for the "from" parameter (API docs say "less than 15"). When HipChatHandler is instantiated with a longer name, it should throw an exception or truncate to first 15 characters. Similarly, the message is limited to 10,000 characters, and HipChatHandler::buildContent() should automatically strip longer messages. Need to locate where "from" name is set/validated and where buildContent() builds the message content.`
+	member := &graph.Node{
+		ID: "src/Monolog/Handler/HipChatHandler.php::HipChatHandler.buildContent", Name: "buildContent",
+		Kind: graph.KindMethod, FilePath: "src/Monolog/Handler/HipChatHandler.php", StartLine: 89, EndLine: 101,
+	}
+	targets := []exploreTarget{
+		{node: &graph.Node{ID: "src/Monolog/Logger.php::Logger.API", Name: "API", Kind: graph.KindConstant, FilePath: "src/Monolog/Logger.php", StartLine: 87, EndLine: 87}, source: "const API = 1;"},
+		{node: &graph.Node{ID: "src/Monolog/Handler/HipChatHandler.php::HipChatHandler", Name: "HipChatHandler", Kind: graph.KindType, FilePath: "src/Monolog/Handler/HipChatHandler.php", StartLine: 28, EndLine: 219}, source: "class HipChatHandler extends SocketHandler {}", syntacticAnchor: true},
+		{node: member, source: "private function buildContent($record) { return http_build_query(array('from' => $this->name, 'message' => $record['formatted'])); }", syntacticAnchor: true},
+	}
+	if got := exploreLocalizationExplicitTarget(task, targets); got != member.ID {
+		t.Fatalf("inline explicit target = %q, want %q", got, member.ID)
+	}
+	completion := newLocalizationCompletion(false, member.ID)
+	result, _, _, finalized := buildLocalizationExploreResultForTaskFinalized(completion, task, targets, exploreDefaultBudgetTokens)
+	if result.IsError || finalized.State != localizationStateAnswerReady {
+		t.Fatalf("inline packed completion = %#v, error=%v", finalized, result.IsError)
+	}
+	body, ok := singleTextContent(result)
+	if !ok {
+		t.Fatal("inline packed result has no text content")
+	}
+	var envelope localizationExploreEnvelope
+	if err := json.Unmarshal([]byte(body), &envelope); err != nil {
+		t.Fatalf("decode inline packed result: %v", err)
+	}
+	if len(envelope.Evidence) == 0 || envelope.Evidence[0].ID != member.ID || strings.TrimSpace(envelope.Evidence[0].Source) == "" {
+		t.Fatalf("inline packed evidence = %#v, want qualified member with source first", envelope.Evidence)
+	}
+}
+
+func TestHandleExplorePacksInlineQualifiedMemberSource(t *testing.T) {
+	server, store := newPHPQualifiedMemberServer(t)
+	member := requirePHPFixtureNode(t, store, "HipChatHandler.php", "buildContent", graph.KindMethod)
+	task := `HipChatHandler: Parameter validation/handling. The HipChat API has a limit of 15 characters for the "from" parameter (API docs say "less than 15"). When HipChatHandler is instantiated with a longer name, it should throw an exception or truncate to first 15 characters. Similarly, the message is limited to 10,000 characters, and HipChatHandler::buildContent() should automatically strip longer messages. Need to locate where "from" name is set/validated and where buildContent() builds the message content.`
+	req := mcpgo.CallToolRequest{}
+	req.Params.Name = "explore"
+	req.Params.Arguments = map[string]any{
+		"task": task, "localize": true, "max_symbols": 30, "token_budget": exploreDefaultBudgetTokens,
+	}
+	result, err := server.handleExplore(WithSessionID(context.Background(), "php_qualified_member_contract"), req)
+	require.NoError(t, err)
+	require.False(t, result.IsError)
+	body, ok := singleTextContent(result)
+	require.True(t, ok)
+	var envelope localizationExploreEnvelope
+	require.NoError(t, json.Unmarshal([]byte(body), &envelope), body)
+	require.Equal(t, localizationStateAnswerReady, envelope.Completion.State, body)
+	require.True(t, envelope.Terminal, body)
+	require.NotEmpty(t, envelope.Evidence, body)
+	require.Equal(t, member.ID, envelope.Evidence[0].ID, body)
+	require.Contains(t, envelope.Evidence[0].Source, "http_build_query", body)
+	require.NotEmpty(t, envelope.Files, body)
+	require.NotEmpty(t, envelope.Symbols, body)
+	require.Equal(t, member.FilePath, envelope.Files[0], body)
+	require.Equal(t, member.ID, envelope.Symbols[0], body)
+	requireLocalizationHostContractMatchesVisible(t, result, envelope)
+}
+
+func newPHPQualifiedMemberServer(t *testing.T) (*Server, graph.Store) {
+	t.Helper()
+	root := t.TempDir()
+	handlerDir := filepath.Join(root, "src", "Monolog", "Handler")
+	require.NoError(t, os.MkdirAll(handlerDir, 0o755))
+	handler := `<?php
+namespace Monolog\Handler;
+class HipChatHandler {
+    private $name;
+    public function __construct($token, $room, $name = 'Monolog') {
+        $this->name = $name;
+    }
+    protected function generateDataStream(array $record): string {
+        return $this->buildContent($record);
+    }
+    private function buildContent(array $record): string {
+        $content = array('from' => $this->name, 'message' => $record['formatted']);
+        return http_build_query($content);
+    }
+}
+`
+	logger := `<?php
+namespace Monolog;
+class Logger {
+    const API = 1;
+}
+`
+	require.NoError(t, os.WriteFile(filepath.Join(handlerDir, "HipChatHandler.php"), []byte(handler), 0o644))
+	require.NoError(t, os.WriteFile(filepath.Join(root, "src", "Monolog", "Logger.php"), []byte(logger), 0o644))
+	store, err := store_sqlite.Open(filepath.Join(t.TempDir(), "graph.sqlite"))
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, store.Close()) })
+	cfg := config.Default()
+	idx := indexer.New(store, testRegistry(), cfg.Index, zap.NewNop())
+	_, err = idx.Index(root)
+	require.NoError(t, err)
+	server := NewServer(query.NewEngine(store), store, idx, nil, zap.NewNop(), nil)
+	return server, store
 }
 
 func TestExploreSyntacticAnchorQualifiedMemberDoesNotReuseOwner(t *testing.T) {

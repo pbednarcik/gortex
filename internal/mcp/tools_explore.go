@@ -1226,6 +1226,14 @@ func exploreLocalizationCompletion(
 	if answerReady && !artifactReady && exploreSingleQualifiedImplementation(task, targets) {
 		return newLocalizationSingleResultCompletion()
 	}
+	// A task-explicit symbol remains the stronger contract input. Construct the
+	// exact-read state internally even when ranking is already answer-ready so
+	// the packer can inline that declaration, validate it against the task, and
+	// retire the redundant read. A bare advisory answer would discard the symbol
+	// here and be downgraded to generic recovery after packing the same source.
+	if answerReady && !artifactReady && exactSymbol != "" {
+		answerReady = false
+	}
 	return newLocalizationCompletion(answerReady, exactSymbol)
 }
 
