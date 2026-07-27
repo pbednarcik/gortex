@@ -1268,17 +1268,6 @@ func exploreAnswerReady(task string, targets []exploreTarget) bool {
 		!exploreSyntacticAnchorEvidenceReady(task, targets) && !strongSourceLiteral {
 		return false
 	}
-	if class == rerank.QueryClassConcept {
-		for _, target := range targets {
-			callable := target.node != nil &&
-				(target.node.Kind == graph.KindFunction || target.node.Kind == graph.KindMethod)
-			if callable && strings.TrimSpace(target.source) != "" &&
-				exploreTaskQualifiedSyntacticAnchorMatchesNode(task, target.node) {
-				return true
-			}
-		}
-	}
-
 	// Paths, signatures, and identifier-shaped queries carry explicit anchors.
 	// A shared token is not enough: the ranked head must cover the complete
 	// path, qualified symbol, or signature anchor from the request.

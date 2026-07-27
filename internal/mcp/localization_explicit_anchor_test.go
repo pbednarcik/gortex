@@ -2,6 +2,7 @@ package mcp
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"strings"
 	"testing"
@@ -74,7 +75,7 @@ func TestExploreQualifiedMemberSurvivesLongIssueShaping(t *testing.T) {
 	targets := []exploreTarget{
 		{node: head, source: "const API = 1;"},
 		{node: owner, source: "class HipChatHandler extends SocketHandler {}", syntacticAnchor: true},
-		{node: member, source: "private function buildContent($record) { return $record['formatted']; }", syntacticAnchor: true},
+		{node: member, source: "private function buildContent($record) { return http_build_query(array('from' => $this->name, 'message' => $record['formatted'])); }", syntacticAnchor: true},
 	}
 	shaped := shapeExploreQuery(task)
 	if exploreLocalizationExplicitAnchor(shaped, member) {
@@ -86,8 +87,8 @@ func TestExploreQualifiedMemberSurvivesLongIssueShaping(t *testing.T) {
 	if got := exploreLocalizationExplicitTarget(task, targets); got != member.ID {
 		t.Fatalf("explicit target = %q, want %q", got, member.ID)
 	}
-	if !exploreAnswerReady(task, targets) {
-		t.Fatal("hydrated exact qualified member did not make localization answer-ready")
+	if exploreAnswerReady(task, targets) {
+		t.Fatal("raw late anchor bypassed the serialized source-proof requirement")
 	}
 	draft := exploreAnswerDraft(task, targets)
 	if len(draft) == 0 || draft[0].node == nil || draft[0].node.ID != member.ID || !draft[0].exact {
@@ -100,6 +101,26 @@ func TestExploreQualifiedMemberSurvivesLongIssueShaping(t *testing.T) {
 	evidence := localizationEvidenceTargetsFromDraft(task, "", targets, draft)
 	if len(evidence) == 0 || evidence[0].node == nil || evidence[0].node.ID != member.ID {
 		t.Fatalf("evidence head = %#v, want qualified member", evidence)
+	}
+
+	completion := newLocalizationCompletion(false, member.ID)
+	result, _, _, finalized := buildLocalizationExploreResultForTaskFinalized(completion, task, targets, exploreDefaultBudgetTokens)
+	if result.IsError {
+		t.Fatalf("packed exact-member result failed: %#v", result)
+	}
+	if finalized.State != localizationStateAnswerReady {
+		t.Fatalf("packed completion = %#v, want answer_ready after visible source proof", finalized)
+	}
+	body, ok := singleTextContent(result)
+	if !ok {
+		t.Fatal("packed result has no text content")
+	}
+	var envelope localizationExploreEnvelope
+	if err := json.Unmarshal([]byte(body), &envelope); err != nil {
+		t.Fatalf("decode packed result: %v", err)
+	}
+	if len(envelope.Evidence) == 0 || envelope.Evidence[0].ID != member.ID || strings.TrimSpace(envelope.Evidence[0].Source) == "" {
+		t.Fatalf("packed evidence = %#v, want qualified member with source first", envelope.Evidence)
 	}
 }
 
