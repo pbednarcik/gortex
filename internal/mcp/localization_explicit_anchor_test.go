@@ -33,8 +33,8 @@ func TestExploreSyntacticAnchorsPreserveQualifiedMemberAlongsideOwner(t *testing
 	if anchors[0].compact != "hipchathandler" || anchors[1].compact != "hipchathandlerbuildcontent" {
 		t.Fatalf("anchor compacts = [%s, %s], want owner then qualified member", anchors[0].compact, anchors[1].compact)
 	}
-	if anchors[1].query != "build content build_content buildcontent" {
-		t.Fatalf("qualified member lookup = %q, want terminal member terms", anchors[1].query)
+	if anchors[1].query != "buildContent" {
+		t.Fatalf("qualified member lookup = %q, want literal terminal member", anchors[1].query)
 	}
 }
 
