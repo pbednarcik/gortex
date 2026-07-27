@@ -35,6 +35,29 @@ func TestExploreSyntacticAnchorsPreserveQualifiedMemberAlongsideOwner(t *testing
 	}
 }
 
+func TestExploreSyntacticAnchorQualifiedMemberDoesNotReuseOwner(t *testing.T) {
+	anchors := exploreSyntacticAnchors(`Find HipChatHandler and HipChatHandler::buildContent()`)
+	if len(anchors) != 2 {
+		t.Fatalf("anchors = %#v, want owner and qualified member", anchors)
+	}
+	owner := &rerank.Candidate{Node: &graph.Node{
+		ID: "HipChatHandler.php::HipChatHandler", Name: "HipChatHandler",
+		QualName: "Monolog.Handler.HipChatHandler", Kind: graph.KindType,
+	}}
+	member := &rerank.Candidate{Node: &graph.Node{
+		ID: "HipChatHandler.php::HipChatHandler.buildContent", Name: "buildContent",
+		QualName: "Monolog.Handler.HipChatHandler.buildContent", Kind: graph.KindMethod,
+	}}
+	candidates := []*rerank.Candidate{owner, member}
+	if got := exploreSyntacticAnchorReusesProtected(anchors[0], candidates, map[string]struct{}{owner.Node.ID: {}}); got != owner.Node.ID {
+		t.Fatalf("owner reuse = %q, want %q", got, owner.Node.ID)
+	}
+	used := map[string]struct{}{owner.Node.ID: {}, member.Node.ID: {}}
+	if got := exploreSyntacticAnchorReusesProtected(anchors[1], candidates, used); got != member.Node.ID {
+		t.Fatalf("qualified member reuse = %q, want %q instead of owner", got, member.Node.ID)
+	}
+}
+
 func TestExploreSourceRangeSpecsPairPathsWithFollowingLines(t *testing.T) {
 	task := `monolog/src/Monolog/Handler/FingersCrossedHandler.php
 		Lines 185 to 187

@@ -735,8 +735,12 @@ func exploreSyntacticAnchorReusesProtected(
 	candidates []*rerank.Candidate,
 	usedIDs map[string]struct{},
 ) string {
+	qualifiedMember := strings.Contains(anchor.source, "::")
 	for _, candidate := range candidates {
 		if candidate == nil || candidate.Node == nil {
+			continue
+		}
+		if qualifiedMember && (candidate.Node.Kind == graph.KindType || candidate.Node.Kind == graph.KindInterface) {
 			continue
 		}
 		if _, used := usedIDs[candidate.Node.ID]; used && exploreSyntacticAnchorMatchesNode(anchor, candidate.Node) {
