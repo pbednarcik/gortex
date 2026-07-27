@@ -127,9 +127,22 @@ func newExploreSyntacticAnchor(raw string) (exploreSyntacticAnchor, bool) {
 	if len(compact) < 4 || exploreSyntacticAnchorNoise(compact) {
 		return exploreSyntacticAnchor{}, false
 	}
-	queryTerms := append([]string(nil), terms...)
-	if len(terms) > 1 {
-		queryTerms = append(queryTerms, strings.Join(terms, "_"), compact)
+	lookupTerms := terms
+	if separator := strings.LastIndex(raw, "::"); separator >= 0 && separator+2 < len(raw) {
+		memberTerms := make([]string, 0, 3)
+		for _, token := range rerank.Tokenize(raw[separator+2:]) {
+			term := strings.ToLower(strings.TrimSpace(token))
+			if len(term) >= 3 {
+				memberTerms = append(memberTerms, term)
+			}
+		}
+		if len(memberTerms) > 0 {
+			lookupTerms = memberTerms
+		}
+	}
+	queryTerms := append([]string(nil), lookupTerms...)
+	if len(lookupTerms) > 1 {
+		queryTerms = append(queryTerms, strings.Join(lookupTerms, "_"), strings.Join(lookupTerms, ""))
 	}
 	return exploreSyntacticAnchor{
 		query:   strings.Join(queryTerms, " "),
