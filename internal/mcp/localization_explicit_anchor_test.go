@@ -23,6 +23,16 @@ func TestExploreSyntacticAnchorsDoNotSpendBudgetOnHTTPRouteMethods(t *testing.T)
 	}
 }
 
+func TestExploreSyntacticAnchorsPreserveQualifiedMemberAlongsideOwner(t *testing.T) {
+	anchors := exploreSyntacticAnchors(`Find HipChatHandler and HipChatHandler::buildContent()`)
+	if len(anchors) != 2 {
+		t.Fatalf("anchors = %#v, want owner and qualified member", anchors)
+	}
+	if anchors[0].compact != "hipchathandler" || anchors[1].compact != "hipchathandlerbuildcontent" {
+		t.Fatalf("anchor compacts = [%s, %s], want owner then qualified member", anchors[0].compact, anchors[1].compact)
+	}
+}
+
 func TestExploreSyntacticAnchorsCollapseAssignedAndBareFlags(t *testing.T) {
 	anchors := exploreSyntacticAnchors(`rg panic caused by --replace, --multiline, a particular pattern, and search text containing repeats and newlines. Panic message: "slice index starts at x but ends at y" where x and y are integers and y < x. Reproduction: rg "(^|[^a-z])((([a-z]+)?)\s)?b(\s([a-z]+)?)($|[^a-z])" --replace=x --multiline lines2.txt where lines2.txt contains " b b b b b b b b\nc". Also reproduces with lines5.txt containing " b\nb\nb\nb\nc". Bug is very sensitive to exact pattern and text.`)
 	if len(anchors) != 2 {

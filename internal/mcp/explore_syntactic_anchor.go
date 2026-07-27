@@ -149,6 +149,21 @@ func exploreSyntacticAnchorEquivalent(left, right exploreSyntacticAnchor) bool {
 	if left.compact == right.compact {
 		return true
 	}
+	leftQualified := strings.Contains(left.source, "::")
+	rightQualified := strings.Contains(right.source, "::")
+	if leftQualified != rightQualified {
+		qualified, plain := left, right
+		if !leftQualified {
+			qualified, plain = right, left
+		}
+		// An explicitly qualified member is complementary to its owner, not a
+		// spelling variant of it. Keep both retrieval lanes so a task naming
+		// HipChatHandler and HipChatHandler::buildContent can surface the class
+		// context and the requested method independently.
+		if strings.HasPrefix(qualified.compact, plain.compact) {
+			return false
+		}
+	}
 	shorter, longer := left.compact, right.compact
 	if len(shorter) > len(longer) {
 		shorter, longer = longer, shorter
