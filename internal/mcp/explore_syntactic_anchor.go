@@ -759,11 +759,12 @@ func exploreSyntacticAnchorReusesProtected(
 	return ""
 }
 
-// exploreExactQualifiedAnchorCandidate resolves the parser's exact Owner.member
-// graph name before the bounded lexical lane. Some backends exhaust that lane
-// before its exact-name fallback runs; this lookup is restricted to explicit
-// Owner::member task syntax and still applies session, query, kind, and diversity
-// filters through the ordinary anchor selector.
+// exploreExactQualifiedAnchorCandidate resolves the parser's exact member name
+// before the bounded lexical lane. Graph nodes commonly store only the terminal
+// method Name while the ID tail carries Owner.member, so query both exact forms.
+// This lookup is restricted to explicit Owner::member task syntax and still
+// applies session, query, kind, and diversity filters through the ordinary
+// anchor selector.
 func (s *Server) exploreExactQualifiedAnchorCandidate(
 	ctx context.Context,
 	anchor exploreSyntacticAnchor,
@@ -773,13 +774,26 @@ func (s *Server) exploreExactQualifiedAnchorCandidate(
 	if s == nil || s.graph == nil || anchor.qualifiedName == "" || ctx.Err() != nil {
 		return nil
 	}
-	nodes := s.graph.FindNodesByName(anchor.qualifiedName)
-	candidates := make([]*rerank.Candidate, 0, min(len(nodes), exploreSyntacticAnchorFetch))
-	for _, node := range nodes {
-		if node == nil || !s.nodeInSessionScope(ctx, node) {
-			continue
+	names := []string{anchor.qualifiedName}
+	if dot := strings.LastIndexByte(anchor.qualifiedName, '.'); dot >= 0 && dot < len(anchor.qualifiedName)-1 {
+		names = []string{anchor.qualifiedName[dot+1:], anchor.qualifiedName}
+	}
+	candidates := make([]*rerank.Candidate, 0, exploreSyntacticAnchorFetch)
+	seen := make(map[string]struct{}, exploreSyntacticAnchorFetch)
+	for _, name := range names {
+		for _, node := range s.graph.FindNodesByName(name) {
+			if node == nil || !s.nodeInSessionScope(ctx, node) {
+				continue
+			}
+			if _, duplicate := seen[node.ID]; duplicate {
+				continue
+			}
+			seen[node.ID] = struct{}{}
+			candidates = append(candidates, &rerank.Candidate{Node: node, VectorRank: -1})
+			if len(candidates) == exploreSyntacticAnchorFetch {
+				break
+			}
 		}
-		candidates = append(candidates, &rerank.Candidate{Node: node, VectorRank: -1})
 		if len(candidates) == exploreSyntacticAnchorFetch {
 			break
 		}

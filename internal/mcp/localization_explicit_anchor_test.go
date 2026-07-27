@@ -41,6 +41,19 @@ func TestExploreSyntacticAnchorsPreserveQualifiedMemberAlongsideOwner(t *testing
 	}
 }
 
+func TestExploreSyntacticAnchorsKeepQualifiedMemberInLongIssue(t *testing.T) {
+	anchors := exploreSyntacticAnchors(`Title: HipChatHandler: Parameter validation/handling
+The HipChat API at https://www.hipchat.com/docs/api/method/rooms/message limits the from parameter.
+When a HipChatHandler is instantiated with a longer name it should fail.
+Similarly, strip longer messages within HipChatHandler::buildContent().`)
+	for _, anchor := range anchors {
+		if anchor.qualifiedName == "HipChatHandler.buildContent" {
+			return
+		}
+	}
+	t.Fatalf("anchors = %#v, qualified member was displaced from bounded issue anchors", anchors)
+}
+
 func TestExploreSyntacticAnchorQualifiedMemberDoesNotReuseOwner(t *testing.T) {
 	anchors := exploreSyntacticAnchors(`Find HipChatHandler and HipChatHandler::buildContent()`)
 	if len(anchors) != 2 {
@@ -82,7 +95,7 @@ func TestExploreExactQualifiedAnchorCandidateFindsParserName(t *testing.T) {
 	g := graph.New()
 	member := &graph.Node{
 		ID:   "src/Monolog/Handler/HipChatHandler.php::HipChatHandler.buildContent",
-		Name: "HipChatHandler.buildContent", Kind: graph.KindMethod,
+		Name: "buildContent", Kind: graph.KindMethod,
 		FilePath: "src/Monolog/Handler/HipChatHandler.php", StartLine: 89,
 	}
 	g.AddNode(member)
