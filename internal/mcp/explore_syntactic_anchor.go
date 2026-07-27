@@ -132,10 +132,8 @@ func newExploreSyntacticAnchor(raw string) (exploreSyntacticAnchor, bool) {
 		queryTerms = append(queryTerms, strings.Join(terms, "_"), compact)
 	}
 	query := strings.Join(queryTerms, " ")
-	if separator := strings.LastIndex(raw, "::"); separator >= 0 && separator+2 < len(raw) {
-		if member := strings.TrimSpace(raw[separator+2:]); member != "" {
-			query = member
-		}
+	if strings.Contains(raw, "::") {
+		query = strings.Join(strings.Fields(strings.ReplaceAll(raw, "::", " ")), " ")
 	}
 	return exploreSyntacticAnchor{
 		query:   query,
