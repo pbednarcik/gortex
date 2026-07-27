@@ -549,6 +549,7 @@ func exploreSyntacticAnchorMatchesNode(anchor exploreSyntacticAnchor, node *grap
 	}
 	return exploreSyntacticAnchorMatchesIdentifier(anchor, node.Name) ||
 		exploreSyntacticAnchorMatchesIdentifier(anchor, node.QualName) ||
+		(strings.Contains(anchor.source, "::") && exploreSyntacticAnchorMatchesIdentifier(anchor, node.ID)) ||
 		exploreSyntacticAnchorMatchesPath(anchor, node)
 }
 

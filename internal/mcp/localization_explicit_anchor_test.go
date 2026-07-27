@@ -49,8 +49,18 @@ func TestExploreSyntacticAnchorQualifiedMemberDoesNotReuseOwner(t *testing.T) {
 	}}
 	member := &rerank.Candidate{Node: &graph.Node{
 		ID: "HipChatHandler.php::HipChatHandler.buildContent", Name: "buildContent",
-		QualName: "Monolog.Handler.HipChatHandler.buildContent", Kind: graph.KindMethod,
+		Kind: graph.KindMethod,
 	}}
+	wrongOwner := &graph.Node{
+		ID: "OtherHandler.php::OtherHandler.buildContent", Name: "buildContent",
+		Kind: graph.KindMethod,
+	}
+	if !exploreSyntacticAnchorMatchesNode(anchors[1], member.Node) {
+		t.Fatal("qualified member did not match its parser ID when QualName was empty")
+	}
+	if exploreSyntacticAnchorMatchesNode(anchors[1], wrongOwner) {
+		t.Fatal("qualified member matched the same method name under a different owner")
+	}
 	candidates := []*rerank.Candidate{owner, member}
 	if got := exploreSyntacticAnchorReusesProtected(anchors[0], candidates, map[string]struct{}{owner.Node.ID: {}}); got != owner.Node.ID {
 		t.Fatalf("owner reuse = %q, want %q", got, owner.Node.ID)
