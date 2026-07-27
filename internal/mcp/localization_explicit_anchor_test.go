@@ -36,6 +36,9 @@ func TestExploreSyntacticAnchorsPreserveQualifiedMemberAlongsideOwner(t *testing
 	if anchors[1].query != "HipChatHandler buildContent" {
 		t.Fatalf("qualified member lookup = %q, want literal owner and member", anchors[1].query)
 	}
+	if anchors[1].qualifiedName != "HipChatHandler.buildContent" {
+		t.Fatalf("qualified graph name = %q, want parser owner.member name", anchors[1].qualifiedName)
+	}
 }
 
 func TestExploreSyntacticAnchorQualifiedMemberDoesNotReuseOwner(t *testing.T) {
@@ -48,7 +51,7 @@ func TestExploreSyntacticAnchorQualifiedMemberDoesNotReuseOwner(t *testing.T) {
 		QualName: "Monolog.Handler.HipChatHandler", Kind: graph.KindType,
 	}}
 	member := &rerank.Candidate{Node: &graph.Node{
-		ID: "HipChatHandler.php::HipChatHandler.buildContent", Name: "buildContent",
+		ID: "HipChatHandler.php::HipChatHandler.buildContent", Name: "HipChatHandler.buildContent",
 		Kind: graph.KindMethod,
 	}}
 	wrongOwner := &graph.Node{
@@ -68,6 +71,36 @@ func TestExploreSyntacticAnchorQualifiedMemberDoesNotReuseOwner(t *testing.T) {
 	used := map[string]struct{}{owner.Node.ID: {}, member.Node.ID: {}}
 	if got := exploreSyntacticAnchorReusesProtected(anchors[1], candidates, used); got != member.Node.ID {
 		t.Fatalf("qualified member reuse = %q, want %q instead of owner", got, member.Node.ID)
+	}
+}
+
+func TestExploreExactQualifiedAnchorCandidateFindsParserName(t *testing.T) {
+	anchors := exploreSyntacticAnchors(`Find HipChatHandler and HipChatHandler::buildContent()`)
+	if len(anchors) != 2 {
+		t.Fatalf("anchors = %#v, want owner and qualified member", anchors)
+	}
+	g := graph.New()
+	member := &graph.Node{
+		ID:   "src/Monolog/Handler/HipChatHandler.php::HipChatHandler.buildContent",
+		Name: "HipChatHandler.buildContent", Kind: graph.KindMethod,
+		FilePath: "src/Monolog/Handler/HipChatHandler.php", StartLine: 89,
+	}
+	g.AddNode(member)
+	g.AddNode(&graph.Node{
+		ID:   "src/Monolog/Handler/OtherHandler.php::OtherHandler.buildContent",
+		Name: "OtherHandler.buildContent", Kind: graph.KindMethod,
+		FilePath: "src/Monolog/Handler/OtherHandler.php", StartLine: 42,
+	})
+	server := &Server{graph: g}
+	got := server.exploreExactQualifiedAnchorCandidate(
+		context.Background(), anchors[1], query.QueryOptions{},
+		map[string]struct{}{}, map[string]struct{}{},
+	)
+	if got == nil || got.Node == nil {
+		t.Fatal("exact qualified lookup returned no candidate")
+	}
+	if got.Node.ID != member.ID {
+		t.Fatalf("exact qualified lookup = %q, want %q", got.Node.ID, member.ID)
 	}
 }
 

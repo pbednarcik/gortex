@@ -25,10 +25,11 @@ const (
 // prose query shaping poorly, but often name the missing implementation more
 // precisely than the surrounding natural language.
 type exploreSyntacticAnchor struct {
-	query   string
-	source  string
-	terms   []string
-	compact string
+	query         string
+	source        string
+	terms         []string
+	compact       string
+	qualifiedName string
 }
 
 // exploreSyntacticAnchors extracts only syntactically strong, unquoted clues.
@@ -132,14 +133,17 @@ func newExploreSyntacticAnchor(raw string) (exploreSyntacticAnchor, bool) {
 		queryTerms = append(queryTerms, strings.Join(terms, "_"), compact)
 	}
 	query := strings.Join(queryTerms, " ")
+	qualifiedName := ""
 	if strings.Contains(raw, "::") {
 		query = strings.Join(strings.Fields(strings.ReplaceAll(raw, "::", " ")), " ")
+		qualifiedName = strings.ReplaceAll(strings.Join(strings.Fields(raw), ""), "::", ".")
 	}
 	return exploreSyntacticAnchor{
-		query:   query,
-		source:  strings.ToLower(raw),
-		terms:   terms,
-		compact: compact,
+		query:         query,
+		source:        strings.ToLower(raw),
+		terms:         terms,
+		compact:       compact,
+		qualifiedName: qualifiedName,
 	}, true
 }
 
@@ -755,6 +759,34 @@ func exploreSyntacticAnchorReusesProtected(
 	return ""
 }
 
+// exploreExactQualifiedAnchorCandidate resolves the parser's exact Owner.member
+// graph name before the bounded lexical lane. Some backends exhaust that lane
+// before its exact-name fallback runs; this lookup is restricted to explicit
+// Owner::member task syntax and still applies session, query, kind, and diversity
+// filters through the ordinary anchor selector.
+func (s *Server) exploreExactQualifiedAnchorCandidate(
+	ctx context.Context,
+	anchor exploreSyntacticAnchor,
+	scope query.QueryOptions,
+	usedIDs, usedFiles map[string]struct{},
+) *rerank.Candidate {
+	if s == nil || s.graph == nil || anchor.qualifiedName == "" || ctx.Err() != nil {
+		return nil
+	}
+	nodes := s.graph.FindNodesByName(anchor.qualifiedName)
+	candidates := make([]*rerank.Candidate, 0, min(len(nodes), exploreSyntacticAnchorFetch))
+	for _, node := range nodes {
+		if node == nil || !s.nodeInSessionScope(ctx, node) {
+			continue
+		}
+		candidates = append(candidates, &rerank.Candidate{Node: node, VectorRank: -1})
+		if len(candidates) == exploreSyntacticAnchorFetch {
+			break
+		}
+	}
+	return exploreSyntacticAnchorCandidate(anchor, candidates, scope, usedIDs, usedFiles)
+}
+
 // gatherExploreSyntacticAnchorCandidates performs a tiny lexical retrieval for
 // each anchor not represented by the ordinary over-fetch pool. Only after that
 // identifier lane misses do we invoke the existing request-local source scan.
@@ -818,6 +850,20 @@ func (s *Server) gatherExploreSyntacticAnchorCandidates(
 		}
 		if reused != "" {
 			protected[index] = reused
+			continue
+		}
+		if exactCandidate := s.exploreExactQualifiedAnchorCandidate(ctx, anchor, scope, usedIDs, usedFiles); exactCandidate != nil {
+			protectedCandidate := exactCandidate
+			for _, existing := range ordinary {
+				if existing != nil && existing.Node != nil && existing.Node.ID == exactCandidate.Node.ID {
+					protectedCandidate = existing
+					break
+				}
+			}
+			if protectedCandidate == exactCandidate {
+				additions = append(additions, exactCandidate)
+			}
+			addProtected(index, protectedCandidate)
 			continue
 		}
 		ordinaryCandidate := exploreSyntacticAnchorCandidate(anchor, ordinary, scope, usedIDs, usedFiles)
