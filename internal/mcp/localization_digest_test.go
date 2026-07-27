@@ -68,6 +68,29 @@ func requireLocalizationTerminalError(t *testing.T, result *mcpgo.CallToolResult
 	return contract
 }
 
+func TestLocalizationTerminalWordingRequiresConcreteMissingArtifact(t *testing.T) {
+	texts := map[string]string{
+		"answer instruction":  localizationAnswerReadyInstruction,
+		"answer directive":    localizationAnswerReadyDirective,
+		"bounded instruction": localizationBoundedConclusionInstruction,
+		"bounded directive":   localizationBoundedConclusionDirective,
+	}
+	for name, text := range texts {
+		t.Run(name, func(t *testing.T) {
+			if !strings.Contains(text, localizationAdvisorySelfCheck) {
+				t.Fatalf("terminal wording omitted advisory self-check: %q", text)
+			}
+			if !strings.Contains(text, "name a concrete requested file or symbol missing from EVIDENCE") ||
+				!strings.Contains(text, "wanting more context is not a missing artifact") {
+				t.Fatalf("terminal wording omitted the concrete missing-artifact test: %q", text)
+			}
+			if !strings.Contains(text, "On a broader coding task") || !strings.Contains(text, "all tools remain available") {
+				t.Fatalf("terminal wording no longer keeps broader coding work open: %q", text)
+			}
+		})
+	}
+}
+
 func requireLocalizationTerminalReplay(t *testing.T, result *mcpgo.CallToolResult, _, _ string) localizationTerminalContract {
 	t.Helper()
 	if result == nil || result.IsError {
