@@ -2735,6 +2735,10 @@ func (s *Server) handleExplore(ctx context.Context, req mcp.CallToolRequest) (*m
 			ranked = mergeExploreCandidates(ranked, anchorCandidates, fetch)
 		}
 	}
+	// Exact source citations in issue bodies are stronger than semantic ranking:
+	// map each bounded file/line range to its smallest enclosing declaration and
+	// place those task-spelled candidates at the head before final selection.
+	ranked = s.promoteExploreSourceRangeCandidates(ctx, task, ranked, opts)
 	// Resilience ladder: a warm-restarted daemon can transiently return an
 	// empty scoped ranked result (workspace stamps not yet backfilled, or
 	// search bundles served before their node payloads re-materialise)

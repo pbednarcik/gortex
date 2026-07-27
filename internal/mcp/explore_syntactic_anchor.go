@@ -2,6 +2,9 @@ package mcp
 
 import (
 	"context"
+	"path/filepath"
+	"regexp"
+	"strconv"
 	"strings"
 	"unicode"
 	"unicode/utf8"
@@ -204,6 +207,224 @@ func exploreUnquotedCodeTokens(task string) []string {
 	return strings.FieldsFunc(masked.String(), func(r rune) bool {
 		return !unicode.IsLetter(r) && !unicode.IsDigit(r) && r != '_' && r != '.' && r != ':' && r != '-'
 	})
+}
+
+const (
+	exploreSourceRangeMaxAnchors  = 4
+	exploreSourceRangeContextSize = 320
+	exploreSourceRangeMaxSpan     = 512
+)
+
+var (
+	exploreSourceRangeLineRE   = regexp.MustCompile(`(?i)\blines?\s+([0-9]{1,8})(?:\s+(?:to|-)\s+([0-9]{1,8}))?`)
+	exploreSourceRangeInlineRE = regexp.MustCompile(`^\s*:([0-9]{1,8})(?:-([0-9]{1,8}))?`)
+)
+
+// exploreSourceRangeSpecs pairs an explicit source path with the line citation
+// immediately following it. GitHub issue bodies render these as a path and a
+// later "Lines X to Y" fragment; stack traces commonly use path:line instead.
+// Both shapes are bounded and ignored unless the path has a source extension.
+func exploreSourceRangeSpecs(task string) []rangeSpec {
+	matches := exploreArtifactPathRE.FindAllStringIndex(task, -1)
+	if len(matches) == 0 {
+		return nil
+	}
+	seen := make(map[string]struct{}, exploreSourceRangeMaxAnchors)
+	out := make([]rangeSpec, 0, exploreSourceRangeMaxAnchors)
+	for index, match := range matches {
+		path := strings.Trim(task[match[0]:match[1]], "`'\"()[]{}<>,;")
+		normalizedPath := strings.ReplaceAll(path, "\\", "/")
+		if !exploreSourceExtension(filepath.Ext(normalizedPath)) {
+			continue
+		}
+		tailEnd := len(task)
+		if index+1 < len(matches) {
+			tailEnd = matches[index+1][0]
+		}
+		if limit := match[1] + exploreSourceRangeContextSize; tailEnd > limit {
+			tailEnd = limit
+		}
+		start, end, ok := exploreSourceRangeLines(task[match[1]:tailEnd])
+		if !ok {
+			continue
+		}
+		key := strings.ToLower(normalizedPath) + ":" + strconv.Itoa(start) + "-" + strconv.Itoa(end)
+		if _, duplicate := seen[key]; duplicate {
+			continue
+		}
+		seen[key] = struct{}{}
+		out = append(out, rangeSpec{File: path, StartLine: start, EndLine: end})
+		if len(out) == exploreSourceRangeMaxAnchors {
+			break
+		}
+	}
+	return out
+}
+
+func exploreSourceRangeLines(tail string) (int, int, bool) {
+	match := exploreSourceRangeInlineRE.FindStringSubmatch(tail)
+	if match == nil {
+		match = exploreSourceRangeLineRE.FindStringSubmatch(tail)
+	}
+	if len(match) < 2 {
+		return 0, 0, false
+	}
+	start, err := strconv.Atoi(match[1])
+	if err != nil || start <= 0 {
+		return 0, 0, false
+	}
+	end := start
+	if len(match) > 2 && match[2] != "" {
+		if parsed, parseErr := strconv.Atoi(match[2]); parseErr == nil && parsed >= start {
+			end = parsed
+		}
+	}
+	if end-start >= exploreSourceRangeMaxSpan {
+		end = start + exploreSourceRangeMaxSpan - 1
+	}
+	return start, end, true
+}
+
+// exploreSourceRangeDefinitions chooses the narrowest editable declaration at
+// each cited line. Anonymous closures are implementation detail: when a cited
+// line falls inside one, the enclosing named method/function remains the useful
+// localization symbol (for example FingersCrossedHandler::flushBuffer).
+func exploreSourceRangeDefinitions(index *fileSymbolIndex, start, end int) []*graph.Node {
+	if index == nil {
+		return nil
+	}
+	if end < start {
+		end = start
+	}
+	if end-start >= exploreSourceRangeMaxSpan {
+		end = start + exploreSourceRangeMaxSpan - 1
+	}
+	seen := make(map[string]struct{})
+	out := make([]*graph.Node, 0, 2)
+	for line := start; line <= end; line++ {
+		var best *graph.Node
+		bestSpan := int(^uint(0) >> 1)
+		for _, node := range index.syms {
+			if node == nil {
+				continue
+			}
+			if node.StartLine > line {
+				break
+			}
+			if node.Kind == graph.KindClosure || node.EndLine < line {
+				continue
+			}
+			span := node.EndLine - node.StartLine
+			if best == nil || span < bestSpan {
+				best = node
+				bestSpan = span
+			}
+		}
+		if best == nil {
+			best = index.smallestEnclosing(line)
+		}
+		if best == nil || best.ID == "" {
+			continue
+		}
+		if _, duplicate := seen[best.ID]; duplicate {
+			continue
+		}
+		seen[best.ID] = struct{}{}
+		out = append(out, best)
+	}
+	return out
+}
+
+// promoteExploreSourceRangeCandidates puts task-cited declarations ahead of
+// semantic neighbours without reranking the completed search. Existing
+// candidates retain their scores; missing exact declarations are admitted with
+// neutral ranks. The syntactic marker protects and labels this task-spelled
+// evidence through the existing bounded selection and rendering policy.
+func (s *Server) promoteExploreSourceRangeCandidates(
+	ctx context.Context,
+	task string,
+	ordinary []*rerank.Candidate,
+	scope query.QueryOptions,
+) []*rerank.Candidate {
+	specs := exploreSourceRangeSpecs(task)
+	if s == nil || s.graph == nil || len(specs) == 0 || ctx.Err() != nil {
+		return ordinary
+	}
+	type resolvedRange struct {
+		spec      rangeSpec
+		graphPath string
+	}
+	resolved := make([]resolvedRange, 0, len(specs))
+	orderedPaths := make([]string, 0, len(specs))
+	seenPaths := make(map[string]struct{}, len(specs))
+	for _, spec := range specs {
+		absPath, relPath, err := s.resolveFilePath(spec.File)
+		if err != nil {
+			continue
+		}
+		graphPath := s.resolveOverlayGraphPath(relPath, absPath)
+		resolved = append(resolved, resolvedRange{spec: spec, graphPath: graphPath})
+		if _, duplicate := seenPaths[graphPath]; !duplicate {
+			seenPaths[graphPath] = struct{}{}
+			orderedPaths = append(orderedPaths, graphPath)
+		}
+	}
+	if len(resolved) == 0 {
+		return ordinary
+	}
+	indexes := s.buildFileSymbolIndexForOrderedPathsContext(ctx, orderedPaths)
+	exactNodes := make([]*graph.Node, 0, len(resolved))
+	seenNodes := make(map[string]struct{}, len(resolved))
+	for _, item := range resolved {
+		for _, node := range exploreSourceRangeDefinitions(indexes[item.graphPath], item.spec.StartLine, item.spec.EndLine) {
+			if node == nil || !exploreLocalizableKind(node.Kind) || !scope.ScopeAllows(node) ||
+				!s.nodeInSessionScope(ctx, node) {
+				continue
+			}
+			if _, duplicate := seenNodes[node.ID]; duplicate {
+				continue
+			}
+			seenNodes[node.ID] = struct{}{}
+			exactNodes = append(exactNodes, node)
+			if len(exactNodes) == exploreSourceRangeMaxAnchors {
+				break
+			}
+		}
+		if len(exactNodes) == exploreSourceRangeMaxAnchors {
+			break
+		}
+	}
+	if len(exactNodes) == 0 {
+		return ordinary
+	}
+	ordinaryByID := make(map[string]*rerank.Candidate, len(ordinary))
+	for _, candidate := range ordinary {
+		if candidate != nil && candidate.Node != nil {
+			ordinaryByID[candidate.Node.ID] = candidate
+		}
+	}
+	out := make([]*rerank.Candidate, 0, len(ordinary)+len(exactNodes))
+	promoted := make(map[string]struct{}, len(exactNodes))
+	for _, node := range exactNodes {
+		candidate := &rerank.Candidate{Node: node, TextRank: -1, VectorRank: -1}
+		if existing := ordinaryByID[node.ID]; existing != nil {
+			clone := *existing
+			candidate = &clone
+		}
+		markExploreSyntacticAnchorCandidate(candidate)
+		out = append(out, candidate)
+		promoted[node.ID] = struct{}{}
+	}
+	for _, candidate := range ordinary {
+		if candidate == nil || candidate.Node == nil {
+			continue
+		}
+		if _, exact := promoted[candidate.Node.ID]; exact {
+			continue
+		}
+		out = append(out, candidate)
+	}
+	return out
 }
 
 func exploreSyntacticAnchorRuntimeDataPath(token string) bool {

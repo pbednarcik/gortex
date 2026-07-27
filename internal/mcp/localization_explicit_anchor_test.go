@@ -1,6 +1,8 @@
 package mcp
 
 import (
+	"context"
+	"fmt"
 	"testing"
 
 	"github.com/zzet/gortex/internal/graph"
@@ -30,6 +32,49 @@ func TestExploreSyntacticAnchorsPreserveQualifiedMemberAlongsideOwner(t *testing
 	}
 	if anchors[0].compact != "hipchathandler" || anchors[1].compact != "hipchathandlerbuildcontent" {
 		t.Fatalf("anchor compacts = [%s, %s], want owner then qualified member", anchors[0].compact, anchors[1].compact)
+	}
+}
+
+func TestExploreSourceRangeSpecsPairPathsWithFollowingLines(t *testing.T) {
+	task := `monolog/src/Monolog/Handler/FingersCrossedHandler.php
+		Lines 185 to 187
+		monolog/tests/Monolog/Handler/FingersCrossedHandlerTest.php
+		Lines 253 to 265`
+	specs := exploreSourceRangeSpecs(task)
+	if len(specs) != 2 {
+		t.Fatalf("source range specs = %#v, want production and test ranges", specs)
+	}
+	if specs[0].File != "monolog/src/Monolog/Handler/FingersCrossedHandler.php" || specs[0].StartLine != 185 || specs[0].EndLine != 187 {
+		t.Fatalf("production range = %#v", specs[0])
+	}
+	if specs[1].File != "monolog/tests/Monolog/Handler/FingersCrossedHandlerTest.php" || specs[1].StartLine != 253 || specs[1].EndLine != 265 {
+		t.Fatalf("test range = %#v", specs[1])
+	}
+}
+
+func TestExploreSourceRangeDefinitionsPreferNamedOwnerOverClosure(t *testing.T) {
+	idx := &fileSymbolIndex{}
+	idx.add(&graph.Node{ID: "handler.php::flushBuffer", Name: "flushBuffer", Kind: graph.KindMethod, StartLine: 170, EndLine: 200})
+	idx.add(&graph.Node{ID: "handler.php::flushBuffer#closure", Name: "closure", Kind: graph.KindClosure, StartLine: 185, EndLine: 187})
+	idx.finalise()
+	got := exploreSourceRangeDefinitions(idx, 185, 187)
+	if len(got) != 1 || got[0].ID != "handler.php::flushBuffer" {
+		t.Fatalf("source range definitions = %#v, want named enclosing method", got)
+	}
+}
+
+func TestPromoteExploreSourceRangeCandidatesMapsToEnclosingMethod(t *testing.T) {
+	server, store := setupNavServer(t)
+	start := store.GetNode(navFindMethod(t, store, "Start"))
+	stop := store.GetNode(navFindMethod(t, store, "Stop"))
+	task := fmt.Sprintf("svc.go\nLines %d to %d", start.StartLine, start.EndLine)
+	ordinary := []*rerank.Candidate{{Node: stop, TextRank: 0, VectorRank: -1}}
+	got := server.promoteExploreSourceRangeCandidates(context.Background(), task, ordinary, query.QueryOptions{})
+	if len(got) != 2 || got[0].Node.ID != start.ID || got[1].Node.ID != stop.ID {
+		t.Fatalf("promoted candidates = %#v, want cited Start then ordinary Stop", got)
+	}
+	if got[0].Signals[exploreSyntacticAnchorSignal] != 1 || got[0].Signals[exploreConceptComplementSignal] != 1 {
+		t.Fatalf("cited candidate signals = %#v, want protected syntactic evidence", got[0].Signals)
 	}
 }
 
