@@ -29,6 +29,12 @@ type exploreArtifactIntent struct {
 	probes        []string
 }
 
+type exploreArtifactProbeCandidate struct {
+	value    string
+	priority int
+	order    int
+}
+
 type exploreArtifactHit struct {
 	file        *graph.Node
 	path        string
@@ -48,9 +54,11 @@ type exploreArtifactLane struct {
 }
 
 var (
-	exploreArtifactPathRE  = regexp.MustCompile(`[A-Za-z0-9_@+.-]*(?:[\\/][A-Za-z0-9_@+.-]+)+|[A-Za-z0-9_@+-]+(?:\.[A-Za-z0-9_@+-]+)+`)
-	exploreArtifactProbeRE = regexp.MustCompile("`[^`\\n]{2,96}`|\\\"[^\\\"\\n]{2,96}\\\"|'[^'\\n]{2,96}'|(?:^|\\s)--?[A-Za-z][A-Za-z0-9_.-]{1,63}|\\b[A-Z][A-Z0-9_]{2,63}\\b")
-	exploreArtifactCallRE  = regexp.MustCompile(`\b[A-Za-z_][A-Za-z0-9_]*(?:(?:::|\.)[A-Za-z_][A-Za-z0-9_]*)?\s*\(`)
+	exploreArtifactPathRE       = regexp.MustCompile(`[A-Za-z0-9_@+.-]*(?:[\\/][A-Za-z0-9_@+.-]+)+|[A-Za-z0-9_@+-]+(?:\.[A-Za-z0-9_@+-]+)+`)
+	exploreArtifactProbeRE      = regexp.MustCompile("`[^`\\n]{2,96}`|\\\"[^\\\"\\n]{2,96}\\\"|'[^'\\n]{2,96}'|(?:^|\\s)--?[A-Za-z][A-Za-z0-9_.-]{1,63}|\\b[A-Z][A-Z0-9_]{2,63}\\b")
+	exploreArtifactPropertyRE   = regexp.MustCompile(`(?i)(?:^|[\s,;])/(?:p|property):([A-Za-z_][A-Za-z0-9_.-]{1,63})`)
+	exploreArtifactAssignmentRE = regexp.MustCompile(`\b([A-Za-z_][A-Za-z0-9_.-]{1,63})\s*=`)
+	exploreArtifactCallRE       = regexp.MustCompile(`\b[A-Za-z_][A-Za-z0-9_]*(?:(?:::|\.)[A-Za-z_][A-Za-z0-9_]*)?\s*\(`)
 )
 
 func classifyExploreArtifactIntent(task string) exploreArtifactIntent {
@@ -68,6 +76,17 @@ func classifyExploreArtifactIntent(task string) exploreArtifactIntent {
 		seen[key] = struct{}{}
 		out.paths = append(out.paths, raw)
 	}
+	addSemanticPath := func(word string) {
+		word = strings.ToLower(strings.TrimSpace(word))
+		if word == "" || len(out.paths) == exploreArtifactPathLimit {
+			return
+		}
+		if _, ok := seen[word]; ok {
+			return
+		}
+		seen[word] = struct{}{}
+		out.paths = append(out.paths, word)
+	}
 	for _, raw := range exploreArtifactPathRE.FindAllString(task, -1) {
 		addPath(raw)
 	}
@@ -80,14 +99,15 @@ func classifyExploreArtifactIntent(task string) exploreArtifactIntent {
 	out.explicitCount = len(out.paths)
 
 	artifactScore, sourceScore := 0, 0
-	for _, word := range exploreArtifactWords(task) {
+	semanticPaths := make([]string, 0, 8)
+	seenSemantic := make(map[string]struct{})
+	for _, rawWord := range exploreArtifactWords(task) {
+		word := canonicalExploreArtifactWord(rawWord)
 		if exploreArtifactWord(word) {
 			artifactScore++
-			if exploreArtifactPathWord(word) && len(out.paths) < exploreArtifactPathLimit {
-				if _, ok := seen[word]; !ok {
-					seen[word] = struct{}{}
-					out.paths = append(out.paths, word)
-				}
+			if _, ok := seenSemantic[word]; !ok {
+				seenSemantic[word] = struct{}{}
+				semanticPaths = append(semanticPaths, word)
 			}
 		}
 		if exploreSourceWord(word) {
@@ -103,24 +123,157 @@ func classifyExploreArtifactIntent(task string) exploreArtifactIntent {
 		sourceScore += 2
 	}
 	out.semantic = artifactScore >= 2
-	for _, raw := range exploreArtifactProbeRE.FindAllString(task, -1) {
-		probe := strings.TrimSpace(strings.Trim(raw, "`'\""))
-		probe = strings.TrimSpace(probe)
-		if len(probe) < 2 || exploreArtifactFile(probe) || strings.EqualFold(probe, "CI") {
+	for _, word := range semanticPaths {
+		if exploreArtifactPathWord(word) {
+			addSemanticPath(word)
+		}
+	}
+	out.probes = rankedExploreArtifactProbes(task, seen)
+	// "build configuration" alone is too broad to scan every artifact file.
+	// Build becomes a secondary filename family only after an explicit artifact,
+	// another semantic path family, or a distinctive content probe activates a
+	// genuinely searchable lane. Environment/property probes such as TF_BUILD
+	// also carry that family even though their separators are intentionally kept
+	// intact by exploreArtifactWords.
+	_, buildMentioned := seenSemantic["build"]
+	for _, probe := range out.probes {
+		for _, word := range strings.FieldsFunc(probe, func(r rune) bool {
+			return !unicode.IsLetter(r) && !unicode.IsDigit(r)
+		}) {
+			if strings.EqualFold(word, "build") {
+				buildMentioned = true
+				break
+			}
+		}
+	}
+	if buildMentioned && (out.explicitCount > 0 || len(out.paths) > 0 || len(out.probes) > 0) {
+		addSemanticPath("build")
+	}
+	// A model may faithfully ask for both "source/configuration files" and
+	// "precise symbols" even when the supplied anchors are overwhelmingly
+	// artifact-shaped. Do not let those incidental source nouns veto a lane
+	// corroborated by at least three artifact terms and two distinctive probes.
+	// The thresholds keep ordinary config-parser and settings-class tasks on the
+	// source path.
+	strongSemanticEvidence := out.semantic && artifactScore >= 3 && len(out.probes) >= 2
+	artifactEligible := out.explicitCount > 0 || (out.semantic && (sourceScore == 0 || strongSemanticEvidence))
+	out.active = artifactEligible && (len(out.paths) > 0 || len(out.probes) > 0)
+	return out
+}
+
+func canonicalExploreArtifactWord(word string) string {
+	switch strings.ToLower(word) {
+	case "artifacts":
+		return "artifact"
+	case "deployments":
+		return "deployment"
+	case "pipelines":
+		return "pipeline"
+	case "releases":
+		return "release"
+	case "settings":
+		return "setting"
+	case "workflows":
+		return "workflow"
+	default:
+		return strings.ToLower(word)
+	}
+}
+
+func rankedExploreArtifactProbes(task string, seen map[string]struct{}) []string {
+	candidates := make(map[string]exploreArtifactProbeCandidate)
+	add := func(value string, priority, order int) {
+		value = strings.TrimSpace(strings.Trim(value, "`'\""))
+		if len(value) < 2 || exploreArtifactFile(value) || strings.EqualFold(value, "CI") {
+			return
+		}
+		key := strings.ToLower(value)
+		if _, exists := seen[key]; exists {
+			return
+		}
+		candidate := exploreArtifactProbeCandidate{value: value, priority: priority, order: order}
+		if current, exists := candidates[key]; exists &&
+			(current.priority > candidate.priority || (current.priority == candidate.priority && current.order <= candidate.order)) {
+			return
+		}
+		candidates[key] = candidate
+	}
+	for _, match := range exploreArtifactPropertyRE.FindAllStringSubmatchIndex(task, -1) {
+		if len(match) >= 4 && match[2] >= 0 {
+			add(task[match[2]:match[3]], 500, match[2])
+		}
+	}
+	for _, match := range exploreArtifactAssignmentRE.FindAllStringSubmatchIndex(task, -1) {
+		if len(match) < 4 || match[2] < 0 {
 			continue
 		}
-		key := strings.ToLower(probe)
-		if _, ok := seen[key]; ok {
-			continue
+		value := task[match[2]:match[3]]
+		priority := 220
+		if exploreArtifactEnvironmentProbe(value) {
+			priority = 450
+		} else if exploreArtifactCamelProbe(value) {
+			priority = 400
 		}
+		add(value, priority, match[2])
+	}
+	for _, match := range exploreArtifactProbeRE.FindAllStringIndex(task, -1) {
+		raw := task[match[0]:match[1]]
+		trimmed := strings.TrimSpace(raw)
+		priority := 100
+		switch {
+		case strings.HasPrefix(trimmed, "`") || strings.HasPrefix(trimmed, "\"") || strings.HasPrefix(trimmed, "'"):
+			priority = 350
+		case strings.HasPrefix(trimmed, "-"):
+			priority = 300
+		case exploreArtifactEnvironmentProbe(trimmed):
+			priority = 425
+		}
+		add(trimmed, priority, match[0])
+	}
+	ordered := make([]exploreArtifactProbeCandidate, 0, len(candidates))
+	for _, candidate := range candidates {
+		ordered = append(ordered, candidate)
+	}
+	sort.Slice(ordered, func(i, j int) bool {
+		if ordered[i].priority != ordered[j].priority {
+			return ordered[i].priority > ordered[j].priority
+		}
+		if ordered[i].order != ordered[j].order {
+			return ordered[i].order < ordered[j].order
+		}
+		return ordered[i].value < ordered[j].value
+	})
+	out := make([]string, 0, exploreArtifactProbeLimit)
+	for _, candidate := range ordered {
+		key := strings.ToLower(candidate.value)
 		seen[key] = struct{}{}
-		out.probes = append(out.probes, probe)
-		if len(out.probes) == exploreArtifactProbeLimit {
+		out = append(out, candidate.value)
+		if len(out) == exploreArtifactProbeLimit {
 			break
 		}
 	}
-	out.active = (out.explicitCount > 0 || (sourceScore == 0 && out.semantic)) && (len(out.paths) > 0 || len(out.probes) > 0)
 	return out
+}
+
+func exploreArtifactEnvironmentProbe(value string) bool {
+	if !strings.Contains(value, "_") {
+		return false
+	}
+	for _, r := range value {
+		if unicode.IsLower(r) || (!unicode.IsLetter(r) && !unicode.IsDigit(r) && r != '_') {
+			return false
+		}
+	}
+	return true
+}
+
+func exploreArtifactCamelProbe(value string) bool {
+	hasLower, hasUpper := false, false
+	for _, r := range value {
+		hasLower = hasLower || unicode.IsLower(r)
+		hasUpper = hasUpper || unicode.IsUpper(r)
+	}
+	return hasLower && hasUpper
 }
 
 const (
@@ -150,6 +303,30 @@ func exploreArtifactPathWord(word string) bool { return exploreInSet(exploreArti
 func exploreSourceWord(word string) bool       { return exploreInSet(exploreSourceWordsSet, word) }
 func exploreSourceExtension(ext string) bool   { return exploreInSet(exploreSourceExtsSet, ext) }
 
+const exploreArtifactToolMetadataRoots = "|.claude|.codegraph|.codex|.flow|.gitnexus|.graphify|.serena|graphify-out|"
+
+func exploreArtifactPathEligible(intent exploreArtifactIntent, path string) bool {
+	normalized := strings.TrimPrefix(strings.ReplaceAll(strings.TrimSpace(path), "\\", "/"), "./")
+	root, _, _ := strings.Cut(normalized, "/")
+	if !exploreInSet(exploreArtifactToolMetadataRoots, root) {
+		return true
+	}
+	// Tool/session metadata is not implementation evidence merely because it
+	// repeats issue vocabulary. It remains searchable when the task names that
+	// path or basename explicitly, which preserves real configuration work.
+	for index, explicit := range intent.paths {
+		if index >= intent.explicitCount {
+			break
+		}
+		explicit = strings.TrimPrefix(strings.ReplaceAll(strings.TrimSpace(explicit), "\\", "/"), "./")
+		if strings.EqualFold(explicit, normalized) ||
+			(!strings.Contains(explicit, "/") && strings.EqualFold(filepath.Base(explicit), filepath.Base(normalized))) {
+			return true
+		}
+	}
+	return false
+}
+
 // gatherExploreArtifactLane reuses search(files)' graph file nodes and
 // search(text)'s trigram backend. The inactive path returns before either I/O.
 func (s *Server) gatherExploreArtifactLane(ctx context.Context, intent exploreArtifactIntent, scope query.QueryOptions) exploreArtifactLane {
@@ -163,6 +340,9 @@ func (s *Server) gatherExploreArtifactLane(ctx context.Context, intent exploreAr
 			continue
 		}
 		rel := repoRelativePath(node)
+		if !exploreArtifactPathEligible(intent, rel) {
+			continue
+		}
 		hit := &exploreArtifactHit{file: node, path: rel}
 		files = append(files, hit)
 		key := strings.ToLower(strings.ReplaceAll(rel, "\\", "/"))
@@ -171,38 +351,7 @@ func (s *Server) gatherExploreArtifactLane(ctx context.Context, intent exploreAr
 			byPath[strings.ToLower(node.RepoPrefix)+"/"+key] = hit
 		}
 	}
-	exactBasenames := make(map[string]int)
-	for _, hit := range files {
-		for i, term := range intent.paths {
-			score, ok := scoreFilenameMatch(term, filepath.Base(hit.path), hit.path, false)
-			if !ok {
-				continue
-			}
-			hit.pathHit = true
-			hit.score += score
-			if i >= intent.explicitCount {
-				continue
-			}
-			normalizedTerm := strings.TrimPrefix(strings.ReplaceAll(term, "\\", "/"), "./")
-			normalizedHit := strings.TrimPrefix(strings.ReplaceAll(hit.path, "\\", "/"), "./")
-			switch {
-			case strings.Contains(normalizedTerm, "/") && strings.EqualFold(normalizedTerm, normalizedHit):
-				hit.fullPath = true
-				hit.score += 20
-			case strings.EqualFold(filepath.Base(term), filepath.Base(hit.path)):
-				hit.exactBase = strings.ToLower(filepath.Base(term))
-				exactBasenames[hit.exactBase]++
-				hit.score += 20
-			}
-		}
-	}
-	for _, hit := range files {
-		hit.uniqueBase = hit.exactBase != "" && exactBasenames[hit.exactBase] == 1
-	}
-	sort.Slice(files, func(i, j int) bool { return files[i].score > files[j].score })
-	if len(files) > exploreArtifactPathLimit {
-		files = files[:exploreArtifactPathLimit]
-	}
+	files = rankExploreArtifactPathHits(files, intent)
 	kept := make(map[*graph.Node]*exploreArtifactHit, len(files))
 	for _, hit := range files {
 		if hit.pathHit {
@@ -227,8 +376,10 @@ func (s *Server) gatherExploreArtifactLane(ctx context.Context, intent exploreAr
 			if hit == nil || !exploreArtifactFile(hit.path) {
 				continue
 			}
+			if !hit.contentHit {
+				hit.score += 5
+			}
 			hit.contentHit = true
-			hit.score += 5
 			hit.declaration = match.SymbolID
 			if hit.snippet == "" {
 				hit.snippet = truncateExploreArtifactSnippet(match.Text)
@@ -240,15 +391,7 @@ func (s *Server) gatherExploreArtifactLane(ctx context.Context, intent exploreAr
 	for _, hit := range kept {
 		results = append(results, hit)
 	}
-	sort.SliceStable(results, func(i, j int) bool {
-		if results[i].score != results[j].score {
-			return results[i].score > results[j].score
-		}
-		return results[i].path < results[j].path
-	})
-	if len(results) > exploreArtifactResultLimit {
-		results = results[:exploreArtifactResultLimit]
-	}
+	results = selectExploreArtifactResults(results, exploreArtifactResultLimit)
 	ids := make([]string, 0, len(results))
 	for _, hit := range results {
 		if hit.declaration != "" {
@@ -272,6 +415,102 @@ func (s *Server) gatherExploreArtifactLane(ctx context.Context, intent exploreAr
 		lane.ready = exploreArtifactTerminal(intent, results[0], runnerUp)
 	}
 	return lane
+}
+
+func rankExploreArtifactPathHits(files []*exploreArtifactHit, intent exploreArtifactIntent) []*exploreArtifactHit {
+	exactBasenames := make(map[string]int)
+	for _, hit := range files {
+		if hit == nil {
+			continue
+		}
+		explicitScore, semanticScore, explicitBonus := 0, 0, 0
+		for i, term := range intent.paths {
+			score, ok := scoreFilenameMatch(term, filepath.Base(hit.path), hit.path, false)
+			if !ok {
+				continue
+			}
+			hit.pathHit = true
+			if i >= intent.explicitCount {
+				if score > semanticScore {
+					semanticScore = score
+				}
+				continue
+			}
+			if score > explicitScore {
+				explicitScore = score
+			}
+			normalizedTerm := strings.TrimPrefix(strings.ReplaceAll(term, "\\", "/"), "./")
+			normalizedHit := strings.TrimPrefix(strings.ReplaceAll(hit.path, "\\", "/"), "./")
+			switch {
+			case strings.Contains(normalizedTerm, "/") && strings.EqualFold(normalizedTerm, normalizedHit):
+				hit.fullPath = true
+				explicitBonus = 20
+			case strings.EqualFold(filepath.Base(term), filepath.Base(hit.path)):
+				hit.exactBase = strings.ToLower(filepath.Base(term))
+				exactBasenames[hit.exactBase]++
+				explicitBonus = 20
+			}
+		}
+		hit.score += explicitScore + semanticScore + explicitBonus
+	}
+	for _, hit := range files {
+		if hit != nil {
+			hit.uniqueBase = hit.exactBase != "" && exactBasenames[hit.exactBase] == 1
+		}
+	}
+	sort.SliceStable(files, func(i, j int) bool { return exploreArtifactHitLess(files[i], files[j]) })
+	if len(files) > exploreArtifactPathLimit {
+		files = files[:exploreArtifactPathLimit]
+	}
+	return files
+}
+
+func selectExploreArtifactResults(results []*exploreArtifactHit, limit int) []*exploreArtifactHit {
+	sort.SliceStable(results, func(i, j int) bool { return exploreArtifactHitLess(results[i], results[j]) })
+	if limit <= 0 || len(results) <= limit {
+		return results
+	}
+	selected := make([]*exploreArtifactHit, 0, limit)
+	deferred := make([]*exploreArtifactHit, 0)
+	exactBaseCounts := make(map[string]int)
+	for _, hit := range results {
+		if hit == nil {
+			continue
+		}
+		if hit.exactBase != "" && !hit.fullPath && exactBaseCounts[hit.exactBase] >= 2 {
+			deferred = append(deferred, hit)
+			continue
+		}
+		selected = append(selected, hit)
+		if hit.exactBase != "" {
+			exactBaseCounts[hit.exactBase]++
+		}
+		if len(selected) == limit {
+			return selected
+		}
+	}
+	for _, hit := range deferred {
+		selected = append(selected, hit)
+		if len(selected) == limit {
+			break
+		}
+	}
+	return selected
+}
+
+func exploreArtifactHitLess(left, right *exploreArtifactHit) bool {
+	if left == nil || right == nil {
+		return right == nil && left != nil
+	}
+	if left.score != right.score {
+		return left.score > right.score
+	}
+	leftDepth := strings.Count(strings.Trim(strings.ReplaceAll(left.path, "\\", "/"), "/"), "/")
+	rightDepth := strings.Count(strings.Trim(strings.ReplaceAll(right.path, "\\", "/"), "/"), "/")
+	if leftDepth != rightDepth {
+		return leftDepth < rightDepth
+	}
+	return left.path < right.path
 }
 
 func truncateExploreArtifactSnippet(snippet string) string {

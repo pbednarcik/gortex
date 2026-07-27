@@ -154,31 +154,23 @@ func TestLocalizationEvidencePolicyKeepsCompleteImplementationRouteAfterPacking(
 		implementation.ID, "find the replacement implementation", targets,
 		exploreDefaultBudgetTokens, routes,
 	)
-	require.Equal(t, localizationStateNeedsRefinement, completion.State)
-	require.True(t, bounded[wrapper.ID].enforceable)
+	if completion.State != localizationStateAnswerReady {
+		t.Fatalf("packed implementation route did not conclude in one call: completion=%#v bounded=%#v", completion, bounded)
+	}
+	require.False(t, completion.Enforceable,
+		"a task-aligned body may conclude localization without upgrading bounded evidence to hard proof")
+	require.Zero(t, completion.AllowedToolCalls)
 	require.True(t, bounded[implementation.ID].enforceable)
 	require.Equal(t, wrapper.ID, bounded[implementation.ID].proofSymbol)
-
-	state := &localizationTerminalState{}
-	state.armRefinementRoutesForTask(
-		"find the replacement implementation", completion.refinementSymbol,
-		completion.AllowedSymbols, bounded, nil,
-	)
-	blocked, allowed := state.authorize("read", "source", map[string]any{
-		"target": map[string]any{"symbol": implementation.ID},
-	})
-	require.Nil(t, blocked)
-	require.True(t, allowed)
-	finished := state.finishReservedRead(true)
-	require.Equal(t, localizationStateAnswerReady, finished.State)
-	require.True(t, finished.Enforceable)
 
 	body, ok := singleTextContent(result)
 	require.True(t, ok)
 	var envelope localizationExploreEnvelope
 	require.NoError(t, json.Unmarshal([]byte(body), &envelope))
-	require.False(t, envelope.Terminal)
+	require.True(t, envelope.Terminal)
+	require.Equal(t, localizationStateAnswerReady, envelope.Completion.State)
 	require.False(t, envelope.Completion.Enforceable)
+	require.Contains(t, envelope.Completion.FinalResponse, localizationBoundedHeading)
 	provenance := make(map[string]string, len(envelope.Evidence))
 	for _, row := range envelope.Evidence {
 		provenance[row.ID] = row.Provenance
@@ -223,30 +215,21 @@ func TestLocalizationEvidencePolicyPrefersImplementationRouteForMixedStrongProof
 		exploreDefaultBudgetTokens, routes,
 	)
 	require.True(t, bounded[implementation.ID].enforceable)
+	require.Equal(t, localizationStateAnswerReady, completion.State)
+	require.Zero(t, completion.AllowedToolCalls)
+	require.False(t, completion.Enforceable)
 	body, ok := singleTextContent(result)
 	require.True(t, ok)
 	var envelope localizationExploreEnvelope
 	require.NoError(t, json.Unmarshal([]byte(body), &envelope))
+	require.True(t, envelope.Terminal)
+	require.Contains(t, envelope.Completion.FinalResponse, localizationBoundedHeading)
 	provenance := make(map[string]string, len(envelope.Evidence))
 	for _, row := range envelope.Evidence {
 		provenance[row.ID] = row.Provenance
 	}
 	require.Equal(t, localizationProvenanceImplementationRoute, provenance[wrapper.ID])
 	require.Equal(t, localizationProvenanceImplementationTarget, provenance[implementation.ID])
-
-	state := &localizationTerminalState{}
-	state.armRefinementRoutesForTask(
-		"find the replacement implementation", completion.refinementSymbol,
-		completion.AllowedSymbols, bounded, nil,
-	)
-	blocked, allowed := state.authorize("read", "source", map[string]any{
-		"target": map[string]any{"symbol": implementation.ID},
-	})
-	require.Nil(t, blocked)
-	require.True(t, allowed)
-	finished := state.finishReservedRead(true)
-	require.Equal(t, localizationStateAnswerReady, finished.State)
-	require.True(t, finished.Enforceable)
 }
 
 func TestTypedAnchorProvenanceDoesNotOverrideStrongerEvidenceRoles(t *testing.T) {

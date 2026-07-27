@@ -4,13 +4,28 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"strings"
 	"testing"
 
 	mcpgo "github.com/mark3labs/mcp-go/mcp"
+
+	"github.com/zzet/gortex/internal/graph"
 )
 
-func TestWeakReadAllowsOneBoundedSearchRecoveryThenTerminates(t *testing.T) {
-	server := setupPresetServer(t, ToolPolicyConfig{Preset: "core", Mode: "defer"})
+func setupHardLocalizationRecoveryServer(t *testing.T) *Server {
+	t.Helper()
+	cfg := ToolPolicyConfig{Preset: "localization", Mode: "defer"}
+	server := setupPresetServer(t, cfg)
+	if server.toolPolicy == nil {
+		t.Fatal("localization test server omitted tool policy")
+	}
+	// Recovery tests exercise the explicit localize transaction itself. Tool
+	// profile provenance must not alter its state machine or grant a hard gate.
+	return server
+}
+
+func TestWeakReadAllowsOneBoundedSearchRecoveryThenContinuesOrdinarySearch(t *testing.T) {
+	server := setupHardLocalizationRecoveryServer(t)
 	ctx := WithSessionID(context.Background(), "weak_read_search_recovery")
 	terminal := server.localizationFor(ctx)
 	preferred := "repo/search.go::findCandidate"
@@ -51,20 +66,19 @@ func TestWeakReadAllowsOneBoundedSearchRecoveryThenTerminates(t *testing.T) {
 	}
 	requireLocalizationResultStateEqual(t, terminal, searchResult, localizationStateAnswerReady, true, 0)
 
-	extra, err := server.handleFacade(ctx, "search", localizationRecoveryRequest("search", "text", map[string]any{
+	ordinary, err := server.handleFacade(ctx, "search", localizationRecoveryRequest("search", "text", map[string]any{
 		"query": "another anchor",
 	}))
-	if err != nil {
-		t.Fatalf("post-recovery call returned transport error: %v", err)
+	if err != nil || ordinary == nil || ordinary.IsError {
+		t.Fatalf("ordinary post-recovery search = (%#v, %v)", ordinary, err)
 	}
-	requireLocalizationTerminalReplay(t, extra, "search", "text")
-	if searchCalls != 1 {
-		t.Fatalf("post-recovery search reached handler: calls=%d", searchCalls)
+	if searchCalls != 2 {
+		t.Fatalf("ordinary post-recovery search did not reach handler: calls=%d", searchCalls)
 	}
 }
 
 func TestRecoveryRejectsUnrelatedAnchorWithoutConsumingAllowance(t *testing.T) {
-	server := setupPresetServer(t, ToolPolicyConfig{Preset: "core", Mode: "defer"})
+	server := setupHardLocalizationRecoveryServer(t)
 	ctx := WithSessionID(context.Background(), "unrelated_recovery_anchor")
 	terminal := server.localizationFor(ctx)
 	terminal.armForTask(newLocalizationRecoveryCompletion(), "--multiline with --replace duplicates printer output")
@@ -149,6 +163,144 @@ func TestRecoveryAcceptsTaskAlignedIdentifierAndCompactLiteralAnchors(t *testing
 	}
 }
 
+func TestAcceptedRecoveryMergesHumanizerLiteralEvidenceAndTerminalizes(t *testing.T) {
+	state := newLocalizationTerminalState()
+	task := `CultureNotFoundException ("ku") on Xamarin for Android`
+	state.armForTask(newLocalizationRecoveryCompletion(), task)
+
+	blocked, token := state.authorizeWithToken("search", "text", map[string]any{"query": "ku"})
+	if blocked != nil || token == 0 {
+		t.Fatalf("humanizer literal recovery authorization = (%#v, %d)", blocked, token)
+	}
+	row := localizationDigestRow{
+		ID:       "src/Humanizer/Configuration/FormatterRegistry.cs::FormatterRegistry",
+		Name:     "FormatterRegistry",
+		QualName: "FormatterRegistry",
+		Kind:     "class",
+		File:     "src/Humanizer/Configuration/FormatterRegistry.cs",
+		Line:     10,
+	}
+	completion := state.finishReservedReadTokenWithDigest(token, true, []localizationDigestRow{row}, true)
+	if completion.State != localizationStateAnswerReady || completion.AllowedToolCalls != 0 || completion.Enforceable {
+		t.Fatalf("humanizer recovery completion = %#v", completion)
+	}
+	if completion.digest == nil || len(completion.digest.Evidence) == 0 || completion.digest.Evidence[0].ID != row.ID {
+		t.Fatalf("humanizer recovery did not merge captured FormatterRegistry evidence: %#v", completion.digest)
+	}
+	if strings.HasPrefix(completion.FinalResponse, localizationProvisionalHeading) ||
+		strings.HasPrefix(completion.FinalResponse, localizationBoundedHeading) || !strings.Contains(completion.FinalResponse, row.ID) {
+		t.Fatalf("aligned humanizer recovery did not publish confirmed evidence: %q", completion.FinalResponse)
+	}
+	if replay, retryToken := state.authorizeWithToken("search", "text", map[string]any{"query": "ku"}); replay == nil || retryToken != 0 {
+		t.Fatalf("humanizer recovery repeated needs_recovery: (%#v, %d)", replay, retryToken)
+	}
+	if blocked, codingToken := state.authorizeWithToken("edit", "file", map[string]any{}); blocked != nil || codingToken != 0 {
+		t.Fatalf("terminal localization blocked coding workflow: (%#v, %d)", blocked, codingToken)
+	}
+}
+
+func TestAcceptedRecoveryHumanizerLiteralFacadeEventPublishesEvidenceAndContinuesSearch(t *testing.T) {
+	server := setupHardLocalizationRecoveryServer(t)
+	ownerGraph := graph.New()
+	repoPrefix := "org/humanizer-1059"
+	file := &graph.Node{
+		ID: "src/Humanizer/Configuration/FormatterRegistry.cs", Name: "FormatterRegistry.cs",
+		Kind: graph.KindFile, FilePath: "src/Humanizer/Configuration/FormatterRegistry.cs", StartLine: 1, EndLine: 67,
+		RepoPrefix: repoPrefix,
+	}
+	owner := &graph.Node{
+		ID: "src/Humanizer/Configuration/FormatterRegistry.cs::FormatterRegistry", Name: "FormatterRegistry",
+		QualName: "FormatterRegistry", Kind: graph.KindType, FilePath: file.FilePath, StartLine: 8, EndLine: 66,
+		RepoPrefix: repoPrefix,
+	}
+	ownerGraph.AddNode(file)
+	ownerGraph.AddNode(owner)
+	server.graph = ownerGraph
+
+	ctx := WithSessionID(context.Background(), "humanizer_literal_recovery_event")
+	terminal := server.localizationFor(ctx)
+	task := `CultureNotFoundException ("ku") on Xamarin for Android`
+	retainedID := "src/Humanizer/NumberToWordsExtension.cs::NumberToWordsExtension.ToWords"
+	recovery := newLocalizationRecoveryCompletion()
+	recovery.digest = newLocalizationEvidenceDigestForTask(task, localizationExploreEnvelope{
+		Evidence: []localizationEvidence{{
+			Rank: 1, ID: retainedID, Name: "ToWords", Kind: "method",
+			File: "src/Humanizer/NumberToWordsExtension.cs", Line: 55,
+		}},
+	})
+	terminal.armForTask(recovery, task)
+	searchSpec, ok := server.facades.operation("search", "text")
+	if !ok {
+		t.Fatal("search.text facade operation is missing")
+	}
+	calls := 0
+	server.facades.capture(mcpgo.NewTool(searchSpec.Legacy), func(callCtx context.Context, _ mcpgo.CallToolRequest) (*mcpgo.CallToolResult, error) {
+		calls++
+		server.captureLocalizationSearchText(callCtx, []enrichedTextMatch{{
+			Path: repoPrefix + "/" + file.FilePath, Line: 24, Text: `Register("ku", formatter)`,
+		}})
+		return mcpgo.NewToolResultText(`{"matches":[{"path":"org/humanizer-1059/src/Humanizer/Configuration/FormatterRegistry.cs","line":24}]}`), nil
+	})
+
+	result, err := server.handleFacade(ctx, "search", localizationRecoveryRequest("search", "text", map[string]any{"query": "ku"}))
+	if err != nil || result == nil || result.IsError || calls != 1 {
+		t.Fatalf("humanizer facade recovery = (%#v, %v), calls=%d", result, err, calls)
+	}
+	requireLocalizationResultStateEqual(t, terminal, result, localizationStateAnswerReady, true, 0)
+	host, ok := result.Meta.AdditionalFields[localizationHostMetaKey].(localizationHostEnvelope)
+	if !ok || host.Evidence == nil || len(host.Evidence.Evidence) == 0 || host.Evidence.Evidence[0].ID != owner.ID {
+		t.Fatalf("humanizer facade event did not publish FormatterRegistry evidence: %#v", result.Meta)
+	}
+	retained := false
+	for _, row := range host.Evidence.Evidence {
+		retained = retained || row.ID == retainedID
+	}
+	if !retained {
+		t.Fatalf("recovery merge discarded retained evidence %q: %#v", retainedID, host.Evidence.Evidence)
+	}
+	primary := "- EVIDENCE #1 — PRIMARY — " + file.FilePath + ":24 — " + owner.ID
+	if !strings.Contains(host.Contract.Completion.FinalResponse, primary) {
+		t.Fatalf("recovered owner is not the first PRIMARY tuple: %q", host.Contract.Completion.FinalResponse)
+	}
+
+	ordinary, err := server.handleFacade(ctx, "search", localizationRecoveryRequest("search", "text", map[string]any{"query": "formatter"}))
+	if err != nil || ordinary == nil || ordinary.IsError {
+		t.Fatalf("ordinary post-recovery search = (%#v, %v)", ordinary, err)
+	}
+	if calls != 2 {
+		t.Fatalf("ordinary post-recovery search did not reach handler: calls=%d", calls)
+	}
+}
+
+func TestBoundedConclusionRetainsCanonicalEvidenceAndCodingTools(t *testing.T) {
+	row := captureTestRow("repo/storage/report.go::Reporter.ReportFailure", "repo/storage/report.go")
+	digest := mergeLocalizationEvidenceDigest([]localizationDigestRow{row}, nil)
+	completion := newLocalizationBoundedConclusionCompletion(digest)
+	if completion.State != localizationStateAnswerReady || completion.AllowedToolCalls != 0 || completion.Enforceable {
+		t.Fatalf("bounded conclusion completion = %#v", completion)
+	}
+	if !strings.HasPrefix(completion.FinalResponse, localizationBoundedHeading+"\n") ||
+		!strings.Contains(completion.FinalResponse, row.ID) {
+		t.Fatalf("bounded conclusion lost canonical evidence or bounded heading: %q", completion.FinalResponse)
+	}
+	for _, term := range []string{"bounded localization search is exhausted", "editing", "building", "testing"} {
+		if !strings.Contains(completion.Instruction, term) {
+			t.Fatalf("bounded conclusion instruction %q does not mention %q", completion.Instruction, term)
+		}
+	}
+
+	state := newLocalizationTerminalState()
+	state.armForTask(completion, "storage reports fail")
+	if replay, token := state.authorizeWithToken("search", "symbols", map[string]any{"query": "storage"}); replay == nil || token != 0 {
+		t.Fatalf("bounded conclusion did not terminate localization navigation: (%#v, %d)", replay, token)
+	}
+	for _, facade := range []string{"change", "edit", "refactor"} {
+		if blocked, token := state.authorizeWithToken(facade, "anything", nil); blocked != nil || token != 0 {
+			t.Fatalf("bounded conclusion blocked %s workflow: (%#v, %d)", facade, blocked, token)
+		}
+	}
+}
+
 func TestRecoveryRejectsDigestOnlyTermFromRG2095Incident(t *testing.T) {
 	terminal := newLocalizationTerminalState()
 	task := "--multiline with --replace causes duplicate output when a match spans multiple lines"
@@ -171,8 +323,8 @@ func TestRecoveryRejectsDigestOnlyTermFromRG2095Incident(t *testing.T) {
 	}
 }
 
-func TestRecoveryFailureRestoresOnceAndTerminalizesSameResponse(t *testing.T) {
-	server := setupPresetServer(t, ToolPolicyConfig{Preset: "core", Mode: "defer"})
+func TestAcceptedRecoveryFailureTerminalizesSameResponseThenContinuesSearch(t *testing.T) {
+	server := setupHardLocalizationRecoveryServer(t)
 	ctx := WithSessionID(context.Background(), "weak_recovery_failure")
 	terminal := server.localizationFor(ctx)
 	terminal.armForTask(newLocalizationRecoveryCompletion(), "find candidate resolution")
@@ -184,34 +336,30 @@ func TestRecoveryFailureRestoresOnceAndTerminalizesSameResponse(t *testing.T) {
 	calls := 0
 	server.facades.capture(mcpgo.NewTool(searchSpec.Legacy), func(context.Context, mcpgo.CallToolRequest) (*mcpgo.CallToolResult, error) {
 		calls++
-		return nil, errors.New("recovery backend unavailable")
+		if calls == 1 {
+			return nil, errors.New("recovery backend unavailable")
+		}
+		return mcpgo.NewToolResultText("ordinary search"), nil
 	})
 	request := localizationRecoveryRequest("search", "symbols", map[string]any{"query": "resolveCandidate"})
 
 	first, err := server.handleFacade(ctx, "search", request)
 	if err != nil || first == nil || !first.IsError || calls != 1 {
-		t.Fatalf("first failed recovery = (%#v, %v), calls=%d", first, err, calls)
+		t.Fatalf("failed accepted recovery = (%#v, %v), calls=%d", first, err, calls)
 	}
-	requireLocalizationResultStateEqual(t, terminal, first, localizationStateNeedsRecovery, false, 1)
+	requireLocalizationResultStateEqual(t, terminal, first, localizationStateAnswerReady, true, 0)
 
-	second, err := server.handleFacade(ctx, "search", request)
-	if err != nil || second == nil || !second.IsError || calls != 2 {
-		t.Fatalf("second failed recovery = (%#v, %v), calls=%d", second, err, calls)
+	ordinary, err := server.handleFacade(ctx, "search", request)
+	if err != nil || ordinary == nil || ordinary.IsError {
+		t.Fatalf("ordinary post-failure search = (%#v, %v)", ordinary, err)
 	}
-	requireLocalizationResultStateEqual(t, terminal, second, localizationStateAnswerReady, true, 0)
-
-	third, err := server.handleFacade(ctx, "search", request)
-	if err != nil {
-		t.Fatalf("post-exhaustion search returned transport error: %v", err)
-	}
-	requireLocalizationTerminalReplay(t, third, "search", "symbols")
 	if calls != 2 {
-		t.Fatalf("recovery allowance restored more than once: calls=%d", calls)
+		t.Fatalf("ordinary post-failure search did not reach handler: calls=%d", calls)
 	}
 }
 
-func TestEnforceableAnswerReadyLocksBeforeHandler(t *testing.T) {
-	server := setupPresetServer(t, ToolPolicyConfig{Preset: "core", Mode: "defer"})
+func TestEnforceableAnswerReadyContinuesOrdinarySearch(t *testing.T) {
+	server := setupHardLocalizationRecoveryServer(t)
 	ctx := WithSessionID(context.Background(), "strong_answer_ready_lock")
 	completion := newLocalizationCompletion(true, "")
 	completion.Enforceable = true
@@ -230,39 +378,51 @@ func TestEnforceableAnswerReadyLocksBeforeHandler(t *testing.T) {
 	result, err := server.handleFacade(ctx, "search", localizationRecoveryRequest("search", "text", map[string]any{
 		"query": "resolveCandidate",
 	}))
-	if err != nil {
-		t.Fatalf("strong terminal search returned transport error: %v", err)
+	if err != nil || result == nil || result.IsError {
+		t.Fatalf("ordinary answer_ready search = (%#v, %v)", result, err)
 	}
-	requireLocalizationTerminalReplay(t, result, "search", "text")
-	if calls != 0 {
-		t.Fatalf("enforceable answer_ready reached handler: calls=%d", calls)
+	if calls != 1 {
+		t.Fatalf("ordinary answer_ready search did not reach handler: calls=%d", calls)
 	}
 }
 
-func TestUnsupportedRecoveryAttemptTerminatesBeforeSchemaDispatch(t *testing.T) {
-	server := setupPresetServer(t, ToolPolicyConfig{Preset: "core", Mode: "defer"})
+func TestUnsupportedRecoveryAttemptTerminalizesSameResponseThenContinuesSearch(t *testing.T) {
+	server := setupHardLocalizationRecoveryServer(t)
 	ctx := WithSessionID(context.Background(), "unsupported_recovery")
-	server.localizationFor(ctx).armForTask(newLocalizationRecoveryCompletion(), "find candidate resolution")
+	terminal := server.localizationFor(ctx)
+	terminal.armForTask(newLocalizationRecoveryCompletion(), "find candidate resolution")
 
-	result, err := server.handleFacade(ctx, "search", localizationRecoveryRequest("search", "not_an_operation", map[string]any{
+	searchSpec, ok := server.facades.operation("search", "text")
+	if !ok {
+		t.Fatal("search.text facade operation is missing")
+	}
+	calls := 0
+	server.facades.capture(mcpgo.NewTool(searchSpec.Legacy), func(context.Context, mcpgo.CallToolRequest) (*mcpgo.CallToolResult, error) {
+		calls++
+		return mcpgo.NewToolResultText("ordinary search"), nil
+	})
+
+	invalid, err := server.handleFacade(ctx, "search", localizationRecoveryRequest("search", "not_an_operation", map[string]any{
 		"query": "resolveCandidate",
 	}))
-	if err != nil || result == nil || !result.IsError {
-		t.Fatalf("unsupported recovery = (%#v, %v), want terminal tool error", result, err)
+	if err != nil || invalid == nil || !invalid.IsError {
+		t.Fatalf("unsupported recovery = (%#v, %v), want terminal tool error", invalid, err)
 	}
-	requireLocalizationTerminalError(t, result, "search", "not_an_operation")
+	requireLocalizationTerminalError(t, invalid, "search", "not_an_operation")
+	if calls != 0 {
+		t.Fatalf("unsupported recovery reached handler: calls=%d", calls)
+	}
 
-	valid, err := server.handleFacade(ctx, "search", localizationRecoveryRequest("search", "text", map[string]any{
+	ordinary, err := server.handleFacade(ctx, "search", localizationRecoveryRequest("search", "text", map[string]any{
 		"query": "resolveCandidate",
 	}))
-	if err != nil {
-		t.Fatalf("post-rejection recovery returned transport error: %v", err)
+	if err != nil || ordinary == nil || ordinary.IsError || calls != 1 {
+		t.Fatalf("ordinary post-recovery search = (%#v, %v), calls=%d", ordinary, err, calls)
 	}
-	requireLocalizationTerminalReplay(t, valid, "search", "text")
 }
 
-func TestSchemaInvalidAllowedRecoveryTerminatesBeforeHandler(t *testing.T) {
-	server := setupPresetServer(t, ToolPolicyConfig{Preset: "core", Mode: "defer"})
+func TestSchemaInvalidAllowedRecoveryTerminalizesSameResponseThenContinuesSearch(t *testing.T) {
+	server := setupHardLocalizationRecoveryServer(t)
 	ctx := WithSessionID(context.Background(), "schema_invalid_recovery")
 	terminal := server.localizationFor(ctx)
 	terminal.armForTask(newLocalizationRecoveryCompletion(), "find candidate resolution")
@@ -288,15 +448,14 @@ func TestSchemaInvalidAllowedRecoveryTerminatesBeforeHandler(t *testing.T) {
 		t.Fatalf("schema-invalid recovery reached handler: calls=%d", calls)
 	}
 
-	valid, err := server.handleFacade(ctx, "search", localizationRecoveryRequest("search", "text", map[string]any{
+	ordinary, err := server.handleFacade(ctx, "search", localizationRecoveryRequest("search", "text", map[string]any{
 		"query": "resolveCandidate",
 	}))
-	if err != nil {
-		t.Fatalf("post-invalid recovery returned transport error: %v", err)
+	if err != nil || ordinary == nil || ordinary.IsError {
+		t.Fatalf("ordinary post-invalid-recovery search = (%#v, %v)", ordinary, err)
 	}
-	requireLocalizationTerminalReplay(t, valid, "search", "text")
-	if calls != 0 {
-		t.Fatalf("recovery allowance survived invalid schema: calls=%d", calls)
+	if calls != 1 {
+		t.Fatalf("ordinary post-invalid-recovery search did not reach handler: calls=%d", calls)
 	}
 }
 
@@ -411,7 +570,7 @@ func TestRecoveryEvidenceRejectsGenericCallableWithSignatureOnlyOverlap(t *testi
 	}
 }
 
-func TestRecoveryWeakResultPreservesAllowanceForEveryOperation(t *testing.T) {
+func TestAcceptedWeakRecoveryTerminalizesEveryOperation(t *testing.T) {
 	longSink := localizationDigestRow{
 		ID:        "repo/storage/report.go::Reporter.ReportStorageFailureAsPending",
 		Name:      "ReportStorageFailureAsPending",
@@ -420,32 +579,23 @@ func TestRecoveryWeakResultPreservesAllowanceForEveryOperation(t *testing.T) {
 		File:      "repo/storage/report.go",
 		Signature: "storage writes stall during commit",
 	}
-	implementation := localizationDigestRow{
-		ID:       "repo/storage/flush.go::Storage.Flush",
-		Name:     "StorageFlush",
-		QualName: "Storage.Flush",
-		Kind:     "method",
-		File:     "repo/storage/flush.go",
-	}
 	tests := []struct {
-		name           string
-		facade         string
-		operation      string
-		arguments      map[string]any
-		retryArguments map[string]any
+		name      string
+		facade    string
+		operation string
+		arguments map[string]any
 	}{
 		{
 			name: "text search", facade: "search", operation: "text",
-			arguments: map[string]any{"query": "storage"}, retryArguments: map[string]any{"query": "storage"},
+			arguments: map[string]any{"query": "storage"},
 		},
 		{
 			name: "symbol search", facade: "search", operation: "symbols",
-			arguments: map[string]any{"query": "storage"}, retryArguments: map[string]any{"query": implementation.Name},
+			arguments: map[string]any{"query": "storage"},
 		},
 		{
 			name: "source read", facade: "read", operation: "source",
-			arguments:      map[string]any{"target": map[string]any{"symbol": longSink.ID}},
-			retryArguments: map[string]any{"target": map[string]any{"symbol": implementation.ID}},
+			arguments: map[string]any{"target": map[string]any{"symbol": longSink.ID}},
 		},
 	}
 	for _, tt := range tests {
@@ -455,20 +605,20 @@ func TestRecoveryWeakResultPreservesAllowanceForEveryOperation(t *testing.T) {
 
 			blocked, token := state.authorizeWithToken(tt.facade, tt.operation, tt.arguments)
 			if blocked != nil || token == 0 {
-				t.Fatalf("first recovery authorization = (%#v, %d)", blocked, token)
+				t.Fatalf("recovery authorization = (%#v, %d)", blocked, token)
 			}
 			completion := state.finishReservedReadTokenWithDigest(token, true, []localizationDigestRow{longSink}, true)
-			if completion.State != localizationStateNeedsRecovery || completion.AllowedToolCalls != 1 {
-				t.Fatalf("weak recovery completion = %#v, want preserved allowance", completion)
+			if completion.State != localizationStateAnswerReady || completion.AllowedToolCalls != 0 || completion.Enforceable {
+				t.Fatalf("weak accepted recovery completion = %#v", completion)
+			}
+			if !strings.HasPrefix(completion.FinalResponse, localizationBoundedHeading+"\n") ||
+				completion.digest == nil || len(completion.digest.Evidence) == 0 || completion.digest.Evidence[0].ID != longSink.ID {
+				t.Fatalf("weak accepted recovery did not retain bounded best evidence: %#v", completion)
 			}
 
-			blocked, retryToken := state.authorizeWithToken(tt.facade, tt.operation, tt.retryArguments)
-			if blocked != nil || retryToken == 0 {
-				t.Fatalf("retry recovery authorization = (%#v, %d)", blocked, retryToken)
-			}
-			completion = state.finishReservedReadTokenWithDigest(retryToken, true, []localizationDigestRow{implementation}, true)
-			if completion.State != localizationStateAnswerReady || completion.AllowedToolCalls != 0 {
-				t.Fatalf("strong recovery completion = %#v, want answer_ready", completion)
+			blocked, retryToken := state.authorizeWithToken(tt.facade, tt.operation, tt.arguments)
+			if blocked == nil || retryToken != 0 {
+				t.Fatalf("accepted recovery repeated after terminal conclusion: (%#v, %d)", blocked, retryToken)
 			}
 		})
 	}
@@ -589,7 +739,7 @@ func TestPlannedRecoveryReplaceFamilyRegression(t *testing.T) {
 	}
 }
 
-func TestPlannedRecoveryIsExactRetriableAndFallsBackToGeneric(t *testing.T) {
+func TestPlannedRecoveryIsExactRetriableAndConcludesAfterAcceptedWeakResult(t *testing.T) {
 	task := "Printed records are duplicated unexpectedly\ncombining --multiline with --replace while --only-matching spans lines"
 	preferred := "crates/searcher/src/sink.rs::sink_slow_multi_line_only_matching"
 	current := []localizationDigestRow{{
@@ -666,14 +816,16 @@ func TestPlannedRecoveryIsExactRetriableAndFallsBackToGeneric(t *testing.T) {
 		Name: "replace_with_captures", Kind: "method", File: "crates/searcher/src/glue.rs",
 	}}
 	completion = state.finishReservedReadTokenWithDigest(token, true, weak, true)
-	generic := newLocalizationRecoveryCompletion()
-	if completion.RequiredAction != generic.RequiredAction || completion.Instruction != generic.Instruction ||
-		len(completion.AllowedOperations) != len(generic.AllowedOperations) {
-		t.Fatalf("weak planned result did not fall back to generic recovery: %#v", completion)
+	if completion.State != localizationStateAnswerReady || completion.AllowedToolCalls != 0 || completion.Enforceable ||
+		!strings.HasPrefix(completion.FinalResponse, localizationBoundedHeading+"\n") {
+		t.Fatalf("weak planned result did not reach a bounded conclusion: %#v", completion)
+	}
+	if completion.digest == nil || len(completion.digest.Evidence) == 0 || completion.digest.Evidence[0].ID != weak[0].ID {
+		t.Fatalf("weak planned result lost accepted evidence: %#v", completion.digest)
 	}
 }
 
-func TestPlannedRecoveryEmptyResultFallsBackToGeneric(t *testing.T) {
+func TestPlannedRecoveryEmptyResultTerminalizesUnconfirmed(t *testing.T) {
 	state := newLocalizationTerminalState()
 	state.armForTask(newLocalizationPlannedRecoveryCompletion("search.symbols", "transform_with"), "--multi-line with --transform duplicates output")
 	blocked, token := state.authorizeWithToken("search", "symbols", map[string]any{"query": "transform_with"})
@@ -681,10 +833,12 @@ func TestPlannedRecoveryEmptyResultFallsBackToGeneric(t *testing.T) {
 		t.Fatalf("planned recovery authorization = (%#v, %d)", blocked, token)
 	}
 	completion := state.finishReservedReadTokenWithDigest(token, true, nil, true)
-	generic := newLocalizationRecoveryCompletion()
-	if completion.State != localizationStateNeedsRecovery || completion.RequiredAction != generic.RequiredAction ||
-		completion.Instruction != generic.Instruction || len(completion.AllowedOperations) != len(generic.AllowedOperations) {
-		t.Fatalf("empty planned result did not fall back to generic recovery: %#v", completion)
+	if completion.State != localizationStateAnswerReady || completion.AllowedToolCalls != 0 || completion.Enforceable ||
+		!strings.HasPrefix(completion.FinalResponse, localizationBoundedHeading+"\n") {
+		t.Fatalf("empty planned recovery did not reach an bounded terminal conclusion: %#v", completion)
+	}
+	if blocked, retryToken := state.authorizeWithToken("search", "symbols", map[string]any{"query": "transform_with"}); blocked == nil || retryToken != 0 {
+		t.Fatalf("empty accepted recovery preserved a retry: (%#v, %d)", blocked, retryToken)
 	}
 }
 

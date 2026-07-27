@@ -73,24 +73,13 @@ type Profile struct {
 	body func() string
 }
 
-// localizationEagerTools is the lean "where is the code that does X"
-// surface: orient, search, trace, read. It is the single source for
-// both the `localization` tool preset (internal/mcp) and the rule
-// table in the localization instructions body.
+// localizationEagerTools is the fixed one-shot localization surface. The
+// terminal contract permits only explore plus one bounded search/read recovery;
+// capabilities remains available for schema discovery. tool_profile and
+// tools_search are kept by every non-facade preset, yielding six published tools
+// in total without leaking the full coding surface into each model turn.
 var localizationEagerTools = []string{
-	// the one-shot localization opener
-	"explore",
-	// orient
-	"smart_context", "index_health",
-	// search
-	"search_symbols", "search_text",
-	// trace
-	"find_usages", "get_callers", "find_implementations",
-	// read — batch_symbols is load-bearing for turn economy: without a
-	// multi-symbol read, follow-ups on a localization neighborhood cost
-	// one turn per symbol (measured +1 median turn on the localization
-	// benchmark when it was left out of this surface).
-	"get_symbol_source", "batch_symbols", "get_file_summary", "read_file",
+	"explore", "search", "read", "capabilities",
 }
 
 // Table returns the profile table. Callers must not mutate the
@@ -104,15 +93,9 @@ func Table() []Profile {
 			body:     coreBody,
 		},
 		{
-			Name:    "localization",
-			Summary: "lean code-finding guidance — diet instructions body, proven tool surface",
-			// ToolPreset is intentionally empty: the profile diets the
-			// @-included body (the per-turn ambient) and keeps the
-			// client-aware default tool surface. The deeper 14-tool
-			// `localization` preset (built from EagerTools below) stays
-			// available via GORTEX_TOOLS=localization — benchmarked, it
-			// cut tools/list ~30% but cost file-hits on cap-adjacent
-			// sessions, so it is opt-in rather than the profile default.
+			Name:       "localization",
+			Summary:    "one-shot code finding — terminal evidence with a minimal fixed tool surface",
+			ToolPreset: "localization",
 			EagerTools: localizationEagerTools,
 			Skills:     []string{"gortex-explore", "gortex-guide", "gortex-debug"},
 			HookTier:   HookTierStandard,

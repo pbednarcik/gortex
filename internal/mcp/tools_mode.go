@@ -157,12 +157,12 @@ func (s *Server) sessionAllows(p *toolPolicy, name string) bool {
 	}
 	// facade-v1 is a static versioned contract: learned legacy promotions
 	// must not leak back into its compact surface.
-	return p.lean && p.preset != FacadeSurfaceVersion && s.isLearnedPromoted(name)
+	return p.lean && !isFacadePreset(p.preset) && s.isLearnedPromoted(name)
 }
 
 func (s *Server) usesFacadeSurface(ctx context.Context) bool {
 	p := s.effectiveSessionPolicy(ctx)
-	return p != nil && p.preset == FacadeSurfaceVersion
+	return p != nil && isFacadePreset(p.preset)
 }
 
 // narrowToPolicy keeps only the tools the policy allows, preserving order.
@@ -247,7 +247,7 @@ func (s *Server) checkToolPresetGate(ctx context.Context, toolName string) *mcp.
 	}
 	guidance := "Call tool_profile to see the available tools."
 	recovery := "tool_profile"
-	if p.preset == FacadeSurfaceVersion {
+	if isFacadePreset(p.preset) {
 		guidance = "Call capabilities to see the available public operations and their schemas."
 		recovery = "capabilities"
 		return NewStructuredErrorResult(StructuredError{

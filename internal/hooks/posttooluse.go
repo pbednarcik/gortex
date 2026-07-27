@@ -82,7 +82,7 @@ func runPostToolUse(data []byte) {
 }
 
 func emitLocalizationTerminalContext(terminal localizationTerminalHookInput) bool {
-	if !localizationTerminalIdentityCurrent(terminal.TerminalIdentity) {
+	if !terminal.TerminalReceipt.Enforceable || !localizationTerminalIdentityCurrent(terminal.TerminalIdentity) {
 		return false
 	}
 	emitPostToolContext(localizationTerminalAdditionalContext(terminal.TerminalReceipt), false)

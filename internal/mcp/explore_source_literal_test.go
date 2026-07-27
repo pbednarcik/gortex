@@ -241,12 +241,30 @@ func TestSourceLiteralCalleeRemainsAuthorizedForRefinement(t *testing.T) {
 	preferred := explorePreferredRefinementSymbol(task, targets)
 	require.Equal(t, callee.ID, preferred)
 
-	_, completion, _, _ := buildLocalizationRefinementResultForTask(
+	result, completion, routes, digest := buildLocalizationRefinementResultForTask(
 		preferred, task, targets, exploreDefaultBudgetTokens, exploreLocalizationRefinementRoutes(targets),
 	)
-	require.Equal(t, localizationStateNeedsRefinement, completion.State)
-	require.Contains(t, completion.AllowedSymbols, callee.ID)
-	require.Contains(t, completion.RequiredAction, callee.ID)
+	require.Equal(t, localizationStateAnswerReady, completion.State)
+	require.False(t, completion.Enforceable)
+	require.Zero(t, completion.AllowedToolCalls)
+	require.Empty(t, completion.AllowedSymbols)
+	require.Contains(t, completion.FinalResponse, localizationBoundedHeading)
+	require.Contains(t, routes, callee.ID, "the packed conclusion must retain the chosen implementation route")
+	require.NotNil(t, digest)
+
+	text, ok := singleTextContent(result)
+	require.True(t, ok)
+	var envelope localizationExploreEnvelope
+	require.NoError(t, json.Unmarshal([]byte(text), &envelope))
+	require.True(t, envelope.Terminal)
+	foundPackedCallee := false
+	for _, evidence := range envelope.Evidence {
+		if evidence.ID == callee.ID && evidence.Source != "" {
+			foundPackedCallee = true
+			break
+		}
+	}
+	require.True(t, foundPackedCallee, "the source-literal callee body must replace the retired refinement read")
 }
 
 func TestMapExploreSourceLiteralMatchesFindsCSharpConstructor(t *testing.T) {
@@ -956,10 +974,12 @@ func TestExploreCompactLiteralIgnoresTestMetadataAndPrefersSpecificProductionCal
 		}
 	}
 	require.NotEqual(t, -1, specificRank, "construction-aligned source evidence must survive final packing")
-	require.Equal(t, localizationStateNeedsRefinement, envelope.Completion.State)
-	require.False(t, envelope.Terminal)
+	require.Equal(t, localizationStateAnswerReady, envelope.Completion.State)
+	require.True(t, envelope.Terminal)
 	require.False(t, envelope.Completion.Enforceable, "ambiguous production literal sites remain advisory")
-	require.Contains(t, envelope.Completion.AllowedSymbols, specificID)
+	require.Zero(t, envelope.Completion.AllowedToolCalls)
+	require.Empty(t, envelope.Completion.AllowedSymbols)
+	require.Contains(t, envelope.Completion.FinalResponse, localizationBoundedHeading)
 }
 
 func TestGatherExploreSourceLiteralRecallBoundsMappingByRequestDeadline(t *testing.T) {

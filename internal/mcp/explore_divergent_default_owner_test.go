@@ -147,6 +147,9 @@ func TestDivergentDefaultOwnerPromotesFromStoreProjectionWithoutEviction(t *test
 	var envelope localizationExploreEnvelope
 	require.NoError(t, json.Unmarshal([]byte(body), &envelope))
 	require.GreaterOrEqual(t, len(envelope.Files), 3)
+	// The prescribed causal owner leads a refinement response, followed by its
+	// owning type and the task-named consumer. Files, Symbols, and Evidence keep
+	// this exact positional order.
 	require.Equal(t, fixture.childCtor.FilePath, envelope.Files[0])
 	require.Equal(t, fixture.childType.FilePath, envelope.Files[1])
 	require.Equal(t, fixture.write.FilePath, envelope.Files[2])

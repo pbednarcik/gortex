@@ -192,9 +192,9 @@ func TestLocalizationConceptComplementSurvivesTightAlignedPacking(t *testing.T) 
 	targets[1].node.Name = "match_ignore_rules"
 	targets[1].node.QualName = "PathWalker.match_ignore_rules"
 	targets[1].conceptImplementation = true
-	targets[2].node.Name = "check_hidden"
-	targets[2].node.QualName = "HiddenMatcher.check_hidden"
-	targets[2].conceptComplement = true
+	targets[8].node.Name = "check_hidden"
+	targets[8].node.QualName = "HiddenMatcher.check_hidden"
+	targets[8].conceptComplement = true
 	targets[0].callees = []*graph.Node{
 		localizationV8Node("repo/relation.go::match_ignore_relation", "match_ignore_relation", "repo/relation.go"),
 	}
@@ -220,7 +220,7 @@ func TestLocalizationConceptComplementSurvivesTightAlignedPacking(t *testing.T) 
 	if err := json.Unmarshal([]byte(text), &envelope); err != nil {
 		t.Fatalf("decode complement envelope: %v", err)
 	}
-	wantHead := []string{targets[0].node.ID, targets[1].node.ID, targets[2].node.ID}
+	wantHead := []string{targets[0].node.ID, targets[1].node.ID, targets[8].node.ID}
 	if len(envelope.Evidence) < len(wantHead) {
 		t.Fatalf("packed rows = %d, want at least %d", len(envelope.Evidence), len(wantHead))
 	}
@@ -250,19 +250,27 @@ func TestRecoveryAllowsInferredConcreteIdentifierOnlyForScopedSymbolEvidence(t *
 		t.Fatalf("inferred exact identifier authorization = (%#v, %d)", blocked, firstToken)
 	}
 	zero := state.finishReservedReadTokenWithDigest(firstToken, true, nil, true)
-	if zero.State != localizationStateNeedsRecovery || zero.AllowedToolCalls != 1 || zero.digest != retained {
-		t.Fatalf("empty typed page consumed recovery: %#v", zero)
+	if zero.State != localizationStateAnswerReady || zero.AllowedToolCalls != 0 || zero.digest == nil ||
+		len(zero.digest.Evidence) == 0 || zero.digest.Evidence[0].ID != retained.Evidence[0].ID {
+		t.Fatalf("empty typed page did not conclude with retained evidence: %#v", zero)
+	}
+	if blocked, retryToken := state.authorizeWithToken("search", "symbols", args); blocked == nil || retryToken != 0 {
+		t.Fatalf("empty accepted symbol recovery preserved a retry: (%#v, %d)", blocked, retryToken)
 	}
 
-	blocked, secondToken := state.authorizeWithToken("search", "symbols", args)
-	if blocked != nil || secondToken == 0 || secondToken == firstToken {
-		t.Fatalf("restored exact identifier authorization = (%#v, %d)", blocked, secondToken)
+	capturedState := newLocalizationTerminalState()
+	capturedCompletion := newLocalizationRecoveryCompletion()
+	capturedCompletion.digest = retained
+	capturedState.armForTask(capturedCompletion, "investigate registry configuration behavior")
+	blocked, capturedToken := capturedState.authorizeWithToken("search", "symbols", args)
+	if blocked != nil || capturedToken == 0 {
+		t.Fatalf("captured identifier authorization = (%#v, %d)", blocked, capturedToken)
 	}
-	captureCtx := withLocalizationPermittedEvidenceCapture(context.Background(), secondToken)
+	captureCtx := withLocalizationPermittedEvidenceCapture(context.Background(), capturedToken)
 	node := localizationV8Node("repo/policy.go::DerivedPolicy.ApplyRule", "ApplyRule", "repo/policy.go")
 	captureLocalizationSearchSymbols(captureCtx, []*graph.Node{node})
-	rows, recorded := localizationEvidenceForPermittedCall(captureCtx, "search", "symbols", secondToken)
-	ready := state.finishReservedReadTokenWithDigest(secondToken, true, rows, recorded)
+	rows, recorded := localizationEvidenceForPermittedCall(captureCtx, "search", "symbols", capturedToken)
+	ready := capturedState.finishReservedReadTokenWithDigest(capturedToken, true, rows, recorded)
 	if ready.State != localizationStateAnswerReady || ready.digest == nil || ready.digest.Evidence[0].ID != node.ID {
 		t.Fatalf("nonempty typed symbol page did not terminalize current-first: %#v", ready)
 	}
@@ -447,7 +455,7 @@ func TestFacadeLocalizedCompletionStripsAuthWithoutPublishingReceipt(t *testing.
 		server.localizationFor(ctx).armForTask(completion, req.GetString("task", ""))
 		return result, nil
 	})
-	server = &Server{facades: registry, localization: newLocalizationTerminalState(), sessions: newSessionMap()}
+	server = newStrictLocalizationFacadeTestServer(registry)
 
 	token, ok := localizationauth.NewToken()
 	if !ok {
@@ -508,7 +516,7 @@ func TestFacadeAuthArgumentIsStrippedAndPublishesTypedTerminalReceipts(t *testin
 		server.localizationFor(ctx).armForTask(completion, req.GetString("task", ""))
 		return localizationAnswerReadyResult(completion), nil
 	})
-	server = &Server{facades: registry, localization: newLocalizationTerminalState(), sessions: newSessionMap()}
+	server = newStrictLocalizationFacadeTestServer(registry)
 
 	newToken := func(t *testing.T) string {
 		t.Helper()
@@ -557,14 +565,18 @@ func TestFacadeAuthArgumentIsStrippedAndPublishesTypedTerminalReceipts(t *testin
 	directReceipt := requireReceipt(t, directToken, direct)
 
 	replayToken := newToken(t)
-	replayArgs := map[string]any{"operation": "symbols", "query": "AnyIdentifier", localizationauth.ArgumentKey: replayToken}
-	replay, err := server.handleFacade(ctx, "search", mcpgo.CallToolRequest{Params: mcpgo.CallToolParams{Name: "search", Arguments: replayArgs}})
+	replayArgs := map[string]any{
+		"operation":                  "localize",
+		"task":                       "locate registry configuration",
+		localizationauth.ArgumentKey: replayToken,
+	}
+	replay, err := server.handleFacade(ctx, "explore", mcpgo.CallToolRequest{Params: mcpgo.CallToolParams{Name: "explore", Arguments: replayArgs}})
 	if err != nil || replay == nil || replay.IsError {
-		t.Fatalf("authenticated replay = (%#v, %v)", replay, err)
+		t.Fatalf("authenticated explicit-localize replay = (%#v, %v)", replay, err)
 	}
 	replayReceipt := requireReceipt(t, replayToken, replay)
 	if replayReceipt.FinalResponse != directReceipt.FinalResponse {
-		t.Fatal("authenticated replay receipt diverged from direct answer_ready")
+		t.Fatal("authenticated explicit-localize replay receipt diverged from direct answer_ready")
 	}
 
 	errorCtx := WithSessionID(context.Background(), "auth_terminal_error")

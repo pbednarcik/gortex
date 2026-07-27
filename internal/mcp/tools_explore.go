@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"path"
 	"regexp"
 	"sort"
 	"strings"
@@ -84,11 +85,15 @@ type exploreTarget struct {
 	callees               []*graph.Node
 	directCalleesComplete bool // false when the direct projection was truncated, bounded, or otherwise lower-bound
 	causalCallees         []exploreCausalNeighbor
+	causalChangeBridge    bool   // one graph-proven caller/callee retained as provenance for a promoted continuation
+	causalChangeLeaf      bool   // graph-proven wrapper implementation or task-aligned cross-file change callable
+	causalChangeOwner     bool   // same-file type that encloses or is uniquely returned by the causal change callable
 	source                string // full body (may be empty for non-source kinds)
 	divergentDefaultOwner bool   // unique child constructor whose concrete default causes the queried behavior
 	divergentDefaultType  bool   // owning type paired with divergentDefaultOwner for coherent file/symbol output
 	conceptImplementation bool   // primary identifier-backed callable; may establish answer readiness
 	conceptComplement     bool   // marginal concept callable protected as evidence, never as terminal proof
+	syntacticAnchor       bool   // task-spelled flag/identifier owner protected by bounded lexical competition
 	exactContent          bool   // verified full quoted-literal hit from content_fts
 	exactContentAmbiguous bool   // exact evidence has visible or possibly truncated peers
 	sourceLiteral         bool   // exact source-body hit that must survive final envelope packing
@@ -1408,11 +1413,50 @@ func exploreNormalizedPath(text string) string {
 }
 
 func exploreQueryPathAnchors(query string) ([]string, bool) {
-	anchors := make([]string, 0, 1)
+	fields := make([]string, 0, 2)
+	routeLike := 0
+	for _, raw := range strings.Fields(query) {
+		field := strings.Trim(raw, "`'\"()[]{}<>,;")
+		// A route is commonly embedded in a call token such as
+		// r.GET("/base/:id"). Extract the quoted value before classifying it;
+		// treating the whole call as a source path poisons every later basename
+		// match in the request.
+		if quote := strings.IndexAny(field, "`'\""); quote >= 0 {
+			field = field[quote+1:]
+			if end := strings.IndexAny(field, "`'\""); end >= 0 {
+				field = field[:end]
+			}
+			field = strings.Trim(field, "`'\"()[]{}<>,;")
+		}
+		if !strings.ContainsAny(field, "/\\") || strings.Contains(field, "://") {
+			continue
+		}
+		// A fully qualified Go stack symbol (`github.com/acme/pkg.(*T).M`) is
+		// a package-qualified callable, not a user-supplied source directory.
+		// Let a later basename/file:line anchor such as `tree.go:637` match
+		// instead of making this package token veto every basename.
+		if strings.Contains(field, "(*") && strings.Contains(field, ").") {
+			continue
+		}
+		fields = append(fields, field)
+		normalized := strings.ReplaceAll(field, "\\", "/")
+		if strings.HasPrefix(normalized, "/") {
+			base := normalized[strings.LastIndex(normalized, "/")+1:]
+			dot := strings.LastIndex(base, ".")
+			if dot <= 0 || dot == len(base)-1 {
+				routeLike++
+			}
+		}
+	}
+
+	anchors := make([]string, 0, len(fields))
 	hasDirectory := false
-	for _, field := range strings.Fields(query) {
-		field = strings.Trim(field, "`'\"()[]{}<>,;")
-		if !strings.ContainsAny(field, "/\\") {
+	for _, field := range fields {
+		normalized := strings.ReplaceAll(field, "\\", "/")
+		base := normalized[strings.LastIndex(normalized, "/")+1:]
+		dot := strings.LastIndex(base, ".")
+		rootedWithoutExtension := strings.HasPrefix(normalized, "/") && (dot <= 0 || dot == len(base)-1)
+		if rootedWithoutExtension && (routeLike >= 2 || strings.Contains(normalized, "/:") || strings.ContainsAny(normalized, "{}")) {
 			continue
 		}
 		hasDirectory = true
@@ -1796,9 +1840,322 @@ type exploreConceptImplementationMetric struct {
 	matchedMask uint64
 }
 
-const exploreConceptComplementSignal = "explore_concept_complement"
+const (
+	exploreConceptComplementSignal = "explore_concept_complement"
+	exploreSyntacticAnchorSignal   = "explore_syntactic_anchor"
+)
 
 // reserveExploreConceptImplementation keeps the strongest identifier-backed
+type exploreComponentConjunctionKey struct {
+	workspaceID string
+	projectID   string
+	repoPrefix  string
+	directory   string
+}
+
+type exploreComponentConjunctionSeed struct {
+	index   int
+	node    *graph.Node
+	file    string
+	matched []bool
+}
+
+type exploreComponentConjunctionScore struct {
+	groups   int
+	marginal int
+	rarity   int
+	longest  int
+}
+
+type exploreComponentConjunctionWinner struct {
+	index    int
+	seedRank int
+	score    exploreComponentConjunctionScore
+}
+
+func exploreComponentConjunctionFile(node *graph.Node) string {
+	if node == nil {
+		return ""
+	}
+	file := path.Clean(strings.ReplaceAll(strings.TrimSpace(node.FilePath), "\\", "/"))
+	if file == "" || file == "." || file == "/" || file == ".." || strings.HasPrefix(file, "../") {
+		return ""
+	}
+	return strings.ToLower(file)
+}
+
+func exploreComponentConjunctionComponent(node *graph.Node) (exploreComponentConjunctionKey, bool) {
+	file := exploreComponentConjunctionFile(node)
+	if file == "" {
+		return exploreComponentConjunctionKey{}, false
+	}
+	directory := path.Dir(file)
+	if directory == "" || directory == "." || directory == "/" || directory == ".." || strings.HasPrefix(directory, "../") {
+		return exploreComponentConjunctionKey{}, false
+	}
+	return exploreComponentConjunctionKey{
+		workspaceID: strings.ToLower(strings.TrimSpace(node.WorkspaceID)),
+		projectID:   strings.ToLower(strings.TrimSpace(node.ProjectID)),
+		repoPrefix:  strings.ToLower(strings.TrimSpace(node.RepoPrefix)),
+		directory:   directory,
+	}, true
+}
+
+func exploreComponentConjunctionMatches(node *graph.Node, terms []string) []bool {
+	matched := make([]bool, len(terms))
+	for index, term := range terms {
+		matched[index] = exploreConceptImplementationHasTerm(node, term)
+	}
+	return matched
+}
+
+func exploreComponentConjunctionScoreCompare(left, right exploreComponentConjunctionScore) int {
+	for _, pair := range [...][2]int{
+		{left.groups, right.groups},
+		{left.marginal, right.marginal},
+		{left.rarity, right.rarity},
+		{left.longest, right.longest},
+	} {
+		if pair[0] > pair[1] {
+			return 1
+		}
+		if pair[0] < pair[1] {
+			return -1
+		}
+	}
+	return 0
+}
+
+// reserveExploreComponentConjunction recovers one callable whose identifier
+// completes a task concept already visible in another file of the same exact
+// component. It only reorders the bounded retrieval pool: no graph or source
+// work is added, the semantic head is fixed, and ambiguous component ties are
+// deliberately left untouched.
+func reserveExploreComponentConjunction(
+	query string,
+	queryClass rerank.QueryClass,
+	candidates []*rerank.Candidate,
+	maxSymbols int,
+) []*rerank.Candidate {
+	if queryClass != rerank.QueryClassConcept || maxSymbols < 2 || len(candidates) < 2 {
+		return candidates
+	}
+	width := min(maxSymbols, len(candidates))
+	if width < 2 {
+		return candidates
+	}
+
+	lowValue := exploreConceptComplementLowValueTermSet(query)
+	queryTermSet := exploreTerminalTerms(query)
+	terms := make([]string, 0, len(queryTermSet))
+	groups := make(map[string]struct{}, len(queryTermSet))
+	for term := range queryTermSet {
+		if _, low := lowValue[term]; low {
+			continue
+		}
+		terms = append(terms, term)
+		groups[exploreConceptBehavioralTermGroup(term)] = struct{}{}
+	}
+	if len(terms) < 2 || len(groups) < 2 {
+		return candidates
+	}
+	sort.Strings(terms)
+
+	leadTerms := exploreTerminalTerms(exploreConceptIssueLead(query))
+	lead := make([]bool, len(terms))
+	leadCount := 0
+	for index, term := range terms {
+		if _, present := leadTerms[term]; present {
+			lead[index] = true
+			leadCount++
+		}
+	}
+	if leadCount == 0 {
+		return candidates
+	}
+
+	matches := make([][]bool, len(candidates))
+	frequency := make([]int, len(terms))
+	for candidateIndex, candidate := range candidates {
+		if candidate == nil || candidate.Node == nil {
+			continue
+		}
+		matches[candidateIndex] = exploreComponentConjunctionMatches(candidate.Node, terms)
+		for termIndex, matched := range matches[candidateIndex] {
+			if matched {
+				frequency[termIndex]++
+			}
+		}
+	}
+
+	seeds := make(map[exploreComponentConjunctionKey][]exploreComponentConjunctionSeed)
+	for index := 0; index < width; index++ {
+		candidate := candidates[index]
+		if candidate == nil || candidate.Node == nil || exploreDraftIsTestNode(candidate.Node) ||
+			!exploreCodeDefinitionKind(candidate.Node.Kind) {
+			continue
+		}
+		component, ok := exploreComponentConjunctionComponent(candidate.Node)
+		if !ok {
+			continue
+		}
+		taskAligned := false
+		for _, matched := range matches[index] {
+			if matched {
+				taskAligned = true
+				break
+			}
+		}
+		if !taskAligned {
+			continue
+		}
+		seeds[component] = append(seeds[component], exploreComponentConjunctionSeed{
+			index: index, node: candidate.Node,
+			file: exploreComponentConjunctionFile(candidate.Node), matched: matches[index],
+		})
+	}
+	if len(seeds) == 0 {
+		return candidates
+	}
+
+	sameNode := func(left, right *graph.Node) bool {
+		if left == nil || right == nil {
+			return false
+		}
+		if left.ID != "" && right.ID != "" {
+			return left.ID == right.ID
+		}
+		return left == right
+	}
+	bestByComponent := make(map[exploreComponentConjunctionKey]exploreComponentConjunctionWinner)
+	for index, candidate := range candidates {
+		if candidate == nil || candidate.Node == nil || exploreDraftIsTestNode(candidate.Node) ||
+			(candidate.Node.Kind != graph.KindFunction && candidate.Node.Kind != graph.KindMethod) ||
+			exploreDraftGenericCandidate(candidate.Node, "") {
+			continue
+		}
+		component, ok := exploreComponentConjunctionComponent(candidate.Node)
+		if !ok {
+			continue
+		}
+		componentSeeds := seeds[component]
+		if len(componentSeeds) == 0 {
+			continue
+		}
+
+		base := make([]bool, len(terms))
+		candidateFile := exploreComponentConjunctionFile(candidate.Node)
+		seedRank := len(candidates)
+		hasOtherSeed := false
+		differentFile := false
+		for _, seed := range componentSeeds {
+			if sameNode(seed.node, candidate.Node) {
+				continue
+			}
+			hasOtherSeed = true
+			if seed.index < seedRank {
+				seedRank = seed.index
+			}
+			if seed.file != candidateFile {
+				differentFile = true
+			}
+			for termIndex, matched := range seed.matched {
+				base[termIndex] = base[termIndex] || matched
+			}
+		}
+		if !hasOtherSeed || !differentFile {
+			continue
+		}
+
+		candidateMatched := 0
+		marginal := 0
+		rarity := 0
+		longest := 0
+		unionGroups := make(map[string]struct{}, len(groups))
+		leadAligned := false
+		for termIndex, term := range terms {
+			candidateHasTerm := matches[index][termIndex]
+			if candidateHasTerm {
+				candidateMatched++
+				if len(term) > longest {
+					longest = len(term)
+				}
+				if !base[termIndex] {
+					marginal++
+					denominator := frequency[termIndex]
+					if denominator < 1 {
+						denominator = 1
+					}
+					rarity += 1000 / denominator
+				}
+			}
+			if base[termIndex] || candidateHasTerm {
+				unionGroups[exploreConceptBehavioralTermGroup(term)] = struct{}{}
+				leadAligned = leadAligned || lead[termIndex]
+			}
+		}
+		if candidateMatched == 0 || marginal == 0 || len(unionGroups) < 2 || !leadAligned ||
+			(longest < 5 && candidateMatched < 2) {
+			continue
+		}
+
+		winner := exploreComponentConjunctionWinner{
+			index:    index,
+			seedRank: seedRank,
+			score: exploreComponentConjunctionScore{
+				groups: len(unionGroups), marginal: marginal, rarity: rarity, longest: longest,
+			},
+		}
+		previous, exists := bestByComponent[component]
+		comparison := exploreComponentConjunctionScoreCompare(winner.score, previous.score)
+		if !exists || comparison > 0 ||
+			(comparison == 0 && (winner.seedRank < previous.seedRank ||
+				(winner.seedRank == previous.seedRank && winner.index < previous.index))) {
+			bestByComponent[component] = winner
+		}
+	}
+	if len(bestByComponent) == 0 {
+		return candidates
+	}
+
+	best := exploreComponentConjunctionWinner{index: -1}
+	ambiguous := false
+	for _, winner := range bestByComponent {
+		if best.index < 0 {
+			best = winner
+			continue
+		}
+		comparison := exploreComponentConjunctionScoreCompare(winner.score, best.score)
+		if comparison > 0 {
+			best = winner
+			ambiguous = false
+		} else if comparison == 0 {
+			ambiguous = true
+		}
+	}
+	if best.index < 0 || ambiguous {
+		return candidates
+	}
+
+	result := append([]*rerank.Candidate(nil), candidates...)
+	clone := *result[best.index]
+	clone.Signals = make(map[string]float64, len(result[best.index].Signals)+1)
+	for key, value := range result[best.index].Signals {
+		clone.Signals[key] = value
+	}
+	clone.Signals[exploreConceptComplementSignal] = 1
+	promoted := &clone
+	if best.index < width {
+		result[best.index] = promoted
+		return result
+	}
+
+	target := width - 1
+	copy(result[target+1:best.index+1], result[target:best.index])
+	result[target] = promoted
+	return result
+}
+
 // callable plus up to two callables that cover distinct task concepts in the
 // final window. Retrieval width and response size remain unchanged. The
 // semantic head stays first; reserved implementations occupy the next slots.
@@ -2441,6 +2798,7 @@ func (s *Server) handleExplore(ctx context.Context, req mcp.CallToolRequest) (*m
 		_, prod = diversifyByFile(prodNodes, prod, defaultMaxPerFile)
 	}
 	prod, protectedImplementationID := reserveExploreConceptImplementation(searchQuery, queryClass, prod, maxSymbols)
+	prod = reserveExploreComponentConjunction(searchQuery, queryClass, prod, maxSymbols)
 	cands := selectFinalExploreCandidates(prod, test, maxSymbols)
 	if len(protectedSyntacticAnchors) > 0 {
 		// Source-literal selection owns its own final-slot guarantees. Re-union
@@ -2509,6 +2867,7 @@ func (s *Server) handleExplore(ctx context.Context, req mcp.CallToolRequest) (*m
 		}
 		if c.Signals != nil {
 			t.conceptComplement = c.Signals[exploreConceptComplementSignal] > 0
+			t.syntacticAnchor = c.Signals[exploreSyntacticAnchorSignal] > 0
 			t.exactContent = c.Signals[exploreContentRecallExactSignal] > 0
 			t.exactContentAmbiguous = c.Signals[exploreContentRecallAmbiguousSignal] > 0
 			t.sourceLiteral = c.Signals[exploreSourceLiteralSignal] > 0
@@ -2567,6 +2926,20 @@ func (s *Server) handleExplore(ctx context.Context, req mcp.CallToolRequest) (*m
 			target.callees, projectionComplete = ringNeighborsProjection(direct, target.node.ID, exploreRingCap)
 			target.directCalleesComplete = target.directCalleesComplete && projectionComplete
 		}
+	}
+	if len(symbolTargets) > 0 {
+		symbolTargets = promoteExploreCausalChangeTargets(task, symbolTargets, s.graph, maxSymbols, func(node *graph.Node) string {
+			return s.manifestSymbolSource(ctx, node)
+		}, func(node *graph.Node) ([]*graph.Node, bool) {
+			callees := eng.GetCallChain(node.ID, ringOpts)
+			if callees == nil {
+				return nil, false
+			}
+			direct, projectionComplete := ringNeighborsProjection(callees.Nodes, node.ID, exploreRingCap)
+			complete := !callees.Truncated && !callees.BudgetHit && !callees.LowerBound && projectionComplete
+			return direct, complete
+		})
+		targets = append(targets[:len(artifactTargets):len(artifactTargets)], symbolTargets...)
 	}
 	if exploreQueryIsConceptTask(task) && len(targets) > len(artifactTargets) {
 		symbolTargets := promoteExploreDivergentDefaultOwner(task, targets[len(artifactTargets):], s.graph, maxSymbols, func(node *graph.Node) string {
@@ -2639,6 +3012,13 @@ func (s *Server) handleExplore(ctx context.Context, req mcp.CallToolRequest) (*m
 		result, refinement, boundedRoutes, digest := buildLocalizationRefinementResultForTask(
 			preferredSymbol, task, targets, budget, routes,
 		)
+		if result.IsError {
+			// A failed response never owns the session. In particular, an
+			// irreducible packing error must not make a long-running coding turn
+			// terminal merely because localization was requested within it.
+			s.localizationFor(ctx).keepOpenForTask(task)
+			return result, nil
+		}
 		if refinement.State != localizationStateNeedsRefinement {
 			refinement.digest = digest
 			s.localizationFor(ctx).armForTask(refinement, task)
@@ -2660,6 +3040,10 @@ func (s *Server) handleExplore(ctx context.Context, req mcp.CallToolRequest) (*m
 	// too, whose success promotes to answer_ready with the evidence already
 	// stashed.
 	result, _, digest, completion := buildLocalizationExploreResultForTaskFinalized(completion, task, targets, budget)
+	if result.IsError {
+		s.localizationFor(ctx).keepOpenForTask(task)
+		return result, nil
+	}
 	// Literal-driven terminality must show its evidence: when the verdict
 	// rests on a quoted-literal match but the budgeted envelope shed the
 	// literal, downgrade to the bounded refinement read instead of telling
@@ -2674,6 +3058,10 @@ func (s *Server) handleExplore(ctx context.Context, req mcp.CallToolRequest) (*m
 		refined, refinement, boundedRoutes, refinedDigest := buildLocalizationRefinementResultForTask(
 			preferredSymbol, task, targets, budget, routes,
 		)
+		if refined.IsError {
+			s.localizationFor(ctx).keepOpenForTask(task)
+			return refined, nil
+		}
 		if refinement.State != localizationStateNeedsRefinement {
 			refinement.digest = refinedDigest
 			s.localizationFor(ctx).armForTask(refinement, task)
@@ -3090,6 +3478,17 @@ func localizationEvidenceTargetsFromDraft(task, exactID string, targets []explor
 	if draft == nil && strings.TrimSpace(task) != "" {
 		draft = exploreAnswerDraft(task, targets)
 	}
+	// Preserve the issue author's explicit file/symbol anchor before causal
+	// owner promotion. The owner still remains adjacent, but a proven upstream
+	// cause must not hide the named implementation target from PRIMARY evidence.
+	if explicitID := exploreLocalizationExplicitTarget(task, targets); explicitID != "" {
+		for _, target := range targets {
+			if target.node != nil && target.node.ID == explicitID {
+				appendTarget(target)
+				break
+			}
+		}
+	}
 	// A graph-proven causal constructor and its owning type outrank the
 	// downstream retrieval seed. Their explicit admission metadata survives
 	// draft ranking, owner folding, and byte-budget packing, so this ordering is
@@ -3144,6 +3543,27 @@ func localizationEvidenceTargetsFromDraft(task, exactID string, targets []explor
 	for _, target := range targets {
 		if target.typedAnchorProjection {
 			appendTarget(target)
+		}
+	}
+	// A graph-proven change owner, bridge, and continuation outrank concept-only
+	// retrieval complements. The retrieval head remains first; this reservation
+	// only replaces non-causal tail rows when the final evidence window is full.
+	for _, target := range targets {
+		if target.causalChangeOwner {
+			appendTarget(target)
+			break
+		}
+	}
+	for _, target := range targets {
+		if target.causalChangeBridge {
+			appendTarget(target)
+			break
+		}
+	}
+	for _, target := range targets {
+		if target.causalChangeLeaf {
+			appendTarget(target)
+			break
 		}
 	}
 	// Concept reservations are weaker than exact, source-literal, typed, and
@@ -3268,11 +3688,13 @@ func interleaveLocalizationDirectRelationsWithRoutes(
 		}
 		direct[target.node.ID] = target
 		if index < localizationDirectEvidenceReserve || target.node.ID == requiredID ||
+			target.causalChangeBridge || target.causalChangeLeaf || target.causalChangeOwner ||
 			target.divergentDefaultOwner || target.divergentDefaultType || target.conceptImplementation || target.conceptComplement ||
 			target.exactContent || target.sourceLiteral || target.typedAnchorProjection {
 			protected[target.node.ID] = struct{}{}
 		}
-		if target.node.ID == requiredID || target.divergentDefaultOwner || target.divergentDefaultType ||
+		if target.node.ID == requiredID || target.causalChangeBridge || target.causalChangeLeaf || target.causalChangeOwner ||
+			target.divergentDefaultOwner || target.divergentDefaultType ||
 			target.conceptImplementation || target.conceptComplement ||
 			target.exactContent || target.sourceLiteral || target.typedAnchorProjection {
 			orderedPrefix = index + 1
@@ -3390,6 +3812,7 @@ func interleaveLocalizationDirectRelationsWithRoutes(
 		if !exists {
 			relation = exploreTarget{node: best.node, localizationRelation: best.direction}
 		} else if relation.node.ID != requiredID &&
+			!relation.causalChangeBridge && !relation.causalChangeLeaf && !relation.causalChangeOwner &&
 			!relation.divergentDefaultOwner && !relation.divergentDefaultType &&
 			!relation.conceptImplementation && !relation.conceptComplement &&
 			!relation.exactContent && !relation.sourceLiteral && !relation.typedAnchorProjection {
@@ -3429,6 +3852,41 @@ func interleaveLocalizationDirectRelationsWithRoutes(
 		}
 	}
 	return selected
+}
+
+// prioritizeLocalizationConceptComplement keeps the implementation pair close
+// enough for agents to interpret it as one unit. The semantic head and its
+// primary implementation retain ranks one and two; a later task-complementary
+// callable is stably rotated into rank three before the aligned wire projection
+// is packed. No row is added or removed.
+func prioritizeLocalizationConceptComplement(targets []exploreTarget) []exploreTarget {
+	if len(targets) < 3 {
+		return targets
+	}
+	hasLeadingImplementation := false
+	for index := 0; index < 2; index++ {
+		if targets[index].conceptImplementation {
+			hasLeadingImplementation = true
+			break
+		}
+	}
+	if !hasLeadingImplementation {
+		return targets
+	}
+	for index := 2; index < len(targets); index++ {
+		if !targets[index].conceptComplement {
+			continue
+		}
+		if index == 2 {
+			return targets
+		}
+		ordered := append([]exploreTarget(nil), targets...)
+		complement := ordered[index]
+		copy(ordered[3:index+1], ordered[2:index])
+		ordered[2] = complement
+		return ordered
+	}
+	return targets
 }
 
 func newLocalizationExploreResult(completion localizationCompletion, targets []exploreTarget, budget int) *mcp.CallToolResult {
@@ -3488,19 +3946,19 @@ func buildLocalizationRefinementResultForTask(
 	routes map[string]localizationRefinementRoute,
 ) (*mcp.CallToolResult, localizationCompletion, map[string]localizationRefinementRoute, *localizationEvidenceDigest) {
 	choosePreferred := func(symbols []string, requested string) (string, []string, map[string]localizationRefinementRoute) {
-		authorized, bounded := boundedLocalizationRefinementRoutes(symbols, routes, requested)
+		_, bounded := boundedLocalizationRefinementRoutes(symbols, routes, requested)
 		if requested != "" {
-			if _, ok := bounded[requested]; ok {
-				return requested, authorized, bounded
+			if route, ok := bounded[requested]; ok {
+				return requested, []string{requested}, map[string]localizationRefinementRoute{requested: route}
 			}
 		}
 		_, bounded = boundedLocalizationRefinementRoutes(symbols, routes, "")
 		for _, symbol := range symbols {
-			if _, ok := bounded[symbol]; !ok {
+			route, ok := bounded[symbol]
+			if !ok {
 				continue
 			}
-			authorized, bounded = boundedLocalizationRefinementRoutes(symbols, routes, symbol)
-			return symbol, authorized, bounded
+			return symbol, []string{symbol}, map[string]localizationRefinementRoute{symbol: route}
 		}
 		return "", nil, nil
 	}
@@ -3513,9 +3971,11 @@ func buildLocalizationRefinementResultForTask(
 		return result, packedCompletion, nil, digest
 	}
 
-	// Budget against the largest completion this envelope can expose. The final
-	// allowed set is an equal or smaller intersection with serialized symbols,
-	// so replacing this provisional contract cannot invalidate the byte cap.
+	// A localization-only request needs the ranked location, not a second model
+	// turn that asks the server for source it has already hydrated. Authorize the
+	// server-ranked preferred refinement only, so the packing pass can inline
+	// that body and retire the deterministic read. Other ranked candidates stay
+	// visible in the canonical evidence and final response.
 	budgetCompletion := newLocalizationRefinementCompletionForSymbols(preferredSymbol, preauthorized)
 	budgetCompletion.refinementRoutes = prebounded
 	var finalRoutes map[string]localizationRefinementRoute
@@ -3562,10 +4022,14 @@ func buildLocalizationExploreResultForTaskFinalized(
 	targets = localizationEvidenceTargetsFromDraft(task, requiredSymbol, targets, draft)
 	if refinementFirst {
 		targets = prioritizeLocalizationEvidenceTarget(requiredSymbol, targets)
+		// A divergent-default refinement is one causal unit: keep the prescribed
+		// constructor adjacent to its owning type before the named consumer.
+		targets = preserveExploreDivergentDefaultOrder(targets)
 	}
 	targets = interleaveLocalizationDirectRelationsWithRoutes(
 		task, requiredSymbol, targets, completion.refinementRoutes,
 	)
+	targets = prioritizeLocalizationConceptComplement(targets)
 	contract := localizationContractFor(completion)
 	envelope := localizationExploreEnvelope{
 		Completion: contract.Completion,
@@ -3702,12 +4166,13 @@ func buildLocalizationExploreResultForTaskFinalized(
 		seenBody[index] = struct{}{}
 		bodyOrder = append(bodyOrder, index)
 	}
-	// The authorized exact symbol's body is precisely what the prescribed read
-	// would return, so it packs first: shipping it here can retire the round
-	// trip, while a preferred body that loses the slot stays one call away.
-	if envelope.Completion.State == localizationStateNeedsExactRead && requiredSymbol != "" {
+	// The prescribed symbol's body is precisely what the bounded read would
+	// return, so it packs first for both exact reads and refinements. Shipping it
+	// here can retire the round trip; letting unrelated preferred bodies consume
+	// the fixed body slots makes the later retirement pass unreachable.
+	if prescribed := localizationPrescribedSymbol(envelope.Completion); prescribed != "" {
 		for index, target := range acceptedTargets {
-			if target.node != nil && target.node.ID == requiredSymbol {
+			if target.node != nil && target.node.ID == prescribed {
 				appendBodyIndex(index)
 				break
 			}
@@ -3756,6 +4221,7 @@ func buildLocalizationExploreResultForTaskFinalized(
 	// still told them to. So pack the body and retire the read together, or
 	// do neither — the half-measure costs payload and saves no call.
 	claimedAnswer := false
+	boundedConclusion := false
 	if prescribed := localizationPrescribedSymbol(envelope.Completion); prescribed != "" &&
 		localizationPrescriptionHasNothingLeftToChoose(envelope.Completion) {
 		// The allowance is what makes this reachable: a full page fills its
@@ -3771,6 +4237,11 @@ func buildLocalizationExploreResultForTaskFinalized(
 				claimedAnswer = true
 				envelope.Completion = localizationCompletionRetiringPrescribedRead(envelope.Completion)
 			} else {
+				// The body still makes the prescribed read redundant even when its
+				// metadata alone does not clear the hard lead-alignment bar. Conclude
+				// localization explicitly as bounded/unconfirmed after the digest is
+				// built instead of leaving a contradictory continue_task state.
+				boundedConclusion = true
 				envelope.Completion = localizationCompletionReleasingPrescribedRead(envelope.Completion)
 			}
 		}
@@ -3780,72 +4251,131 @@ func buildLocalizationExploreResultForTaskFinalized(
 	// share this one normalized completion value.
 	envelope.Completion = localizationFinalizeCompletionEvidence(task, envelope.Completion, acceptedTargets, envelope)
 	if claimedAnswer && envelope.Completion.State != localizationStateAnswerReady {
-		// The policy would not stand behind the retirement — an unproven answer
-		// is demoted to a recovery page, which is a worse offer than the bounded
-		// read we started from. Put back the prescription, and with it the bytes
-		// that only made sense if the read went away.
-		satisfiedSymbol = ""
-		envelope = prescribedEnvelope
-		envelope.Completion = localizationFinalizeCompletionEvidence(
-			task, envelope.Completion, acceptedTargets, envelope)
+		// Hard terminal policy may decline to call a ranked answer proven even
+		// though the prescribed body is already present and task-aligned. Keep
+		// that body and release the redundant read as a bounded conclusion. A
+		// localization-only caller answers from the explicitly unconfirmed page;
+		// task/coding tools remain available because only navigation is terminal.
+		boundedConclusion = true
+		envelope.Completion = localizationCompletionReleasingPrescribedRead(prescribedEnvelope.Completion)
 	}
 	contract = localizationContractFor(envelope.Completion)
 	envelope.Completion = contract.Completion
 	envelope.Terminal = contract.Terminal
 	digest := newLocalizationEvidenceDigestForTask(task, envelope)
-	envelope.Completion = localizationCompletionBoundedByDigest(envelope.Completion, digest)
+	alignLocalizationEnvelopeWithDigest(&envelope, digest)
 	// The serialized completion, returned state, structuredContent, and host
-	// metadata must carry the same final_response. Build the digest first, then
-	// enrich the one completion value before any wire representation is made.
-	envelope.Completion = localizationCompletionWithDigest(envelope.Completion, digest)
-	contract = localizationContractFor(envelope.Completion)
-	envelope.Completion = contract.Completion
-	envelope.Terminal = contract.Terminal
+	// metadata must carry the same final_response. Reconcile through one closure
+	// initially and after every later digest mutation so a shed proof row can
+	// never remain authorized by stale completion fields.
+	reconcilePackedCompletion := func() {
+		envelope.Completion = localizationCompletionBoundedByDigest(envelope.Completion, digest)
+		if boundedConclusion {
+			envelope.Completion = newLocalizationBoundedConclusionCompletion(digest)
+		} else {
+			envelope.Completion = localizationCompletionWithDigest(envelope.Completion, digest)
+		}
+		contract = localizationContractFor(envelope.Completion)
+		envelope.Completion = contract.Completion
+		envelope.Terminal = contract.Terminal
+	}
+	reconcilePackedCompletion()
 	// The ready-to-emit answer is derived from the retained rows, so it lands
 	// after the fit checks above and can push the envelope past its budget.
-	// Give back the weakest presented row first — the caller is asked to
-	// reproduce these lines, so a row that cannot be shown is a row that cannot
-	// be retained either — then packed source bodies, which are the largest and
-	// most recoverable payload. A body that just retired a prescribed read is
-	// kept: it is the evidence the caller would otherwise have paid a call for.
+	// Give back non-prescribed source bodies and optional row detail before any
+	// file/symbol identity. The terminal page is the compact interpretation of
+	// those identities; discarding it to preserve duplicate signatures or caller
+	// lists both costs more and hides a late implementation candidate. A body
+	// that just retired a prescribed read remains protected.
 	shedBudget := maxBytes
 	if satisfiedSymbol != "" {
 		shedBudget = maxBytes + localizationRetiredReadAllowance(maxBytes)
 	}
 	for !localizationEnvelopeFits(envelope, shedBudget) {
-		if digest != nil && len(digest.Evidence) > localizationFinalResponsePrimaryLimit {
-			digest.Evidence = digest.Evidence[:len(digest.Evidence)-1]
-			rebuildLocalizationDigestSkeleton(digest)
-			refreshLocalizationDigestResponses(digest, task, nil)
-			envelope.Completion = localizationCompletionWithDigest(envelope.Completion, digest)
-			continue
-		}
-		shed := -1
-		for index := range envelope.Evidence {
+		shedSource := false
+		for index := len(envelope.Evidence) - 1; index >= 0; index-- {
 			if strings.TrimSpace(envelope.Evidence[index].Source) == "" ||
 				envelope.Evidence[index].ID == satisfiedSymbol {
 				continue
 			}
-			shed = index
-		}
-		if shed < 0 {
-			// Last resort. The unproven page is the answer a caller that stops
-			// here would give, so it outranks every packed body and survives
-			// until nothing else can be given back — and even then it goes only
-			// if going makes the envelope fit. Dropping it from a response that
-			// is over budget either way costs the caller its answer and buys
-			// nothing.
-			page := envelope.Completion.FinalResponse
-			if envelope.Completion.State != localizationStateAnswerReady && page != "" {
-				envelope.Completion.FinalResponse = ""
-				if localizationEnvelopeFits(envelope, shedBudget) {
-					break
-				}
-				envelope.Completion.FinalResponse = page
-			}
+			envelope.Evidence[index].Source = ""
+			shedSource = true
 			break
 		}
-		envelope.Evidence[shed].Source = ""
+		if shedSource {
+			continue
+		}
+
+		shedDetails := false
+		for index := len(envelope.Evidence) - 1; index >= 0; index-- {
+			if shedLocalizationEnvelopeRowOptionalFields(&envelope.Evidence[index]) {
+				shedDetails = true
+				break
+			}
+		}
+		if shedDetails {
+			continue
+		}
+
+		if digest != nil && len(digest.Evidence) > localizationFinalResponsePrimaryLimit {
+			drop := localizationDigestPackingDropIndex(digest, envelope.Completion, satisfiedSymbol)
+			if drop >= 0 {
+				copy(digest.Evidence[drop:], digest.Evidence[drop+1:])
+				digest.Evidence = digest.Evidence[:len(digest.Evidence)-1]
+				rebuildLocalizationDigestSkeleton(digest)
+				refreshLocalizationDigestResponses(digest, task, nil)
+				alignLocalizationEnvelopeWithDigest(&envelope, digest)
+				reconcilePackedCompletion()
+				continue
+			}
+		}
+
+		// The prescribed body was packed before final_response existed. If the
+		// completed page cannot fit even after compaction, restore the exact read
+		// instead of emitting an oversized or internally contradictory answer.
+		if satisfiedSymbol != "" {
+			for index := range envelope.Evidence {
+				if envelope.Evidence[index].ID == satisfiedSymbol {
+					envelope.Evidence[index].Source = ""
+					break
+				}
+			}
+			satisfiedSymbol = ""
+			boundedConclusion = false
+			// The earlier digest was built for the retired prescription. Once the
+			// read is restored, rebuild from the source-cleared envelope so the
+			// prescribed identity is retained and evidence-derived enforcement is
+			// recomputed from exactly what the caller will receive.
+			restoredCompletion := localizationFinalizeCompletionEvidence(
+				task, prescribedEnvelope.Completion, acceptedTargets, envelope,
+			)
+			restoredContract := localizationContractFor(restoredCompletion)
+			envelope.Completion = restoredContract.Completion
+			envelope.Terminal = restoredContract.Terminal
+			digest = newLocalizationEvidenceDigestForTask(task, envelope)
+			alignLocalizationEnvelopeWithDigest(&envelope, digest)
+			shedBudget = maxBytes
+			reconcilePackedCompletion()
+			continue
+		}
+
+		// Last resort. The unproven page is the answer a caller that stops
+		// here would give, so it goes only if removing it actually fits.
+		page := envelope.Completion.FinalResponse
+		if envelope.Completion.State != localizationStateAnswerReady && page != "" {
+			envelope.Completion.FinalResponse = ""
+			if localizationEnvelopeFits(envelope, shedBudget) {
+				break
+			}
+			envelope.Completion.FinalResponse = page
+		}
+		break
+	}
+	if !localizationEnvelopeFits(envelope, shedBudget) {
+		// Packing failure is not a localization conclusion. Return an explicitly
+		// inactive completion so no caller can accidentally arm a terminal or
+		// refinement contract from an error payload.
+		return mcp.NewToolResultError("localization result exceeds its serialized response budget"), nil, nil, newLocalizationOpenCompletion()
 	}
 	body, err := json.Marshal(envelope)
 	if err != nil {

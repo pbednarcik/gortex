@@ -25,11 +25,9 @@ const (
 	localizationTerminalAgentHardCap    = 64
 	localizationTerminalJanitorDeletes  = 32
 
-	localizationTerminalContext    = "[Gortex] Localization for this task is complete. Answer now from completion.final_response, naming the files and symbols you rely on; if its evidence does not fit the request, say so and name what does. Either way, do not call another tool."
-	localizationTerminalDenyReason = "[Gortex] Localization for this task is complete, so this tool call is blocked. Answer now from the retained evidence below, naming what you rely on; if it does not fit the request, say so in your answer."
-	localizationAdvisoryDenyReason = "[Gortex] Localization for this task is complete, so this additional Gortex navigation call was not run. Answer now from the retained evidence below, naming what you rely on; if it does not fit the request, say so in your answer."
-	gortexPluginMCPToolPrefix      = "mcp__plugin_gortex_gortex__"
-	localizationHostMetaKey        = "gortex/localization"
+	localizationTerminalContext = "[Gortex] The bounded localization search completed and the retained result is included below. For a localization-only request, answer from the PRIMARY file/symbol tuples. For diagnosis, implementation, or contradictory evidence, continue with the appropriate tools; this conclusion does not block the session."
+	gortexPluginMCPToolPrefix   = "mcp__plugin_gortex_gortex__"
+	localizationHostMetaKey     = "gortex/localization"
 )
 
 var localizationNavigationOperations = map[string]struct{}{
@@ -39,6 +37,27 @@ var localizationNavigationOperations = map[string]struct{}{
 	"relations": {},
 	"trace":     {},
 	"analyze":   {},
+
+	// Legacy navigation names are normally hidden behind the compact facade,
+	// but the hook keeps the same boundary as defense in depth for promoted or
+	// older host tool catalogs.
+	"smart_context": {}, "context_closure": {}, "get_repo_outline": {},
+	"plan_turn": {}, "prefetch_context": {}, "suggest_queries": {}, "gortex_wakeup": {},
+	"search_artifacts": {}, "search_ast": {}, "graph_completion_search": {}, "find_files": {},
+	"search_symbols": {}, "search_text": {}, "winnow_symbols": {},
+	"get_artifact": {}, "get_editing_context": {}, "read_file": {}, "get_symbol_history": {},
+	"get_symbol_source": {}, "get_file_summary": {}, "batch_symbols": {}, "get_symbol": {},
+	"get_callers": {}, "get_cluster": {}, "find_declaration": {}, "get_dependencies": {},
+	"get_dependents": {}, "get_class_hierarchy": {}, "find_implementations": {},
+	"find_import_path": {}, "find_overrides": {}, "check_references": {}, "find_usages": {},
+	"get_call_chain": {}, "get_cfg": {}, "flow_between": {}, "graph_query": {},
+	"trace_path": {}, "taint_paths": {}, "walk_graph": {},
+	"audit_agent_config": {}, "get_architecture": {}, "verify_citation": {}, "find_clones": {},
+	"find_co_changing_symbols": {}, "get_communities": {}, "contracts": {},
+	"get_coupling_metrics": {}, "get_extraction_candidates": {}, "audit_health": {},
+	"run_inspections": {}, "list_inspections": {}, "get_knowledge_gaps": {}, "lint_file": {},
+	"get_processes": {}, "get_recent_changes": {}, "replay_episode": {},
+	"get_surprising_connections": {}, "get_untested_symbols": {}, "why": {}, "get_churn_rate": {},
 }
 
 // localizationRedirectedHostTools are the host tools whose access-policy deny
@@ -638,13 +657,16 @@ func localizationTerminalIdentityCurrent(identity localizationTerminalIdentity) 
 }
 
 func markLocalizationTerminal(identity localizationTerminalIdentity, contractVersion int) bool {
-	return markLocalizationTerminalWithStrength(identity, contractVersion, false, "")
+	return markLocalizationTerminalWithStrength(identity, contractVersion, true, "")
 }
 
 func markLocalizationTerminalReceipt(
-	identity localizationTerminalIdentity, contractVersion int, enforceable bool, finalResponse string,
+	identity localizationTerminalIdentity, contractVersion int, _ bool, finalResponse string,
 ) bool {
-	return markLocalizationTerminalWithStrength(identity, contractVersion, !enforceable, finalResponse)
+	// Retained terminal context is always advisory. A response contract may
+	// classify its evidence as enforceable for replay quality, but that field is
+	// never permission authority for host tools.
+	return markLocalizationTerminalWithStrength(identity, contractVersion, true, finalResponse)
 }
 
 func markLocalizationTerminalWithStrength(

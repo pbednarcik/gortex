@@ -32,8 +32,9 @@ const (
 )
 
 // Receipt is written only by the MCP response path after it has constructed an
-// answer_ready contract. PostToolUse treats this server-owned record, rather
-// than its visible tool_response, as the terminal authority.
+// answer_ready contract. PostToolUse uses this authenticated record, rather than
+// visible tool_response text, to attach advisory localization context. A receipt
+// never grants permission to deny or replace a later tool call.
 type Receipt struct {
 	FinalResponse   string `json:"final_response"`
 	ContractVersion int    `json:"contract_version"`

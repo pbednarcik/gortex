@@ -6,15 +6,17 @@ import (
 	"github.com/zzet/gortex/internal/graph"
 )
 
-// Hard terminal enforcement is deliberately narrower than answer readiness.
-// The latter is a ranking decision; the former requires one of these bounded,
-// production-proven evidence shapes and must survive final response packing.
+// Strong completion evidence is deliberately narrower than answer readiness.
+// Answer readiness is a ranking decision; these bounded, production-proven
+// shapes justify a stronger advisory confidence signal after response packing.
+// They never create a tool-permission boundary for an ordinary coding session.
 const (
 	localizationProvenanceSourceLiteralCallee   = "source_literal_callee"
 	localizationProvenanceDivergentDefault      = "divergent_default_owner"
 	localizationProvenanceDivergentDefaultType  = "divergent_default_type"
 	localizationProvenanceImplementationRoute   = "implementation_route"
 	localizationProvenanceImplementationTarget  = "implementation_target"
+	localizationProvenanceSyntacticAnchor       = "syntactic_anchor"
 	localizationProvenanceTypedAnchorProjection = "typed_anchor_projection"
 )
 
@@ -55,6 +57,29 @@ func localizationStrongImplementationRoute(wrapper, implementation exploreTarget
 func localizationStrongEvidenceForCompletion(completion localizationCompletion, targets []exploreTarget) localizationEvidenceProof {
 	if completion.State != localizationStateAnswerReady && completion.State != localizationStateNeedsExactRead {
 		return localizationEvidenceProof{}
+	}
+
+	// A prescribed refinement can retire in the first response because its
+	// graph-proven wrapper/implementation pair is already packed. Preserve the
+	// same paired proof that an authorized follow-up read would enforce.
+	for symbol, route := range completion.refinementRoutes {
+		if !route.enforceable {
+			continue
+		}
+		switch {
+		case route.proofSymbol != "":
+			return localizationEvidenceProof{
+				provenance: localizationProvenanceImplementationRoute,
+				primary:    route.proofSymbol,
+				support:    []string{symbol},
+			}
+		case route.implementationSymbol != "":
+			return localizationEvidenceProof{
+				provenance: localizationProvenanceImplementationRoute,
+				primary:    symbol,
+				support:    []string{route.implementationSymbol},
+			}
+		}
 	}
 
 	ownerID, ownerIndex := "", -1
@@ -100,23 +125,21 @@ func localizationStrongEvidenceForCompletion(completion localizationCompletion, 
 }
 
 // localizationRetiredReadByteAllowance caps the extra payload a response may
-// spend on the one body that removes a round trip. Measured, a full page fills
-// its budget to within a few hundred bytes with ranked rows alone, so an
-// ordinary body overflows by a little and is refused — and that is the
-// expensive outcome. The caller spends those bytes either way: inline they are
-// paid once, as a round trip they are paid again as a fresh request, its cache
-// write and its output.
-const localizationRetiredReadByteAllowance = 4096
+// spend on the one body that removes a round trip. A complete second model turn
+// replays the system prompt, tool schemas, and ranked page before it can return
+// the same source. Paying up to one response budget for that source in the first
+// page is therefore the smaller bounded cost.
+const localizationRetiredReadByteAllowance = 8192
 
-// localizationRetiredReadAllowance bounds that spend against what the caller
-// asked for: nothing below the real minimum budget, and never more than half
-// again.
+// localizationRetiredReadAllowance bounds the inlined source against what the
+// caller already budgeted for the ranked response. It never grows a page by
+// more than one additional response budget or the hard byte cap.
 func localizationRetiredReadAllowance(maxBytes int) int {
 	if maxBytes < exploreMinBudgetTokens*localizationEnvelopeBytesPerToken {
 		return 0
 	}
-	if allowance := maxBytes / 2; allowance < localizationRetiredReadByteAllowance {
-		return allowance
+	if maxBytes < localizationRetiredReadByteAllowance {
+		return maxBytes
 	}
 	return localizationRetiredReadByteAllowance
 }
@@ -224,6 +247,12 @@ func localizationCompletionRetiringPrescribedRead(completion localizationComplet
 	completed.taskLead = completion.taskLead
 	completed.enforceableOnAnswerReady = completion.enforceableOnAnswerReady
 	completed.digest = completion.digest
+	if len(completion.refinementRoutes) > 0 {
+		completed.refinementRoutes = make(map[string]localizationRefinementRoute, len(completion.refinementRoutes))
+		for symbol, route := range completion.refinementRoutes {
+			completed.refinementRoutes[symbol] = route
+		}
+	}
 	return completed
 }
 
@@ -390,6 +419,9 @@ func localizationTargetProvenance(completion localizationCompletion, target expl
 	}
 	if localizationStrongSourceLiteralCallee(target) {
 		return localizationProvenanceSourceLiteralCallee
+	}
+	if target.syntacticAnchor {
+		return localizationProvenanceSyntacticAnchor
 	}
 	if target.typedAnchorProjection {
 		return localizationProvenanceTypedAnchorProjection

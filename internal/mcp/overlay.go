@@ -118,8 +118,9 @@ func (s *Server) wrapToolHandlerMode(h mcpserver.ToolHandlerFunc, injectOverlay 
 		// Tolerate hallucinated / mistyped parameter names before the
 		// handler reads arguments (e.g. "symbol" accepted as "id").
 		s.reconcileToolParams(&req)
-		// Enforce the session's runtime mode / workflow phase — a hard
-		// gate even if the client never re-read tools/list.
+		// Enforce the session's ordinary runtime and workflow gates. Localization
+		// conclusions are evidence, not permission boundaries: unrelated tools
+		// remain dispatchable in every profile.
 		if blocked := s.checkToolGate(ctx, req.Params.Name); blocked != nil {
 			return blocked, nil
 		}

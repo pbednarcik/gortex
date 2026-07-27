@@ -631,6 +631,13 @@ type sessionState struct {
 	// toolSpec / clientName is (re)recorded.
 	resolvedToolPolicy *toolPolicy
 	toolPolicyResolved bool
+	// instructionProfilePreset is captured once for this connection. Profile
+	// switches are documented to affect new sessions only; later client/policy
+	// handshake updates may re-resolve the surface, but never against a new
+	// machine profile.
+	instructionProfilePreset   string
+	instructionProfileResolved bool
+	toolPolicyGeneration       uint64
 	// lastSearch captures the most recent search_symbols call so that a
 	// subsequent get_symbol_source / get_editing_context on one of its
 	// results can be attributed back to the query — this is the raw input
@@ -906,6 +913,7 @@ func (ss *sessionState) recordClientName(name string) {
 	// session's effective tool policy.
 	ss.resolvedToolPolicy = nil
 	ss.toolPolicyResolved = false
+	ss.toolPolicyGeneration++
 }
 
 // recordToolPolicy captures the client-forwarded tool-surface preference
@@ -921,6 +929,7 @@ func (ss *sessionState) recordToolPolicy(spec, mode string) {
 	ss.toolMode = mode
 	ss.resolvedToolPolicy = nil
 	ss.toolPolicyResolved = false
+	ss.toolPolicyGeneration++
 }
 
 // snapshotClientName returns the captured client name under the

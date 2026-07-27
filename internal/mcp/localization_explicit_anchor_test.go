@@ -1,0 +1,206 @@
+package mcp
+
+import (
+	"testing"
+
+	"github.com/zzet/gortex/internal/graph"
+	"github.com/zzet/gortex/internal/query"
+	"github.com/zzet/gortex/internal/search/rerank"
+)
+
+func TestExploreSyntacticAnchorsDoNotSpendBudgetOnHTTPRouteMethods(t *testing.T) {
+	task := `HandleMethodNotAllowed with r.GET("/base/metrics"), r.DELETE("/base/v1/organizations/:id"), then panic in tree.go getValue`
+	anchors := exploreSyntacticAnchors(task)
+	if len(anchors) != 3 {
+		t.Fatalf("anchors = %#v, want three implementation anchors", anchors)
+	}
+	got := []string{anchors[0].compact, anchors[1].compact, anchors[2].compact}
+	want := []string{"handlemethodnotallowed", "tree", "getvalue"}
+	for index := range want {
+		if got[index] != want[index] {
+			t.Fatalf("anchor %d = %q, want %q (all=%v)", index, got[index], want[index], got)
+		}
+	}
+}
+
+func TestExploreSyntacticAnchorsCollapseAssignedAndBareFlags(t *testing.T) {
+	anchors := exploreSyntacticAnchors(`rg panic caused by --replace, --multiline, a particular pattern, and search text containing repeats and newlines. Panic message: "slice index starts at x but ends at y" where x and y are integers and y < x. Reproduction: rg "(^|[^a-z])((([a-z]+)?)\s)?b(\s([a-z]+)?)($|[^a-z])" --replace=x --multiline lines2.txt where lines2.txt contains " b b b b b b b b\nc". Also reproduces with lines5.txt containing " b\nb\nb\nb\nc". Bug is very sensitive to exact pattern and text.`)
+	if len(anchors) != 2 {
+		t.Fatalf("anchors = %#v, want one replace lane and one multiline lane", anchors)
+	}
+	if anchors[0].compact != "replace" || anchors[1].compact != "multiline" {
+		t.Fatalf("anchor compacts = [%s, %s], want replace then multiline", anchors[0].compact, anchors[1].compact)
+	}
+}
+
+func TestExploreSyntacticAnchorCompetitionIsScopedToBareCompoundCallable(t *testing.T) {
+	anchor, ok := newExploreSyntacticAnchor("--replace")
+	if !ok {
+		t.Fatal("replace flag did not produce a syntactic anchor")
+	}
+	separator := &rerank.Candidate{Node: &graph.Node{
+		ID: "crates/printer/src/util.rs::replace_separator", Name: "replace_separator",
+		QualName: "replace_separator", Kind: graph.KindFunction, FilePath: "crates/printer/src/util.rs",
+		StartLine: 10, EndLine: 210,
+	}}
+	replacement := &rerank.Candidate{Node: &graph.Node{
+		ID: "crates/printer/src/util.rs::Replacer.replacement", Name: "replacement",
+		QualName: "Replacer.replacement", Kind: graph.KindMethod, FilePath: "crates/printer/src/util.rs",
+		StartLine: 113, EndLine: 124,
+	}}
+	replaceAll := &rerank.Candidate{Node: &graph.Node{
+		ID: "crates/printer/src/util.rs::Replacer.replace_all", Name: "replace_all",
+		QualName: "Replacer.replace_all", Kind: graph.KindMethod, FilePath: "crates/printer/src/util.rs",
+		StartLine: 55, EndLine: 111,
+	}}
+	candidates := []*rerank.Candidate{separator, replacement, replaceAll}
+	usedIDs, usedFiles := map[string]struct{}{}, map[string]struct{}{}
+	if !exploreSyntacticAnchorNeedsLexicalCompetition(anchor, separator) {
+		t.Fatal("bare replace anchor prematurely settled on compound replace_separator")
+	}
+	ordinary := exploreSyntacticAnchorCandidate(
+		anchor, candidates, query.QueryOptions{}, usedIDs, usedFiles,
+	)
+	if ordinary == nil || ordinary.Node.ID != separator.Node.ID {
+		t.Fatalf("ordinary selection = %#v, want stable first candidate", ordinary)
+	}
+	competing := exploreSyntacticAnchorCompetingCandidate(
+		anchor, candidates, query.QueryOptions{}, usedIDs, usedFiles,
+	)
+	if competing == nil || competing.Node.ID != replaceAll.Node.ID {
+		t.Fatalf("competing selection = %#v, want specific replace_all implementation despite larger generic body", competing)
+	}
+
+	explicit, ok := newExploreSyntacticAnchor("replace_separator")
+	if !ok {
+		t.Fatal("explicit replace_separator did not produce an anchor")
+	}
+	if exploreSyntacticAnchorNeedsLexicalCompetition(explicit, separator) {
+		t.Fatal("multi-term explicit replace_separator was treated as ambiguous")
+	}
+	exact := &rerank.Candidate{Node: &graph.Node{
+		ID: "crates/printer/src/util.rs::replace", Name: "replace",
+		Kind: graph.KindFunction, FilePath: "crates/printer/src/util.rs",
+	}}
+	if exploreSyntacticAnchorNeedsLexicalCompetition(anchor, exact) {
+		t.Fatal("atomic exact replace match was treated as ambiguous")
+	}
+	if got := exploreSyntacticAnchorFetchLimit(anchor, separator); got != exploreSyntacticAnchorCompetitionFetch {
+		t.Fatalf("ambiguous replace fetch = %d, want %d", got, exploreSyntacticAnchorCompetitionFetch)
+	}
+	if got := exploreSyntacticAnchorFetchLimit(explicit, separator); got != exploreSyntacticAnchorFetch {
+		t.Fatalf("exact replace_separator fetch = %d, want %d", got, exploreSyntacticAnchorFetch)
+	}
+}
+
+func TestMarkExploreSyntacticAnchorCandidateCarriesDedicatedProvenanceSignal(t *testing.T) {
+	shared := map[string]float64{"existing": 1}
+	candidate := &rerank.Candidate{Node: &graph.Node{ID: "pkg/util.rs::Replacer.replace_all"}, Signals: shared}
+	sibling := &rerank.Candidate{Node: &graph.Node{ID: "pkg/lines.rs::lines"}, Signals: shared}
+	markExploreSyntacticAnchorCandidate(candidate)
+	if candidate.Signals[exploreConceptComplementSignal] != 1 || candidate.Signals[exploreSyntacticAnchorSignal] != 1 {
+		t.Fatalf("signals = %#v, want concept retention plus syntactic provenance", candidate.Signals)
+	}
+	if sibling.Signals[exploreConceptComplementSignal] != 0 || sibling.Signals[exploreSyntacticAnchorSignal] != 0 {
+		t.Fatalf("syntactic provenance leaked to unselected sibling: %#v", sibling.Signals)
+	}
+	if candidate.Signals["existing"] != 1 {
+		t.Fatalf("existing signal was lost: %#v", candidate.Signals)
+	}
+}
+
+func TestExploreQueryPathAnchorsIgnoreHTTPRouteExamples(t *testing.T) {
+	query := `HandleMethodNotAllowed r.GET("/base/metrics") r.GET("/base/v1/:id/devices") panic in github.com/gin-gonic/gin.(*node).getValue at tree.go:637`
+	syntactic := exploreSyntacticAnchors(query)
+	if len(syntactic) != 3 || syntactic[2].compact != "tree" {
+		t.Fatalf("stack source location anchor = %#v, want trailing tree", syntactic)
+	}
+	anchors, hasDirectory := exploreQueryPathAnchors(query)
+	if hasDirectory || len(anchors) != 0 {
+		t.Fatalf("runtime routes became source paths: anchors=%v hasDirectory=%v", anchors, hasDirectory)
+	}
+	node := &graph.Node{
+		ID:       "tree.go::node.getValue",
+		Name:     "getValue",
+		QualName: "node.getValue",
+		Kind:     graph.KindMethod,
+		FilePath: "tree.go",
+	}
+	if !exploreLocalizationExplicitAnchor(query, node) {
+		t.Fatal("explicit tree.go/getValue anchor was hidden by HTTP route examples")
+	}
+}
+
+func TestLocalizationEvidenceTargetsPreserveProtectedSyntacticAnchorBeforeDraftRelations(t *testing.T) {
+	head := exploreTarget{node: &graph.Node{
+		ID: "crates/core/flags/hiargs.rs::suggest_multiline", Name: "suggest_multiline",
+		QualName: "suggest_multiline", Kind: graph.KindFunction, FilePath: "crates/core/flags/hiargs.rs",
+	}}
+	unrelated := exploreTarget{node: &graph.Node{
+		ID: "crates/core/flags/hiargs.rs::BinaryMode.Auto", Name: "Auto",
+		QualName: "BinaryMode.Auto", Kind: graph.KindMethod, FilePath: "crates/core/flags/hiargs.rs",
+	}}
+	replaceAll := exploreTarget{
+		node: &graph.Node{
+			ID: "crates/printer/src/util.rs::Replacer.replace_all", Name: "replace_all",
+			QualName: "Replacer.replace_all", Kind: graph.KindMethod, FilePath: "crates/printer/src/util.rs",
+		},
+		conceptComplement: true,
+	}
+	targets := []exploreTarget{head, unrelated, replaceAll}
+	selected := localizationEvidenceTargetsFromDraft(
+		"--replace with --multiline panics while replacing repeated matches",
+		"",
+		targets,
+		[]exploreDraftEntry{{node: head.node}, {node: unrelated.node}, {node: replaceAll.node}},
+	)
+	if len(selected) != len(targets) {
+		t.Fatalf("selected = %#v, want all targets", selected)
+	}
+	if selected[0].node.ID != head.node.ID || selected[1].node.ID != replaceAll.node.ID {
+		t.Fatalf("selected order = [%s, %s], want retrieval head then protected replace anchor", selected[0].node.ID, selected[1].node.ID)
+	}
+}
+
+func TestLocalizationEvidenceTargetsPrioritizeExplicitConsumerBeforeCausalOwner(t *testing.T) {
+	explicit := exploreTarget{node: &graph.Node{
+		ID:       "src/Monolog/Handler/StreamHandler.php::StreamHandler.write",
+		Name:     "write",
+		QualName: "StreamHandler.write",
+		Kind:     graph.KindMethod,
+		FilePath: "src/Monolog/Handler/StreamHandler.php",
+	}}
+	owner := exploreTarget{
+		node: &graph.Node{
+			ID:       "src/Monolog/Handler/RotatingFileHandler.php::RotatingFileHandler.__construct",
+			Name:     "__construct",
+			QualName: "RotatingFileHandler.__construct",
+			Kind:     graph.KindMethod,
+			FilePath: "src/Monolog/Handler/RotatingFileHandler.php",
+		},
+		divergentDefaultOwner: true,
+	}
+	ownerType := exploreTarget{
+		node: &graph.Node{
+			ID:       "src/Monolog/Handler/RotatingFileHandler.php::RotatingFileHandler",
+			Name:     "RotatingFileHandler",
+			QualName: "RotatingFileHandler",
+			Kind:     graph.KindType,
+			FilePath: "src/Monolog/Handler/RotatingFileHandler.php",
+		},
+		divergentDefaultType: true,
+	}
+	targets := []exploreTarget{owner, ownerType, explicit}
+	selected := localizationEvidenceTargetsFromDraft(
+		"chmod failure in src/Monolog/Handler/StreamHandler.php::StreamHandler.write",
+		owner.node.ID,
+		targets,
+		[]exploreDraftEntry{{node: owner.node}, {node: ownerType.node}, {node: explicit.node}},
+	)
+	if len(selected) < 2 {
+		t.Fatalf("selected = %#v, want explicit target plus causal owner", selected)
+	}
+	if selected[0].node.ID != explicit.node.ID || selected[1].node.ID != owner.node.ID {
+		t.Fatalf("selected order = [%s, %s], want explicit consumer then causal owner", selected[0].node.ID, selected[1].node.ID)
+	}
+}

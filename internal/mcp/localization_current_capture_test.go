@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"strings"
 	"sync"
 	"testing"
 
@@ -194,7 +195,7 @@ func TestFinishReservedReadWithDigestMergesOnlyOnAnswerReady(t *testing.T) {
 	}
 }
 
-func TestFinishReservedReadWithDigestRetriesRecordedZeroThenPreservesCurrentTaskDigest(t *testing.T) {
+func TestFinishReservedReadWithDigestRecordedZeroTerminalizesWithRetainedEvidence(t *testing.T) {
 	retained := mergeLocalizationEvidenceDigest([]localizationDigestRow{
 		captureTestRow("repo/storage/base.go::Storage.Load", "repo/storage/base.go"),
 	}, nil)
@@ -207,25 +208,20 @@ func TestFinishReservedReadWithDigestRetriesRecordedZeroThenPreservesCurrentTask
 		digest:                   retained,
 	}
 	completion := state.finishReservedReadTokenWithDigest(21, true, nil, true)
-	if completion.State != localizationStateNeedsRecovery || completion.AllowedToolCalls != 1 {
-		t.Fatalf("first zero-result completion = %#v", completion)
+	if completion.State != localizationStateAnswerReady || completion.AllowedToolCalls != 0 || completion.Enforceable {
+		t.Fatalf("zero-result bounded conclusion = %#v", completion)
 	}
-	if state.digest == nil {
-		t.Fatal("bounded retry discarded digest before exhaustion")
-	}
-
-	state.state = localizationStateRecoveryInFlight
-	state.readReservationToken = 22
-	state.readReservationGen = state.generation
-	completion = state.finishReservedReadTokenWithDigest(22, true, nil, true)
-	if completion.State != localizationStateAnswerReady {
-		t.Fatalf("exhausted zero-result state = %q", completion.State)
-	}
-	if state.digest != retained || completion.digest != retained {
-		t.Fatalf("same-task exhaustion discarded retained evidence: state=%#v completion=%#v", state.digest, completion.digest)
+	if state.digest == nil || completion.digest == nil || len(completion.digest.Evidence) == 0 {
+		t.Fatalf("zero-result conclusion discarded retained evidence: state=%#v completion=%#v", state.digest, completion.digest)
 	}
 	if got := completion.digest.Evidence[0].ID; got != "repo/storage/base.go::Storage.Load" {
-		t.Fatalf("same-task exhaustion changed retained identity: %q", got)
+		t.Fatalf("zero-result conclusion changed retained identity: %q", got)
+	}
+	if !strings.HasPrefix(completion.FinalResponse, localizationBoundedHeading+"\n") {
+		t.Fatalf("zero-result conclusion lacked bounded-evidence heading: %q", completion.FinalResponse)
+	}
+	if blocked, retryToken := state.authorizeWithToken("search", "text", map[string]any{"query": "storage"}); blocked == nil || retryToken != 0 {
+		t.Fatalf("zero-result accepted recovery preserved a retry: (%#v, %d)", blocked, retryToken)
 	}
 }
 

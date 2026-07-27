@@ -67,6 +67,23 @@ func TestEveryProfileKeepsPositioningCues(t *testing.T) {
 	}
 }
 
+func TestEveryProfileKeepsAnswerReadyWorkflowAdvisory(t *testing.T) {
+	for _, p := range Table() {
+		body := p.Body()
+		for _, required := range []string{
+			"localization-only work",
+		} {
+			if !strings.Contains(body, required) {
+				t.Errorf("profile %q body lost answer-ready workflow guidance %q", p.Name, required)
+			}
+		}
+		if strings.Contains(body, "make no further tool calls") ||
+			strings.Contains(body, "answer from `completion.final_response` and stop") {
+			t.Errorf("profile %q body retained all-tool stop wording", p.Name)
+		}
+	}
+}
+
 // TestLocalizationPresetRowsStayInSync keeps the optional legacy
 // localization preset table internally consistent. The active localization
 // instruction profile now describes the compact public surface instead.
@@ -254,7 +271,11 @@ func TestBodies_PolicyCoreAndSingleHome(t *testing.T) {
 		if !found {
 			t.Fatalf("profile %q missing", name)
 		}
-		for _, token := range []string{"explore", "search", "read", "relations", "trace", "change", "edit", "refactor", "capabilities", "recall", "remember"} {
+		compactTools := []string{"explore", "search", "read", "relations", "trace", "change", "edit", "refactor", "capabilities", "recall", "remember"}
+		if name == "localization" {
+			compactTools = p.EagerTools
+		}
+		for _, token := range compactTools {
 			if !strings.Contains(p.Body(), token) {
 				t.Errorf("%s body no longer mentions compact tool %q", name, token)
 			}

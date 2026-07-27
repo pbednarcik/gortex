@@ -12,8 +12,9 @@ import (
 )
 
 const (
-	exploreSyntacticAnchorMaxTerms = 3
-	exploreSyntacticAnchorFetch    = 10
+	exploreSyntacticAnchorMaxTerms         = 3
+	exploreSyntacticAnchorFetch            = 10
+	exploreSyntacticAnchorCompetitionFetch = 32
 )
 
 // exploreSyntacticAnchor is a bounded, implementation-shaped clue copied
@@ -52,7 +53,11 @@ func exploreSyntacticAnchors(task string) []exploreSyntacticAnchor {
 		if !strings.HasPrefix(token, "--") || len(token) <= 2 {
 			continue
 		}
-		add(strings.TrimLeft(token, "-"))
+		flag := strings.TrimLeft(token, "-")
+		if assignment := strings.IndexByte(flag, '='); assignment >= 0 {
+			flag = flag[:assignment]
+		}
+		add(flag)
 		if len(out) == exploreSyntacticAnchorMaxTerms {
 			return out
 		}
@@ -62,7 +67,7 @@ func exploreSyntacticAnchors(task string) []exploreSyntacticAnchor {
 		if strings.HasPrefix(token, "--") {
 			continue
 		}
-		if !exploreCodeShapedToken(token) {
+		if exploreSyntacticAnchorRuntimeDataPath(token) || !exploreCodeShapedToken(token) {
 			continue
 		}
 		add(token)
@@ -75,6 +80,27 @@ func exploreSyntacticAnchors(task string) []exploreSyntacticAnchor {
 
 func newExploreSyntacticAnchor(raw string) (exploreSyntacticAnchor, bool) {
 	raw = strings.Trim(raw, " \t\r\n()[]{}<>,.;:'\"")
+	// Stack traces commonly suffix an otherwise exact source anchor with a
+	// decimal line/column (`tree.go:637` or `tree.go:637:12`). Those coordinates
+	// are not identifier terms; retaining them makes both lexical lookup and
+	// node matching miss the named file.
+	for {
+		colon := strings.LastIndexByte(raw, ':')
+		if colon < 0 || colon == len(raw)-1 {
+			break
+		}
+		digits := true
+		for _, r := range raw[colon+1:] {
+			if r < '0' || r > '9' {
+				digits = false
+				break
+			}
+		}
+		if !digits {
+			break
+		}
+		raw = raw[:colon]
+	}
 	if raw == "" {
 		return exploreSyntacticAnchor{}, false
 	}
@@ -165,6 +191,16 @@ func exploreUnquotedCodeTokens(task string) []string {
 	})
 }
 
+func exploreSyntacticAnchorRuntimeDataPath(token string) bool {
+	lower := strings.ToLower(strings.Trim(token, "-_.:()[]{}<>,;'\""))
+	for _, suffix := range []string{".txt", ".log", ".csv", ".tsv"} {
+		if strings.HasSuffix(lower, suffix) {
+			return true
+		}
+	}
+	return false
+}
+
 func exploreCodeShapedToken(token string) bool {
 	token = strings.Trim(token, "-_.:")
 	first, _ := utf8.DecodeRuneInString(token)
@@ -175,6 +211,18 @@ func exploreCodeShapedToken(token string) bool {
 	for _, suffix := range []string{".ai", ".com", ".dev", ".io", ".net", ".org"} {
 		if strings.HasSuffix(lower, suffix) {
 			return false
+		}
+	}
+	// Route-registration examples such as r.GET("/users/:id") describe
+	// runtime input, not implementation anchors. They otherwise consume the
+	// three-slot syntactic budget ahead of a later stack-trace file/symbol.
+	if dot := strings.LastIndex(token, "."); dot >= 0 && dot < len(token)-1 {
+		member := token[dot+1:]
+		if member == strings.ToUpper(member) {
+			switch member {
+			case "GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS", "CONNECT", "TRACE":
+				return false
+			}
 		}
 	}
 	if strings.Contains(token, "_") || strings.Contains(token, "::") || strings.Contains(token, ".") {
@@ -195,7 +243,17 @@ func exploreSyntacticAnchorMatchesNode(anchor exploreSyntacticAnchor, node *grap
 		return false
 	}
 	return exploreSyntacticAnchorMatchesIdentifier(anchor, node.Name) ||
-		exploreSyntacticAnchorMatchesIdentifier(anchor, node.QualName)
+		exploreSyntacticAnchorMatchesIdentifier(anchor, node.QualName) ||
+		exploreSyntacticAnchorMatchesPath(anchor, node)
+}
+
+func exploreSyntacticAnchorMatchesPath(anchor exploreSyntacticAnchor, node *graph.Node) bool {
+	if node == nil || !strings.ContainsAny(anchor.source, ".\\/") {
+		return false
+	}
+	want := strings.ToLower(strings.ReplaceAll(strings.TrimSpace(anchor.source), "\\", "/"))
+	got := strings.ToLower(strings.ReplaceAll(nodeDisplayPath(node), "\\", "/"))
+	return want != "" && got != "" && (got == want || strings.HasSuffix(got, "/"+want))
 }
 
 func exploreSyntacticAnchorMatchesIdentifier(anchor exploreSyntacticAnchor, identifier string) bool {
@@ -246,6 +304,9 @@ func exploreSyntacticAnchorNodeStrength(anchor exploreSyntacticAnchor, node *gra
 	}
 	identifierTerms := rerank.Tokenize(node.Name)
 	strength := 0
+	if exploreSyntacticAnchorMatchesPath(anchor, node) {
+		strength = 4
+	}
 	for _, anchorTerm := range anchor.terms {
 		best := 0
 		for _, rawIdentifierTerm := range identifierTerms {
@@ -286,9 +347,34 @@ func exploreSyntacticAnchorCandidate(
 	scope query.QueryOptions,
 	usedIDs, usedFiles map[string]struct{},
 ) *rerank.Candidate {
+	return exploreSyntacticAnchorCandidateWithTie(
+		anchor, candidates, scope, usedIDs, usedFiles, false,
+	)
+}
+
+func exploreSyntacticAnchorCompetingCandidate(
+	anchor exploreSyntacticAnchor,
+	candidates []*rerank.Candidate,
+	scope query.QueryOptions,
+	usedIDs, usedFiles map[string]struct{},
+) *rerank.Candidate {
+	return exploreSyntacticAnchorCandidateWithTie(
+		anchor, candidates, scope, usedIDs, usedFiles, true,
+	)
+}
+
+func exploreSyntacticAnchorCandidateWithTie(
+	anchor exploreSyntacticAnchor,
+	candidates []*rerank.Candidate,
+	scope query.QueryOptions,
+	usedIDs, usedFiles map[string]struct{},
+	preferImplementation bool,
+) *rerank.Candidate {
 	var best *rerank.Candidate
 	bestStrength := 0
 	bestDiverse := false
+	bestSpan := 0
+	bestNameWidth := 0
 	for _, candidate := range candidates {
 		if candidate == nil || !exploreSyntacticAnchorEligibleNode(candidate.Node) ||
 			!scope.ScopeAllows(candidate.Node) || !exploreSyntacticAnchorMatchesNode(anchor, candidate.Node) {
@@ -300,13 +386,56 @@ func exploreSyntacticAnchorCandidate(
 		strength := exploreSyntacticAnchorNodeStrength(anchor, candidate.Node)
 		_, repeatedFile := usedFiles[candidate.Node.FilePath]
 		diverse := !repeatedFile
-		if best == nil || strength > bestStrength || (strength == bestStrength && diverse && !bestDiverse) {
+		span := max(0, candidate.Node.EndLine-candidate.Node.StartLine)
+		nameWidth := len(strings.TrimSpace(candidate.Node.Name))
+		if best == nil || strength > bestStrength ||
+			(strength == bestStrength && diverse && !bestDiverse) ||
+			(preferImplementation && strength == bestStrength && diverse == bestDiverse && nameWidth < bestNameWidth) ||
+			(preferImplementation && strength == bestStrength && diverse == bestDiverse && nameWidth == bestNameWidth && span > bestSpan) {
 			best = candidate
 			bestStrength = strength
 			bestDiverse = diverse
+			bestSpan = span
+			bestNameWidth = nameWidth
 		}
 	}
 	return best
+}
+
+// A bare one-term flag can match several equally strong compound callables.
+// Fetch the existing bounded lexical lane only for that ambiguity class; the
+// ordinary selector remains unchanged for every other anchor.
+func exploreSyntacticAnchorNeedsLexicalCompetition(anchor exploreSyntacticAnchor, candidate *rerank.Candidate) bool {
+	if candidate == nil || candidate.Node == nil || len(anchor.terms) != 1 ||
+		exploreSyntacticAnchorMatchesPath(anchor, candidate.Node) {
+		return false
+	}
+	switch candidate.Node.Kind {
+	case graph.KindFunction, graph.KindMethod:
+	default:
+		return false
+	}
+	identifierTerms := rerank.Tokenize(candidate.Node.Name)
+	if len(identifierTerms) < 2 {
+		return false
+	}
+	for _, term := range identifierTerms {
+		if strings.EqualFold(term, anchor.terms[0]) {
+			return true
+		}
+	}
+	return false
+}
+
+// Ambiguous one-term flags such as --replace often have many prefix-sharing
+// helpers. Widen only that bounded lexical lane so the concrete implementation
+// (for example replace_all) can compete with generic helpers such as
+// replace_separator; ordinary identifiers retain the smaller fetch.
+func exploreSyntacticAnchorFetchLimit(anchor exploreSyntacticAnchor, candidate *rerank.Candidate) int {
+	if exploreSyntacticAnchorNeedsLexicalCompetition(anchor, candidate) {
+		return exploreSyntacticAnchorCompetitionFetch
+	}
+	return exploreSyntacticAnchorFetch
 }
 
 func exploreSyntacticAnchorReusesProtected(
@@ -329,6 +458,25 @@ func exploreSyntacticAnchorReusesProtected(
 // each anchor not represented by the ordinary over-fetch pool. Only after that
 // identifier lane misses do we invoke the existing request-local source scan.
 // One diverse node per anchor is retained; no source body is persisted.
+func markExploreSyntacticAnchorCandidate(candidate *rerank.Candidate) {
+	if candidate == nil {
+		return
+	}
+	// Candidate clones elsewhere in the reranking pipeline may share the same
+	// signal map. Copy before tagging so provenance cannot leak to an unselected
+	// sibling through that shallow clone.
+	signals := make(map[string]float64, len(candidate.Signals)+2)
+	for name, value := range candidate.Signals {
+		signals[name] = value
+	}
+	// The concept marker preserves the row in existing bounded selectors; the
+	// dedicated marker survives into rendered provenance so PRIMARY confidence
+	// can distinguish an explicit task-spelled anchor from a semantic neighbour.
+	signals[exploreConceptComplementSignal] = 1
+	signals[exploreSyntacticAnchorSignal] = 1
+	candidate.Signals = signals
+}
+
 func (s *Server) gatherExploreSyntacticAnchorCandidates(
 	ctx context.Context,
 	task string,
@@ -351,6 +499,7 @@ func (s *Server) gatherExploreSyntacticAnchorCandidates(
 		if candidate.Node.FilePath != "" {
 			usedFiles[candidate.Node.FilePath] = struct{}{}
 		}
+		markExploreSyntacticAnchorCandidate(candidate)
 	}
 
 	additions := make([]*rerank.Candidate, 0, len(anchors))
@@ -371,16 +520,20 @@ func (s *Server) gatherExploreSyntacticAnchorCandidates(
 			continue
 		}
 		ordinaryCandidate := exploreSyntacticAnchorCandidate(anchor, ordinary, scope, usedIDs, usedFiles)
-		if ordinaryCandidate != nil && exploreSyntacticAnchorNodeStrength(anchor, ordinaryCandidate.Node) >= 4 {
+		compete := exploreSyntacticAnchorNeedsLexicalCompetition(anchor, ordinaryCandidate)
+		if ordinaryCandidate != nil && exploreSyntacticAnchorNodeStrength(anchor, ordinaryCandidate.Node) >= 4 && !compete {
 			addProtected(index, ordinaryCandidate)
 			continue
 		}
-		rows := eng.GatherSymbolCandidates(anchor.query, exploreSyntacticAnchorFetch, anchorOpts, rctx)
+		rows := eng.GatherSymbolCandidates(anchor.query, exploreSyntacticAnchorFetchLimit(anchor, ordinaryCandidate), anchorOpts, rctx)
 		combined := rows
 		if ordinaryCandidate != nil {
 			combined = append([]*rerank.Candidate{ordinaryCandidate}, rows...)
 		}
 		candidate := exploreSyntacticAnchorCandidate(anchor, combined, scope, usedIDs, usedFiles)
+		if compete {
+			candidate = exploreSyntacticAnchorCompetingCandidate(anchor, combined, scope, usedIDs, usedFiles)
+		}
 		if candidate == nil {
 			missed = append(missed, index)
 			continue

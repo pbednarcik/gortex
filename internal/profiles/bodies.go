@@ -39,7 +39,7 @@ A Gortex daemon is configured machine-wide via the §gortex§ MCP server. Whenev
 // sectionExploreOpener positions the one-shot localization verb as
 // the opening move (standard rendering; the lean profile carries its
 // own condensed line).
-var sectionExploreOpener = bt(`For an explicitly named file to read/review/summarize, call §read(operation:"file", target:{file:"<path>"})§ directly; do not start localization. When the file, symbol, or evidence must be discovered, call §explore(operation:"localize")§ and obey §completion.required_action§; after §answer_ready§ answer from §completion.final_response§ and make no further tool calls. For diagnosis or requested changes, call §explore(operation:"task")§, make at most one focused follow-up, then proceed to impact, edit, and test.
+var sectionExploreOpener = bt(`For an explicitly named file to read/review/summarize, call §read(operation:"file", target:{file:"<path>"})§ directly; do not start localization. When the file, symbol, or evidence must be discovered, call §explore(operation:"localize")§ and obey §completion.required_action§; after §answer_ready§ do not repeat localization or navigation, and answer directly from §completion.final_response§ for localization-only work. For diagnosis or requested changes, call §explore(operation:"task")§, make at most one focused follow-up, then continue normally through impact, edit, and test.
 
 `)
 
@@ -48,7 +48,7 @@ var sectionExploreOpener = bt(`For an explicitly named file to read/review/summa
 // can actually call; exact operation schemas remain on demand.
 var sectionCompactWorkflow = bt(`For every coding task:
 
-1. For an explicitly named file to read/review/summarize, call §read(operation:"file", target:{file:"<path>"})§ directly; do not start localization. When the file, symbol, or evidence must be discovered, call §explore(operation:"localize")§ and obey §completion.required_action§; after §answer_ready§, answer from §completion.final_response§ and stop. For diagnosis or modification, call §explore(operation:"task")§.
+1. Named file: call §read(operation:"file", target:{file:"<path>"})§. Unknown evidence: call §explore(operation:"localize")§ and obey §completion.required_action§. At §answer_ready§, do not repeat localization or navigation. For localization-only work, next action MUST be the answer from §completion.final_response§: copy PRIMARY tuples in EVIDENCE order; call no tool. Diagnosis/change: continue via §explore(operation:"task")§.
 2. In a diagnosis/change flow, make at most one follow-up call on one unresolved symbol with §search§, §read§, §relations§, or §trace§, then continue to step 3. Never reopen indexed source with Read/Grep/Glob or shell equivalents.
 3. Before mutation, call §change(operation:"impact")§; for a signature change, also call §change(operation:"verify")§ with the proposed signature. Mutate only with §edit§ or §refactor§. After mutation, call §change(operation:"detect")§, then use its symbol IDs with §change(operation:"tests")§, §change(operation:"guards")§, and §change(operation:"contract")§.
 4. Call §capabilities§ only when you need the exact fields for an operation.
@@ -168,33 +168,28 @@ type localizationRow struct {
 }
 
 var localizationRows = []localizationRow{
-	{"explore", "Localizing a task / bug / \"where is X\"", "§explore§ (one call: ranked neighborhood + source + call paths)"},
-	{"search_symbols", "§Grep§ / §rg§ for a symbol", "§search_symbols§ (BM25 + camelCase-aware)"},
-	{"search_text", "§Grep§ for a literal / regex", "§search_text§ (trigram-indexed)"},
-	{"find_usages", "§Grep§ for references", "§find_usages§ (zero false positives)"},
-	{"get_callers", "Reading to find callers", "§get_callers§"},
-	{"find_implementations", "Hunting interface implementors", "§find_implementations§"},
-	{"get_symbol_source", "§Read§ a file for one symbol", "§get_symbol_source§"},
-	{"batch_symbols", "Reading several symbols one by one", "§batch_symbols§ (one call, many bodies)"},
-	{"get_file_summary", "§Read§ to understand a file", "§get_file_summary§"},
-	{"read_file", "§Read§ a non-indexed / raw file", "§read_file§"},
+	{"explore", "Localizing a task / bug / \"where is X\"", "§explore(operation:\"localize\")§ (one ranked terminal result)"},
+	{"search", "The one prescribed bounded recovery", "§search§"},
+	{"read", "The one prescribed exact or bounded read", "§read§"},
+	{"capabilities", "An operation schema is genuinely unknown", "§capabilities§"},
 }
 
-// localizationNonTableTools are eager tools cued in prose rather than
-// table rows.
-var localizationNonTableTools = map[string]bool{
-	"smart_context": true, // the open-with-one-call cue
-	"index_health":  true, // the liveness line in discovery
-}
+// Every eager localization tool has an explicit row above.
+var localizationNonTableTools = map[string]bool{}
 
-// localizationBody is the lean profile: every positioning cue (MUST
-// rule, deny warning, one-shot opener, memory triggers, discovery /
-// switch-back path) survives; reference elaboration moves to
-// gortex://guide.
+// localizationBody is the purpose-built one-shot profile. It omits mutation,
+// memory, review, and analysis guidance because those schemas are intentionally
+// absent from this session surface; switch back to core for broader work.
 func localizationBody() string {
 	return sectionHeader(true) +
-		sectionCompactWorkflow +
-		sectionCompactMemory +
-		bt(`**Reference:** call §capabilities§ for an exact operation schema; use §gortex://guide§ only for deeper background.
+		bt(`This profile is for localization-only work and publishes a fixed, minimal surface.
+
+1. For an explicitly named file to read/review/summarize, call §read(operation:"file", target:{file:"<path>"})§ directly.
+2. When the file, symbol, or evidence must be discovered, call §explore(operation:"localize")§ once and obey §completion.required_action§. For §needs_recovery§, make only the prescribed bounded §search§ or §read§ call.
+3. At §answer_ready§, the bounded search is complete and §completion.final_response§ contains the full retained result. For a localization-only request, answer directly with compact FILES, SYMBOLS, and EVIDENCE sections; copy each PRIMARY file/symbol tuple once in EVIDENCE order and use SUPPORTING rows only when needed. An identical §explore(operation:"localize")§ call replays that result.
+4. Do not use host Read/Grep/Glob or shell navigation merely to repeat the same localization. If the evidence is contradictory or the user requested diagnosis, modification, review, or other coding work, continue with the appropriate tools; localization never blocks the session. Call §capabilities§ only when an operation schema is genuinely unknown.
+
+For broader coding work, the core profile exposes the full workflow guidance and tool surface. If the Gortex server is configured but the tools above are missing, report a Gortex MCP integration failure and stop. Do not start a daemon or use a CLI/shell fallback.
+
 `) + switchBullet("localization", true)
 }

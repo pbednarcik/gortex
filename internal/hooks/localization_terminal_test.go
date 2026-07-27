@@ -224,13 +224,18 @@ func TestPostToolUseObservesMatchingFinalResponseContract(t *testing.T) {
 		t.Fatalf("PostToolUse output %q does not contain terminal context", output)
 	}
 	for _, required := range []string{
-		"Localization for this task is complete",
-		"completion.final_response",
-		"do not call another tool",
+		"bounded localization search completed",
+		"retained result",
+		"PRIMARY file/symbol tuples",
+		"continue with the appropriate tools",
+		"does not block the session",
 	} {
 		if !strings.Contains(output, required) {
 			t.Fatalf("PostToolUse output %q does not contain %q", output, required)
 		}
+	}
+	if strings.Contains(output, "call no tool") {
+		t.Fatalf("PostToolUse retained hard-stop wording: %q", output)
 	}
 }
 
@@ -249,13 +254,11 @@ func TestPostToolUseAnswerReadyEventAuthenticationAndJSONShape(t *testing.T) {
 				completionMap(contract)["enforceable"] = false
 				return terminalToolResponse(t, contract, true, false)
 			},
-			wantOutput: true,
 		},
 		{
 			name:       "enforceable",
 			response:   func(t *testing.T) map[string]any { return terminalToolResponse(t, terminalContractMap(), true, false) },
 			wantOutput: true,
-			wantMarker: true,
 		},
 		{
 			name:     "forged without authoritative meta",
@@ -318,7 +321,7 @@ func TestPostToolUseAnswerReadyEventAuthenticationAndJSONShape(t *testing.T) {
 	}
 }
 
-func TestLocalizationTerminalHookFlowDeniesThenPromptRotatesTurn(t *testing.T) {
+func TestLocalizationTerminalHookFlowAdvisesWithoutBlockingAndRotatesPrompt(t *testing.T) {
 	configureLocalizationTerminalTestHome(t)
 	sessionID := "terminal-flow"
 	cwd := t.TempDir()
@@ -336,31 +339,48 @@ func TestLocalizationTerminalHookFlowDeniesThenPromptRotatesTurn(t *testing.T) {
 		tool  string
 		input map[string]any
 	}{
-		{name: "web search", tool: "WebSearch"},
+		{name: "gortex read", tool: gortexMCPToolPrefix + "read", input: map[string]any{"target": map[string]any{"file": "repo/source.go"}}},
 		{name: "host read", tool: "Read", input: map[string]any{"file_path": "repo/source.go"}},
 		{name: "host grep", tool: "Grep", input: map[string]any{"pattern": "Target", "path": "repo"}},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
 			pre := preToolPayload(t, tt.tool, "", identity, tt.input)
 			preOutput := captureHookStdout(t, func() { runPreToolUse(pre, 0, ModeDeny) })
+			if preOutput == "" {
+				return
+			}
 			var output HookOutput
 			if err := json.Unmarshal([]byte(preOutput), &output); err != nil {
 				t.Fatalf("decode PreToolUse output %q: %v", preOutput, err)
 			}
-			if output.HookSpecificOutput == nil || output.HookSpecificOutput.PermissionDecision != "deny" {
-				t.Fatalf("expected all-tool terminal deny, got %#v", output)
+			if output.HookSpecificOutput != nil && output.HookSpecificOutput.PermissionDecision == "deny" {
+				t.Fatalf("advisory localization marker denied %s: %#v", tt.tool, output.HookSpecificOutput)
 			}
-			if got := output.HookSpecificOutput.PermissionDecisionReason; !strings.HasPrefix(got, localizationTerminalDenyReason) {
-				t.Fatalf("terminal deny reason = %q, want prefix %q", got, localizationTerminalDenyReason)
+		})
+	}
+
+	for _, tt := range []struct {
+		name  string
+		tool  string
+		input map[string]any
+	}{
+		{name: "web search", tool: "WebSearch"},
+		{name: "gortex impact", tool: gortexMCPToolPrefix + "change", input: map[string]any{"operation": "impact", "target": map[string]any{"symbol": "repo/source.go::Target"}}},
+		{name: "gortex edit", tool: gortexMCPToolPrefix + "edit", input: map[string]any{"operation": "file", "target": map[string]any{"file": "repo/source.go"}}},
+		{name: "build and test", tool: "Bash", input: map[string]any{"command": "go test ./..."}},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			pre := preToolPayload(t, tt.tool, "", identity, tt.input)
+			preOutput := captureHookStdout(t, func() { runPreToolUse(pre, 0, ModeDeny) })
+			if preOutput == "" {
+				return
 			}
-			for _, required := range []string{
-				"Localization for this task is complete",
-				"retained evidence",
-				"naming what you rely on",
-			} {
-				if !strings.Contains(output.HookSpecificOutput.PermissionDecisionReason, required) {
-					t.Fatalf("terminal deny reason %q does not contain %q", output.HookSpecificOutput.PermissionDecisionReason, required)
-				}
+			var output HookOutput
+			if err := json.Unmarshal([]byte(preOutput), &output); err != nil {
+				t.Fatalf("decode PreToolUse output %q: %v", preOutput, err)
+			}
+			if output.HookSpecificOutput != nil && output.HookSpecificOutput.PermissionDecision == "deny" {
+				t.Fatalf("advisory localization marker denied task-execution tool %q: %#v", tt.tool, output.HookSpecificOutput)
 			}
 		})
 	}
@@ -420,9 +440,9 @@ func TestLocalizationTerminalSeparatesParentAndSubagent(t *testing.T) {
 		t.Fatalf("subagent was denied by parent marker: %q", got)
 	}
 	if got := captureHookStdout(t, func() {
-		runPreToolUse(preToolPayload(t, "WebSearch", "", parent, nil), 0, ModeDeny)
-	}); !strings.Contains(got, `"permissionDecision":"deny"`) {
-		t.Fatalf("parent marker did not deny parent tool: %q", got)
+		runPreToolUse(preToolPayload(t, gortexMCPToolPrefix+"read", "", parent, map[string]any{"operation": "source"}), 0, ModeDeny)
+	}); strings.Contains(got, `"permissionDecision":"deny"`) {
+		t.Fatalf("advisory parent marker denied parent localization navigation: %q", got)
 	}
 }
 
@@ -485,8 +505,8 @@ func TestLocalizationTerminalSubagentPromptIDFlowsThroughStartPrePostStop(t *tes
 	if got := captureHookStdout(t, func() { runPostToolUse(post) }); !strings.Contains(got, localizationTerminalContext) {
 		t.Fatalf("PostToolUse did not observe prompt-scoped terminal result: %q", got)
 	}
-	if !hasLocalizationTerminal(identity) {
-		t.Fatal("prompt-scoped terminal marker was not persisted")
+	if marker, marked := localizationTerminalMarkerFor(identity); !marked || !marker.Advisory {
+		t.Fatalf("prompt-scoped advisory marker was not persisted: marker=%#v marked=%v", marker, marked)
 	}
 
 	stop := subagentLifecyclePayloadWithPrompt(t, "SubagentStop", sessionID, agentID, promptID, cwd)
@@ -727,7 +747,7 @@ func TestPreToolUseUnrelatedToolWithoutTurnIsStrictLocalNoOp(t *testing.T) {
 func TestLocalizationTerminalMarkerUsesFullHashAndAtomicConcurrentWrites(t *testing.T) {
 	configureLocalizationTerminalTestHome(t)
 	identity := beginTestLocalizationSubagentTurn(t, "terminal-race", "agent", t.TempDir())
-	base := strings.TrimSuffix(filepath.Base(localizationTerminalMarkerPath(identity)), ".json")
+	base := strings.TrimSuffix(filepath.Base(localizationTerminalAdvisoryMarkerPath(identity)), ".advisory.json")
 	if len(base) != sha256HexLength || strings.Trim(base, "0123456789abcdef") != "" {
 		t.Fatalf("marker basename is not a full SHA-256 hex digest: %q", base)
 	}
@@ -741,12 +761,12 @@ func TestLocalizationTerminalMarkerUsesFullHashAndAtomicConcurrentWrites(t *test
 			if !markLocalizationTerminal(identity, localizationTerminalContractV2) {
 				t.Errorf("markLocalizationTerminal failed")
 			}
-			_ = hasLocalizationTerminal(identity)
+			_, _ = localizationTerminalMarkerFor(identity)
 		}()
 	}
 	wg.Wait()
-	if !hasLocalizationTerminal(identity) {
-		t.Fatal("expected a complete marker after concurrent writers")
+	if marker, marked := localizationTerminalMarkerFor(identity); !marked || !marker.Advisory {
+		t.Fatalf("expected a complete advisory marker after concurrent writers: marker=%#v marked=%v", marker, marked)
 	}
 }
 

@@ -895,6 +895,60 @@ func TestFacadeExploreDemotesRepeatedDataLeafNames(t *testing.T) {
 	}
 }
 
+func TestHandleExplorePackingErrorKeepsSessionOpen(t *testing.T) {
+	g := graph.New()
+	bm := search.NewBM25()
+	// IDs are contractual and intentionally are not truncated. This synthetic
+	// identity makes even the minimal mandatory envelope exceed the handler's
+	// minimum 1,000-token budget, exercising the irreducible error path.
+	hugeID := "pkg/huge.go::" + strings.Repeat("HugeTarget", 700)
+	node := &graph.Node{
+		ID: hugeID, Name: "HugeTarget", Kind: graph.KindFunction,
+		FilePath: "pkg/huge.go", Language: "go", StartLine: 1, EndLine: 3,
+	}
+	g.AddNode(node)
+	bm.Add(hugeID, node.Name, node.FilePath, "HugeTarget implementation")
+	eng := query.NewEngine(g)
+	eng.SetSearch(bm)
+	srv := NewServer(eng, g, nil, nil, zap.NewNop(), nil)
+	ctx := WithSessionID(context.Background(), "explore_packing_error_stays_open")
+
+	prior := newLocalizationCompletion(true, "")
+	prior.Enforceable = true
+	prior.enforceableOnAnswerReady = true
+	prior.digest = testEvidenceDigest()
+	srv.localizationFor(ctx).armForTask(prior, "previous localization")
+
+	req := mcpgo.CallToolRequest{}
+	req.Params.Arguments = map[string]any{
+		"task":         "locate HugeTarget implementation",
+		"localize":     true,
+		"token_budget": exploreMinBudgetTokens,
+		"max_symbols":  1,
+	}
+	result, err := srv.handleExplore(ctx, req)
+	if err != nil {
+		t.Fatalf("handleExplore error: %v", err)
+	}
+	if result == nil || !result.IsError {
+		t.Fatalf("oversized localization result = %#v, want MCP error", result)
+	}
+	if text, _ := singleTextContent(result); !strings.Contains(text, "serialized response budget") {
+		t.Fatalf("unexpected packing error: %q", text)
+	}
+
+	state := srv.localizationFor(ctx)
+	state.mu.Lock()
+	completion := state.completionLocked()
+	state.mu.Unlock()
+	if completion.State != localizationStateInactive || completion.Enforceable || completion.digest != nil {
+		t.Fatalf("packing error armed localization state: %#v", completion)
+	}
+	if blocked, _ := state.authorizeWithToken("search", "text", map[string]any{"query": "HugeTarget"}); blocked != nil {
+		t.Fatalf("packing error blocked the continuing coding session: %#v", blocked)
+	}
+}
+
 func TestExploreFileDiversificationIsStrictlyConceptOnly(t *testing.T) {
 	if !exploreShouldDiversifyByFile(rerank.QueryClassConcept) {
 		t.Fatal("Concept query must retain bounded per-file diversification")
@@ -1065,11 +1119,11 @@ func TestLocalizationEvidenceReservesExactBeforePromotedNeighbor(t *testing.T) {
 	if err := json.Unmarshal([]byte(wire.Content[0].Text), &envelope); err != nil {
 		t.Fatal(err)
 	}
-	if len(envelope.Symbols) != 2 || envelope.Symbols[0] != primary.ID || envelope.Symbols[1] != exact.ID {
-		t.Fatalf("symbols = %v, want primary and exact", envelope.Symbols)
+	if len(envelope.Symbols) != 2 || envelope.Symbols[0] != exact.ID || envelope.Symbols[1] != primary.ID {
+		t.Fatalf("symbols = %v, want canonical exact then primary order", envelope.Symbols)
 	}
-	if len(envelope.Evidence) != 2 || envelope.Evidence[1].ID != exact.ID {
-		t.Fatalf("exact evidence missing: %+v", envelope.Evidence)
+	if len(envelope.Evidence) != 2 || envelope.Evidence[0].ID != exact.ID || envelope.Evidence[1].ID != primary.ID {
+		t.Fatalf("canonical evidence order diverged: %+v", envelope.Evidence)
 	}
 	if len(envelope.Files) != 2 || envelope.Files[0] != "walk.go" || envelope.Files[1] != "walk.go" {
 		t.Fatalf("files = %v, want one positional file per primary/exact row", envelope.Files)
@@ -1124,11 +1178,11 @@ func TestLocalizationEnvelopeEnforcesSerializedBudgetWithLongMetadata(t *testing
 	if err := json.Unmarshal([]byte(text), &envelope); err != nil {
 		t.Fatal(err)
 	}
-	if len(envelope.Symbols) < 2 || envelope.Symbols[0] != primary.ID || envelope.Symbols[1] != exact.ID {
-		t.Fatalf("mandatory symbols not retained: %v", envelope.Symbols)
+	if len(envelope.Symbols) < 2 || envelope.Symbols[0] != exact.ID || envelope.Symbols[1] != primary.ID {
+		t.Fatalf("mandatory symbols not retained in canonical order: %v", envelope.Symbols)
 	}
-	if len(envelope.Evidence) < 2 || envelope.Evidence[0].ID != primary.ID || envelope.Evidence[1].ID != exact.ID {
-		t.Fatalf("mandatory evidence not retained: %+v", envelope.Evidence)
+	if len(envelope.Evidence) < 2 || envelope.Evidence[0].ID != exact.ID || envelope.Evidence[1].ID != primary.ID {
+		t.Fatalf("mandatory evidence not retained in canonical order: %+v", envelope.Evidence)
 	}
 	for _, evidence := range envelope.Evidence {
 		if len(evidence.Callers) > localizationMaxNeighborIDs || len(evidence.Callees) > localizationMaxNeighborIDs {
@@ -1140,6 +1194,78 @@ func TestLocalizationEnvelopeEnforcesSerializedBudgetWithLongMetadata(t *testing
 	}
 	if got := compactLocalizationField(longMetadata, localizationMaxSignatureRunes); len([]rune(got)) > localizationMaxSignatureRunes {
 		t.Fatalf("signature compaction = %d runes", len([]rune(got)))
+	}
+}
+
+func TestLocalizationFinalResponseRestoresReadInsteadOfOversizedRetiredBody(t *testing.T) {
+	const budget = 512
+	exactID := "repo/target.go::Target"
+	leadID := "repo/entry.go::TargetEntry"
+	targets := []exploreTarget{
+		{node: &graph.Node{
+			ID: leadID, Name: "TargetEntry", QualName: "TargetEntry", Kind: graph.KindFunction,
+			FilePath: "repo/entry.go", StartLine: 1, EndLine: 8,
+		}},
+		{
+			node: &graph.Node{
+				ID: exactID, Name: "Target", QualName: "Target", Kind: graph.KindFunction,
+				FilePath: "repo/target.go", StartLine: 1, EndLine: 80,
+			},
+			source:                "func Target() {\n" + strings.Repeat("\t// target implementation body\n", 90) + "}\n",
+			sourceLiteral:         true,
+			sourceLiteralCallee:   true,
+			exactContent:          true,
+			directCalleesComplete: true,
+			sourceLiteralAligned:  true,
+			exactContentAmbiguous: false,
+		},
+	}
+	for index := 0; index < 4; index++ {
+		targets = append(targets, exploreTarget{node: &graph.Node{
+			ID:       fmt.Sprintf("repo/support-%d.go::Support%dWithLongImplementationName", index, index),
+			Name:     fmt.Sprintf("Support%dWithLongImplementationName", index),
+			QualName: fmt.Sprintf("Support%dWithLongImplementationName", index),
+			Kind:     graph.KindFunction, FilePath: fmt.Sprintf("repo/support-%d.go", index),
+			StartLine: index + 2, EndLine: index + 8,
+		}})
+	}
+
+	result, _, digest, packed := buildLocalizationExploreResultForTaskFinalized(
+		newLocalizationExactReadCompletion(exactID, false),
+		"find the Target implementation body",
+		targets,
+		budget,
+	)
+	if result == nil || result.IsError {
+		t.Fatalf("packing returned an error instead of restoring the read: %#v", result)
+	}
+	text, ok := singleTextContent(result)
+	if !ok {
+		t.Fatalf("packed result content = %#v", result.Content)
+	}
+	if len(text) > budget*localizationEnvelopeBytesPerToken {
+		t.Fatalf("restored-read envelope = %d bytes, budget = %d", len(text), budget*localizationEnvelopeBytesPerToken)
+	}
+	var envelope localizationExploreEnvelope
+	if err := json.Unmarshal([]byte(text), &envelope); err != nil {
+		t.Fatal(err)
+	}
+	if packed.State != localizationStateNeedsExactRead || envelope.Completion.State != localizationStateNeedsExactRead {
+		t.Fatalf("oversized retired body did not restore exact read: packed=%#v visible=%#v", packed, envelope.Completion)
+	}
+	if !packed.enforceableOnAnswerReady {
+		t.Fatalf("restored exact-read prescription lost its visible strong-proof enforcement: %#v", packed)
+	}
+	if digest == nil || len(digest.Evidence) == 0 || digest.Evidence[0].ID != exactID {
+		t.Fatalf("restored non-head prescription was not retained as the canonical digest priority: %#v", digest)
+	}
+	if len(envelope.Evidence) == 0 || envelope.Evidence[0].ID != exactID || envelope.Symbols[0] != exactID {
+		t.Fatalf("visible response order diverged from restored digest priority: %#v", envelope)
+	}
+	for _, row := range envelope.Evidence {
+		if row.ID == exactID && row.Source != "" {
+			t.Fatalf("restored prescription still shipped its oversized body: %d bytes", len(row.Source))
+		}
 	}
 }
 
@@ -1181,6 +1307,58 @@ func TestLocalizationEnvelopeIncludesBoundedStructuralNeighbor(t *testing.T) {
 	}
 }
 
+func TestExploreEnvelopeCompactsOptionalDetailBeforeDigestIdentities(t *testing.T) {
+	task := "CultureNotFoundException ku on Xamarin.Android while calling ToWords with CultureInfo pl after Kurdish support"
+	localiser := &graph.Node{
+		ID: "src/Humanizer/Configuration/LocaliserRegistry.cs::LocaliserRegistry.Register", Name: "Register",
+		QualName: "LocaliserRegistry.Register", Kind: graph.KindMethod,
+		FilePath: "src/Humanizer/Configuration/LocaliserRegistry.cs", StartLine: 55,
+	}
+	nodes := []*graph.Node{
+		{ID: "src/Humanizer/NumberToWordsExtension.cs::NumberToWordsExtension.ToWords_L92", Name: "ToWords", QualName: "NumberToWordsExtension.ToWords", Kind: graph.KindMethod, FilePath: "src/Humanizer/NumberToWordsExtension.cs", StartLine: 92},
+		localiser,
+		{ID: "src/Humanizer/Configuration/Configurator.cs::Configurator", Name: "Configurator", QualName: "Configurator", Kind: graph.KindType, FilePath: "src/Humanizer/Configuration/Configurator.cs", StartLine: 16},
+		{ID: "src/Humanizer/Configuration/Configurator.cs::Configurator.GetNumberToWordsConverter", Name: "GetNumberToWordsConverter", QualName: "Configurator.GetNumberToWordsConverter", Kind: graph.KindMethod, FilePath: "src/Humanizer/Configuration/Configurator.cs", StartLine: 85},
+		{ID: "src/Humanizer/NoMatchFoundException.cs::NoMatchFoundException.init", Name: "NoMatchFoundException.init", QualName: "NoMatchFoundException.init", Kind: graph.KindMethod, FilePath: "src/Humanizer/NoMatchFoundException.cs", StartLine: 20},
+		{ID: "src/Humanizer/Configuration/LocaliserRegistry.cs::LocaliserRegistry.ResolveForCulture", Name: "ResolveForCulture", QualName: "LocaliserRegistry.ResolveForCulture", Kind: graph.KindMethod, FilePath: "src/Humanizer/Configuration/LocaliserRegistry.cs", StartLine: 47},
+		{ID: "src/Humanizer/NumberToWordsExtension.cs::NumberToWordsExtension.ToWords_L55", Name: "ToWords", QualName: "NumberToWordsExtension.ToWords", Kind: graph.KindMethod, FilePath: "src/Humanizer/NumberToWordsExtension.cs", StartLine: 55},
+		{ID: "src/Humanizer/GrammaticalGender.cs::GrammaticalGender", Name: "GrammaticalGender", QualName: "GrammaticalGender", Kind: graph.KindType, FilePath: "src/Humanizer/GrammaticalGender.cs", StartLine: 6},
+		{ID: "src/Humanizer/Configuration/FormatterRegistry.cs::FormatterRegistry.RegisterCzechSlovakPolishFormatter", Name: "RegisterCzechSlovakPolishFormatter", QualName: "FormatterRegistry.RegisterCzechSlovakPolishFormatter", Kind: graph.KindMethod, FilePath: "src/Humanizer/Configuration/FormatterRegistry.cs", StartLine: 62},
+	}
+	targets := make([]exploreTarget, 0, len(nodes))
+	for index, node := range nodes {
+		node.Meta = map[string]any{"signature": strings.Repeat("optional argument ", 8)}
+		target := exploreTarget{node: node}
+		if index == len(nodes)-1 {
+			target.callees = []*graph.Node{localiser}
+		}
+		targets = append(targets, target)
+	}
+	result, _, digest := buildLocalizationExploreResultForTask(
+		newLocalizationRecoveryCompletion(), task, targets, exploreMaxBudgetTokens,
+	)
+	if result == nil || result.IsError || digest == nil {
+		t.Fatalf("packed result=%#v digest=%#v", result, digest)
+	}
+	text, ok := singleTextContent(result)
+	if !ok {
+		t.Fatalf("expected one text result: %#v", result.Content)
+	}
+	var envelope localizationExploreEnvelope
+	if err := json.Unmarshal([]byte(text), &envelope); err != nil {
+		t.Fatalf("decode localization envelope: %v", err)
+	}
+	if len(envelope.Evidence) != len(nodes) || len(digest.Evidence) != len(nodes) {
+		t.Fatalf("optional detail displaced identities: visible=%d retained=%d want=%d", len(envelope.Evidence), len(digest.Evidence), len(nodes))
+	}
+	if !strings.Contains(envelope.Completion.FinalResponse, " — PRIMARY — src/Humanizer/Configuration/FormatterRegistry.cs:62 — src/Humanizer/Configuration/FormatterRegistry.cs::FormatterRegistry.RegisterCzechSlovakPolishFormatter") {
+		t.Fatalf("direct complementary implementation was not retained as PRIMARY:\n%s", envelope.Completion.FinalResponse)
+	}
+	if !localizationEnvelopeFits(envelope, exploreMaxBudgetTokens*localizationEnvelopeBytesPerToken) {
+		t.Fatal("compacted visible envelope exceeded its byte budget")
+	}
+}
+
 func TestRefinementEnvelopeAuthorizesSerializedEvidenceAndOmitsSource(t *testing.T) {
 	buildParallel := &graph.Node{ID: "crates/ignore/src/walk.rs::WalkBuilder.build_parallel", Name: "build_parallel", QualName: "WalkBuilder.build_parallel", Kind: graph.KindMethod, FilePath: "crates/ignore/src/walk.rs"}
 	buildWithCWD := &graph.Node{ID: "crates/ignore/src/dir.rs::IgnoreBuilder.build_with_cwd", Name: "build_with_cwd", QualName: "IgnoreBuilder.build_with_cwd", Kind: graph.KindMethod, FilePath: "crates/ignore/src/dir.rs"}
@@ -1203,28 +1381,42 @@ func TestRefinementEnvelopeAuthorizesSerializedEvidenceAndOmitsSource(t *testing
 	if err := json.Unmarshal([]byte(text), &envelope); err != nil {
 		t.Fatalf("decode localization envelope: %v", err)
 	}
-	if !strings.Contains(envelope.Completion.RequiredAction, buildParallel.ID) {
-		t.Fatalf("refinement action did not name preferred symbol: %#v", envelope.Completion)
+	if envelope.Completion.State != localizationStateAnswerReady || !envelope.Terminal {
+		t.Fatalf("packed refinement did not terminate localization: %#v", envelope.Completion)
 	}
-	if envelope.Completion.ExactSymbol != "" {
-		t.Fatalf("uncertain refinement advertised exact symbol: %#v", envelope.Completion)
+	if envelope.Completion.Enforceable || envelope.Completion.AllowedToolCalls != 0 {
+		t.Fatalf("uncertain refinement became enforceable or retained a read: %#v", envelope.Completion)
+	}
+	if envelope.Completion.ExactSymbol != "" || len(envelope.Completion.AllowedSymbols) != 0 {
+		t.Fatalf("bounded conclusion advertised a remaining symbol read: %#v", envelope.Completion)
+	}
+	if !strings.Contains(envelope.Completion.FinalResponse, localizationBoundedHeading) {
+		t.Fatalf("bounded refinement omitted its bounded-evidence heading: %#v", envelope.Completion)
 	}
 	if strings.Join(authorized, "\n") != strings.Join(envelope.Symbols, "\n") {
-		t.Fatalf("authorization differs from serialized symbols: authorized=%#v symbols=%#v", authorized, envelope.Symbols)
+		t.Fatalf("returned evidence differs from serialized symbols: returned=%#v symbols=%#v", authorized, envelope.Symbols)
 	}
 	if len(authorized) > 12 {
-		t.Fatalf("refinement authorization exceeded cap: %d", len(authorized))
+		t.Fatalf("serialized evidence exceeded cap: %d", len(authorized))
 	}
 	if !strings.Contains(strings.Join(authorized, "\n"), buildWithCWD.ID) {
-		t.Fatalf("serialized structural target was not authorized: %#v", authorized)
+		t.Fatalf("serialized structural target was not retained: %#v", authorized)
 	}
 	if strings.Contains(strings.Join(authorized, "\n"), unrelated.ID) {
-		t.Fatalf("neighbor hint became a refinement target: %#v", authorized)
+		t.Fatalf("neighbor hint became terminal evidence: %#v", authorized)
 	}
+	packedPreferred := false
 	for _, evidence := range envelope.Evidence {
-		if evidence.Source != "" {
-			t.Fatalf("needs-refinement duplicated source for %s", evidence.ID)
+		if evidence.ID == buildParallel.ID && strings.TrimSpace(evidence.Source) != "" {
+			packedPreferred = true
+			continue
 		}
+		if evidence.Source != "" {
+			t.Fatalf("bounded refinement packed non-prescribed source for %s", evidence.ID)
+		}
+	}
+	if !packedPreferred {
+		t.Fatal("bounded refinement retired the read without the prescribed source")
 	}
 }
 
@@ -1268,8 +1460,11 @@ func TestRefinementEnvelopeAndHostDigestShareBoundedAuthorization(t *testing.T) 
 	result, packed, _, digest := buildLocalizationRefinementResultForTask(
 		allowed[0], "", targets, exploreMaxBudgetTokens, routes,
 	)
-	if result == nil || result.IsError || digest == nil || packed.State != localizationStateNeedsRefinement {
+	if result == nil || result.IsError || digest == nil || packed.State != localizationStateAnswerReady {
 		t.Fatalf("packed refinement = result=%#v completion=%#v digest=%#v", result, packed, digest)
+	}
+	if packed.Enforceable || packed.AllowedToolCalls != 0 || len(packed.AllowedSymbols) != 0 {
+		t.Fatalf("packed refinement retained an enforceable navigation contract: %#v", packed)
 	}
 	text, ok := singleTextContent(result)
 	if !ok {
@@ -1282,10 +1477,16 @@ func TestRefinementEnvelopeAndHostDigestShareBoundedAuthorization(t *testing.T) 
 	if len(envelope.Evidence) != len(visibleIDs) || len(envelope.Files) != len(visibleIDs) || len(envelope.Symbols) != len(visibleIDs) {
 		t.Fatalf("visible cardinality changed: files=%d symbols=%d evidence=%d want=%d", len(envelope.Files), len(envelope.Symbols), len(envelope.Evidence), len(visibleIDs))
 	}
-	for index, want := range visibleIDs {
-		row := envelope.Evidence[index]
-		if envelope.Symbols[index] != want || row.ID != want || envelope.Files[index] != row.File || row.Rank != index+1 {
-			t.Fatalf("visible row %d changed or diverged: want=%q row=%#v", index+1, want, row)
+	seenVisible := make(map[string]struct{}, len(visibleIDs))
+	for index, row := range envelope.Evidence {
+		if envelope.Symbols[index] != row.ID || envelope.Files[index] != row.File || row.Rank != index+1 {
+			t.Fatalf("visible row %d is not positionally aligned: %#v", index+1, row)
+		}
+		seenVisible[row.ID] = struct{}{}
+	}
+	for _, want := range visibleIDs {
+		if _, exists := seenVisible[want]; !exists {
+			t.Fatalf("visible evidence lost %q after canonical reorder", want)
 		}
 	}
 	if len(digest.Evidence) >= len(envelope.Evidence) {
@@ -1298,19 +1499,27 @@ func TestRefinementEnvelopeAndHostDigestShareBoundedAuthorization(t *testing.T) 
 	if !ok || host.Evidence == nil {
 		t.Fatalf("host localization envelope = %#v", result.Meta.AdditionalFields[localizationHostMetaKey])
 	}
-	wantAllowed := strings.Join(allowed, "\n")
-	if strings.Join(packed.AllowedSymbols, "\n") != wantAllowed ||
-		strings.Join(envelope.Completion.AllowedSymbols, "\n") != wantAllowed ||
-		strings.Join(host.Contract.Completion.AllowedSymbols, "\n") != wantAllowed {
-		t.Fatalf("completion authorization diverged: packed=%#v visible=%#v host=%#v", packed.AllowedSymbols, envelope.Completion.AllowedSymbols, host.Contract.Completion.AllowedSymbols)
+	if !envelope.Terminal || !host.Contract.Terminal {
+		t.Fatalf("bounded refinement was not terminal: visible=%t host=%t", envelope.Terminal, host.Contract.Terminal)
 	}
-	if len(host.Evidence.Evidence) < len(allowed) {
-		t.Fatalf("host retained %d rows, want %d authorized rows", len(host.Evidence.Evidence), len(allowed))
+	if envelope.Completion.State != localizationStateAnswerReady || host.Contract.Completion.State != localizationStateAnswerReady ||
+		envelope.Completion.Enforceable || host.Contract.Completion.Enforceable ||
+		envelope.Completion.AllowedToolCalls != 0 || host.Contract.Completion.AllowedToolCalls != 0 ||
+		len(envelope.Completion.AllowedSymbols) != 0 || len(host.Contract.Completion.AllowedSymbols) != 0 {
+		t.Fatalf("bounded completion contract diverged: packed=%#v visible=%#v host=%#v", packed, envelope.Completion, host.Contract.Completion)
 	}
-	for index, want := range allowed {
-		row := host.Evidence.Evidence[index]
-		if row.ID != want || host.Evidence.Symbols[index] != want || host.Evidence.Files[index] != row.File || row.Rank != index+1 {
-			t.Fatalf("host authorized row %d diverged: want=%q row=%#v", index+1, want, row)
+	if packed.FinalResponse != envelope.Completion.FinalResponse || packed.FinalResponse != host.Contract.Completion.FinalResponse ||
+		!strings.Contains(packed.FinalResponse, localizationBoundedHeading) {
+		t.Fatalf("bounded response diverged: packed=%q visible=%q host=%q", packed.FinalResponse, envelope.Completion.FinalResponse, host.Contract.Completion.FinalResponse)
+	}
+	if len(host.Evidence.Evidence) == 0 || len(host.Evidence.Evidence) > len(envelope.Evidence) {
+		t.Fatalf("host retained invalid evidence cardinality: retained=%d visible=%d", len(host.Evidence.Evidence), len(envelope.Evidence))
+	}
+	for index, row := range host.Evidence.Evidence {
+		want := envelope.Evidence[index]
+		if row.ID != want.ID || row.File != want.File || row.Rank != want.Rank ||
+			host.Evidence.Symbols[index] != want.ID || host.Evidence.Files[index] != want.File {
+			t.Fatalf("host row %d diverged from visible evidence: want=%#v row=%#v", index+1, want, row)
 		}
 	}
 	encoded, err := json.Marshal(host.Evidence)

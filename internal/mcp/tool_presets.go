@@ -505,29 +505,49 @@ func (s *Server) effectiveSessionPolicy(ctx context.Context) *toolPolicy {
 	if sess == nil {
 		return s.toolPolicy
 	}
-	sess.mu.Lock()
-	if sess.toolPolicyResolved {
-		p := sess.resolvedToolPolicy
+	for {
+		sess.mu.Lock()
+		if sess.toolPolicyResolved {
+			p := sess.resolvedToolPolicy
+			sess.mu.Unlock()
+			if p != nil {
+				return p
+			}
+			return s.toolPolicy
+		}
+		if !sess.instructionProfileResolved {
+			sess.instructionProfilePreset = activeInstructionPreset()
+			sess.instructionProfileResolved = true
+		}
+		spec, mode, client := sess.toolSpec, sess.toolMode, sess.clientName
+		profilePreset := sess.instructionProfilePreset
+		generation := sess.toolPolicyGeneration
 		sess.mu.Unlock()
+
+		p := s.resolveSessionPolicyForProfile(spec, mode, client, profilePreset)
+
+		sess.mu.Lock()
+		if generation != sess.toolPolicyGeneration {
+			sess.mu.Unlock()
+			continue
+		}
+		if sess.toolPolicyResolved {
+			cached := sess.resolvedToolPolicy
+			sess.mu.Unlock()
+			if cached != nil {
+				return cached
+			}
+			return s.toolPolicy
+		}
+		sess.resolvedToolPolicy = p
+		sess.toolPolicyResolved = true
+		sess.mu.Unlock()
+
 		if p != nil {
 			return p
 		}
 		return s.toolPolicy
 	}
-	spec, mode, client := sess.toolSpec, sess.toolMode, sess.clientName
-	sess.mu.Unlock()
-
-	p := s.resolveSessionPolicy(spec, mode, client)
-
-	sess.mu.Lock()
-	sess.resolvedToolPolicy = p
-	sess.toolPolicyResolved = true
-	sess.mu.Unlock()
-
-	if p != nil {
-		return p
-	}
-	return s.toolPolicy
 }
 
 // resolveSessionPolicy builds the effective policy from a client-forwarded
@@ -536,6 +556,10 @@ func (s *Server) effectiveSessionPolicy(ctx context.Context) *toolPolicy {
 // the client did not pin one, so a bare `GORTEX_TOOLS=nav` keeps the
 // daemon's defer semantics instead of silently switching to hide.
 func (s *Server) resolveSessionPolicy(spec, mode, client string) *toolPolicy {
+	return s.resolveSessionPolicyForProfile(spec, mode, client, activeInstructionPreset())
+}
+
+func (s *Server) resolveSessionPolicyForProfile(spec, mode, client, profilePreset string) *toolPolicy {
 	if strings.TrimSpace(spec) != "" {
 		cfg := parseToolSpec(spec)
 		switch {
@@ -557,7 +581,7 @@ func (s *Server) resolveSessionPolicy(spec, mode, client string) *toolPolicy {
 	if s.toolPolicyOperatorPinned {
 		return nil
 	}
-	if p := s.instructionProfilePolicy(); p != nil {
+	if p := s.instructionProfilePolicyForPreset(profilePreset); p != nil {
 		return p
 	}
 	if p := s.clientDefaultPolicy(client); p != nil {
@@ -568,7 +592,7 @@ func (s *Server) resolveSessionPolicy(spec, mode, client string) *toolPolicy {
 
 func isFacadePreset(name string) bool {
 	switch strings.ToLower(strings.TrimSpace(name)) {
-	case FacadeSurfaceVersion, "compact", "facade", "agent-v2":
+	case FacadeSurfaceVersion, "compact", "facade", "agent-v2", "localization":
 		return true
 	default:
 		return false
@@ -588,11 +612,11 @@ var activeInstructionPreset = profiles.ActiveToolPreset
 // profile carries no preset, so machines that never ran
 // `gortex instructions switch` resolve exactly as before.
 func (s *Server) instructionProfilePolicy() *toolPolicy {
-	if s == nil || s.toolPolicyOperatorPinned {
-		return nil
-	}
-	preset := activeInstructionPreset()
-	if strings.TrimSpace(preset) == "" {
+	return s.instructionProfilePolicyForPreset(activeInstructionPreset())
+}
+
+func (s *Server) instructionProfilePolicyForPreset(preset string) *toolPolicy {
+	if s == nil || s.toolPolicyOperatorPinned || strings.TrimSpace(preset) == "" {
 		return nil
 	}
 	mode := toolPolicyModeDefer

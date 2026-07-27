@@ -42,11 +42,18 @@ func TestRulePreambleRoutesByOutcomeAndPreservesExactIdentifiers(t *testing.T) {
 		"preserves the recovery allowance",
 		"the rejected request does not count as the accepted recovery",
 		"Do not call host Read, Grep, Glob, or Bash",
-		"one aligned file/symbol tuple",
+		"bounded localization is complete and retained",
+		"localization-only request",
+		"respond directly from `completion.final_response`",
+		"do not call another tool merely to repeat the same search",
+		"An identical `explore.localize` call replays the retained terminal payload",
+		"Ordinary Gortex tools remain live",
+		"for contradictory evidence or a diagnosis/change workflow",
+		"continue reading, analysis, impact, editing, and verification normally",
+		"each EVIDENCE #N row",
+		"one aligned rank/role/file/symbol tuple",
 		"preserve the PRIMARY file and symbol identities",
 		"SUPPORTING rows are optional context",
-		"intentionally not executed and replays the same retained terminal payload",
-		"not stale or canned output or an integration failure",
 		"Outside an active localization contract",
 	} {
 		if !strings.Contains(briefing, required) {
@@ -56,6 +63,9 @@ func TestRulePreambleRoutesByOutcomeAndPreservesExactIdentifiers(t *testing.T) {
 	for _, forced := range []string{
 		"including a request framed as diagnosis or a why question",
 		"Call `explore` first for code discovery, diagnosis",
+		"make no further tool calls",
+		"Any later Gortex navigation call for that same task is intentionally not executed",
+		"not stale or canned output or an integration failure",
 	} {
 		if strings.Contains(briefing, forced) {
 			t.Fatalf("rule preamble contains forced-localize wording %q: %s", forced, briefing)
@@ -96,19 +106,32 @@ func TestRunSessionStartEmitsNeutralRoutingAndIdentifierGuidance(t *testing.T) {
 		"the rejected request does not count as the accepted recovery",
 		"Do not call host Read, Grep, Glob, or Bash",
 		"At `answer_ready`",
-		"respond from `completion.final_response`",
-		"one aligned file/symbol tuple",
+		"bounded localization is complete and retained",
+		"localization-only request",
+		"respond directly from `completion.final_response`",
+		"do not call another tool merely to repeat the same search",
+		"An identical `explore.localize` call replays the retained terminal payload",
+		"Ordinary Gortex tools remain live",
+		"for contradictory evidence or a diagnosis/change workflow",
+		"continue reading, analysis, impact, editing, and verification normally",
+		"each EVIDENCE #N row",
+		"one aligned rank/role/file/symbol tuple",
 		"preserve the PRIMARY file and symbol identities",
 		"SUPPORTING rows are optional context",
-		"intentionally not executed and replays the same retained terminal payload",
-		"not stale or canned output or an integration failure",
 	} {
 		if !strings.Contains(context, required) {
 			t.Fatalf("SessionStart event missing %q: %s", required, context)
 		}
 	}
-	if strings.Contains(context, "including a request framed as diagnosis or a why question") {
-		t.Fatalf("SessionStart event contains forced-localize diagnosis wording: %s", context)
+	for _, forbidden := range []string{
+		"including a request framed as diagnosis or a why question",
+		"make no further tool calls",
+		"Any later Gortex navigation call for that same task is intentionally not executed",
+		"not stale or canned output or an integration failure",
+	} {
+		if strings.Contains(context, forbidden) {
+			t.Fatalf("SessionStart event contains obsolete wording %q: %s", forbidden, context)
+		}
 	}
 }
 

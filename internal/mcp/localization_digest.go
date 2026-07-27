@@ -6,6 +6,8 @@ import (
 	"strings"
 
 	mcpgo "github.com/mark3labs/mcp-go/mcp"
+
+	"github.com/zzet/gortex/internal/search/rerank"
 )
 
 // Terminal evidence retention.
@@ -67,9 +69,11 @@ type localizationDigestRow struct {
 // rows. Files and Symbols are rebuilt from those rows, so an item that was shed
 // by the replay limit or byte budget cannot survive as an unsupported answer
 // candidate. Exact and refinement-authorized rows form a stable protected
-// prefix in retained state only; the visible envelope keeps its original order.
+// prefix in retained state first. The serialized envelope is then aligned to
+// that canonical digest order, so every response mode assigns the same rank to
+// the same file/symbol tuple on the first page and every later replay.
 // The request is rendered into the ready-to-emit answer, so a page completing
-// on its first call presents the same task-scored rows a later merge would.
+// on its first call presents the same canonical retained rows a later replay would.
 func newLocalizationEvidenceDigestForTask(task string, envelope localizationExploreEnvelope) *localizationEvidenceDigest {
 	digest := &localizationEvidenceDigest{}
 	priorityIDs := localizationDigestPriorityIDs(envelope.Completion, envelope.Evidence)
@@ -109,29 +113,7 @@ func newLocalizationEvidenceDigestForTask(task string, envelope localizationExpl
 	appendRows(true)
 	appendRows(false)
 
-	for {
-		rebuildLocalizationDigestSkeleton(digest)
-		refreshLocalizationDigestResponses(digest, task, nil)
-		encoded, err := json.Marshal(digest)
-		if err == nil && len(encoded) <= localizationDigestMaxBytes && len(digest.finalResponse) <= localizationFinalResponseMaxBytes {
-			return digest
-		}
-		if len(digest.Evidence) == 0 {
-			return digest
-		}
-		last := len(digest.Evidence) - 1
-		if shedLocalizationDigestRowOptionalFields(&digest.Evidence[last]) {
-			continue
-		}
-		// The identity and file are the irreducible row. If even one pathological
-		// row cannot fit, prefer a bounded empty answer over retaining oversized
-		// session state or emitting a truncated, misleading identity.
-		if last == 0 {
-			digest.Evidence = nil
-			continue
-		}
-		digest.Evidence = digest.Evidence[:last]
-	}
+	return fitLocalizationEvidenceDigest(digest, task, nil, priorityIDs)
 }
 
 // localizationDigestPriorityIDs protects every identity required to justify a
@@ -229,26 +211,7 @@ func mergeLocalizationEvidenceDigest(current []localizationDigestRow, retained *
 	}
 	// Any capacity the retained rows did not need goes back to the fresh page.
 	appendRows(current, localizationReplayEvidenceLimit)
-	for {
-		rebuildLocalizationDigestSkeleton(digest)
-		refreshLocalizationDigestResponses(digest, "", nil)
-		encoded, err := json.Marshal(digest)
-		if err == nil && len(encoded) <= localizationDigestMaxBytes && len(digest.finalResponse) <= localizationFinalResponseMaxBytes {
-			return digest
-		}
-		if len(digest.Evidence) == 0 {
-			return digest
-		}
-		last := len(digest.Evidence) - 1
-		if shedLocalizationDigestRowOptionalFields(&digest.Evidence[last]) {
-			continue
-		}
-		if last == 0 {
-			digest.Evidence = nil
-			continue
-		}
-		digest.Evidence = digest.Evidence[:last]
-	}
+	return fitLocalizationEvidenceDigest(digest, "", nil, nil)
 }
 
 const localizationSameOwnerEvidenceReserve = 3
@@ -378,6 +341,31 @@ func localizationDigestRowOwnerKey(row localizationDigestRow) string {
 	return file + "\x00" + owner
 }
 
+func shedLocalizationEnvelopeRowOptionalFields(row *localizationEvidence) bool {
+	if row == nil {
+		return false
+	}
+	if len(row.Callers) > 0 || len(row.Callees) > 0 {
+		row.Callers = nil
+		row.Callees = nil
+		return true
+	}
+	if row.Signature != "" {
+		row.Signature = ""
+		return true
+	}
+	if row.QualName != "" {
+		row.QualName = ""
+		return true
+	}
+	if row.Name != "" || row.Kind != "" {
+		row.Name = ""
+		row.Kind = ""
+		return true
+	}
+	return false
+}
+
 func shedLocalizationDigestRowOptionalFields(row *localizationDigestRow) bool {
 	if row == nil {
 		return false
@@ -403,6 +391,103 @@ func shedLocalizationDigestRowOptionalFields(row *localizationDigestRow) bool {
 	return false
 }
 
+const (
+	localizationProvenanceTaskComplement         = "task_complement"
+	localizationProvenanceTaskRelationComplement = "task_relation_complement"
+)
+
+// markLocalizationDigestTaskComplement records the one complementary PRIMARY
+// identity before byte packing removes relation lists. A separate marker keeps
+// a direct graph complement distinguishable from a weak lexical hint after the
+// relation arrays are compacted. Both markers are display-only: neither grants
+// navigation authorization or changes evidence order.
+func markLocalizationDigestTaskComplement(task string, current []localizationDigestRow, digest *localizationEvidenceDigest) {
+	if digest == nil || strings.TrimSpace(task) == "" {
+		return
+	}
+	relationRows := current
+	if len(relationRows) == 0 {
+		relationRows = digest.Evidence
+	}
+	relationSeeds := relationRows[:min(localizationFinalResponsePrimaryLimit+2, len(relationRows))]
+	for _, item := range localizationFinalResponseRows(task, current, digest.Evidence) {
+		if !item.primary || item.row.Rank <= 2 {
+			continue
+		}
+		provenance := localizationProvenanceTaskComplement
+		for _, candidate := range relationRows {
+			if candidate.ID == item.row.ID && localizationFinalResponseDirectRelation(candidate, relationSeeds) {
+				provenance = localizationProvenanceTaskRelationComplement
+				break
+			}
+		}
+		for index := range digest.Evidence {
+			if digest.Evidence[index].ID != item.row.ID {
+				continue
+			}
+			if strings.TrimSpace(digest.Evidence[index].Provenance) == "" {
+				digest.Evidence[index].Provenance = provenance
+			}
+			return
+		}
+	}
+}
+
+// fitLocalizationEvidenceDigest removes optional detail across the whole page
+// before it drops any file/symbol identity. The old tail-only policy could spend
+// the entire byte budget on callers and signatures for early rows, then discard
+// a late implementation candidate that would fit once those optional fields
+// were compacted. Protected authorization identities are dropped only when no
+// unprotected identity can satisfy the hard cap.
+func fitLocalizationEvidenceDigest(
+	digest *localizationEvidenceDigest,
+	task string,
+	current []localizationDigestRow,
+	protectedIDs map[string]struct{},
+) *localizationEvidenceDigest {
+	markLocalizationDigestTaskComplement(task, current, digest)
+	for {
+		rebuildLocalizationDigestSkeleton(digest)
+		refreshLocalizationDigestResponses(digest, task, current)
+		encoded, err := json.Marshal(digest)
+		if err == nil && len(encoded) <= localizationDigestMaxBytes && len(digest.finalResponse) <= localizationFinalResponseMaxBytes {
+			return digest
+		}
+		if len(digest.Evidence) == 0 {
+			return digest
+		}
+
+		shed := false
+		for index := len(digest.Evidence) - 1; index >= 0; index-- {
+			if shedLocalizationDigestRowOptionalFields(&digest.Evidence[index]) {
+				shed = true
+			}
+		}
+		if shed {
+			continue
+		}
+
+		drop := -1
+		for index := len(digest.Evidence) - 1; index >= 0; index-- {
+			if _, protected := protectedIDs[digest.Evidence[index].ID]; !protected {
+				drop = index
+				break
+			}
+		}
+		if drop < 0 {
+			drop = len(digest.Evidence) - 1
+		}
+		if len(digest.Evidence) == 1 {
+			// The identity and file are irreducible. A pathological single row
+			// cannot escape the byte cap as a truncated, misleading identity.
+			digest.Evidence = nil
+			continue
+		}
+		copy(digest.Evidence[drop:], digest.Evidence[drop+1:])
+		digest.Evidence = digest.Evidence[:len(digest.Evidence)-1]
+	}
+}
+
 func rebuildLocalizationDigestSkeleton(digest *localizationEvidenceDigest) {
 	digest.Files = digest.Files[:0]
 	digest.Symbols = digest.Symbols[:0]
@@ -416,15 +501,106 @@ func rebuildLocalizationDigestSkeleton(digest *localizationEvidenceDigest) {
 	}
 }
 
+// alignLocalizationEnvelopeWithDigest makes the retained digest the one
+// canonical positional projection. Source bodies and end lines stay attached
+// to their identities, while every visible mode receives the digest's ranks,
+// file/symbol order, and provenance labels.
+func alignLocalizationEnvelopeWithDigest(envelope *localizationExploreEnvelope, digest *localizationEvidenceDigest) {
+	if envelope == nil || digest == nil {
+		return
+	}
+
+	original := append([]localizationEvidence(nil), envelope.Evidence...)
+	rowsByID := make(map[string]localizationEvidence, len(original))
+	for _, row := range original {
+		if row.ID == "" {
+			continue
+		}
+		if _, exists := rowsByID[row.ID]; !exists {
+			rowsByID[row.ID] = row
+		}
+	}
+
+	files := make([]string, 0, len(original))
+	symbols := make([]string, 0, len(original))
+	evidence := make([]localizationEvidence, 0, len(original))
+	seen := make(map[string]struct{}, len(original))
+	appendRow := func(row localizationEvidence) {
+		if row.ID == "" {
+			return
+		}
+		if _, exists := seen[row.ID]; exists {
+			return
+		}
+		seen[row.ID] = struct{}{}
+		row.Rank = len(evidence) + 1
+		files = append(files, row.File)
+		symbols = append(symbols, row.ID)
+		evidence = append(evidence, row)
+	}
+	for _, retained := range digest.Evidence {
+		row, exists := rowsByID[retained.ID]
+		if !exists {
+			row = localizationEvidence{
+				ID: retained.ID, Name: retained.Name, QualName: retained.QualName,
+				Kind: retained.Kind, File: retained.File, Line: retained.Line,
+				Signature: retained.Signature,
+				Callers:   append([]string(nil), retained.Callers...),
+				Callees:   append([]string(nil), retained.Callees...),
+			}
+		}
+		row.ID = retained.ID
+		row.File = retained.File
+		row.Provenance = retained.Provenance
+		appendRow(row)
+	}
+	// Rows that did not fit the retained replay digest remain useful on the
+	// first page. Keep them after the canonical prefix so accuracy does not pay
+	// for replay's tighter byte cap and every shared rank still stays aligned.
+	for _, row := range original {
+		appendRow(row)
+	}
+	envelope.Files = files
+	envelope.Symbols = symbols
+	envelope.Evidence = evidence
+}
+
+// localizationDigestPackingDropIndex chooses a response-compaction row without
+// invalidating the live completion. Authorization dependencies, strong proof
+// provenance, and a body that retired its prescribed read are never selected.
+func localizationDigestPackingDropIndex(
+	digest *localizationEvidenceDigest,
+	completion localizationCompletion,
+	satisfiedSymbol string,
+) int {
+	if digest == nil || len(digest.Evidence) == 0 {
+		return -1
+	}
+	evidence := make([]localizationEvidence, 0, len(digest.Evidence))
+	for _, row := range digest.Evidence {
+		evidence = append(evidence, localizationEvidence{ID: row.ID, Provenance: row.Provenance})
+	}
+	protected := localizationDigestPriorityIDs(completion, evidence)
+	if satisfiedSymbol = strings.TrimSpace(satisfiedSymbol); satisfiedSymbol != "" {
+		protected[satisfiedSymbol] = struct{}{}
+	}
+	for index := len(digest.Evidence) - 1; index >= 0; index-- {
+		if _, keep := protected[digest.Evidence[index].ID]; !keep {
+			return index
+		}
+	}
+	return -1
+}
+
 func localizationFinalResponseField(value string) string {
 	return strings.Join(strings.Fields(value), " ")
 }
 
 const (
 	localizationFinalResponsePrimaryLimit = 3
-	// The answer asks the caller to reproduce these lines verbatim, so the
-	// presentation must cover every row the digest retained: a retained row
-	// that never reaches the answer is evidence the page found and then hid.
+	// PRIMARY is a role label on the canonical retained order, never a second
+	// ranking. Every retained row keeps its EVIDENCE number and later rows remain
+	// visible even when one complementary row receives the third PRIMARY slot.
 	localizationFinalResponseSupportingLimit = localizationReplayEvidenceLimit - localizationFinalResponsePrimaryLimit
 )
 
@@ -444,6 +620,7 @@ func localizationFinalResponsePrimaryProvenance(provenance string) bool {
 	case localizationProvenanceSourceLiteralCallee,
 		localizationProvenanceDivergentDefault,
 		localizationProvenanceImplementationTarget,
+		localizationProvenanceSyntacticAnchor,
 		localizationProvenanceTypedAnchorProjection:
 		return true
 	default:
@@ -455,6 +632,8 @@ func localizationFinalResponseSupportingProvenance(provenance string) bool {
 	switch provenance {
 	case localizationProvenanceDivergentDefaultType,
 		localizationProvenanceImplementationRoute,
+		localizationProvenanceTaskComplement,
+		localizationProvenanceTaskRelationComplement,
 		"direct_caller", "direct_callee":
 		return true
 	default:
@@ -488,6 +667,21 @@ func scoreLocalizationFinalResponseTask(taskTerms map[string]struct{}, row local
 	return score
 }
 
+func localizationFinalResponseTaskSupportsPrimary(row localizationDigestRow, score localizationFinalResponseTaskScore) bool {
+	if score.matched == 0 {
+		return false
+	}
+	switch strings.ToLower(strings.TrimSpace(row.Kind)) {
+	case "function", "method", "type", "class":
+		return true
+	default:
+		// Constants and enum variants are often incidental flag metadata. Keep
+		// them PRIMARY only when the task supplies multiple distinctive terms;
+		// an explicit identifier such as BinaryMode.Auto still clears this bar.
+		return score.matched >= 2 && score.longest >= 6
+	}
+}
+
 func localizationFinalResponseBetterTaskScore(left, right localizationFinalResponseTaskScore) bool {
 	if left.matched != right.matched {
 		return left.matched > right.matched
@@ -508,9 +702,6 @@ func localizationFinalResponseNeighborContains(ids []string, id string) bool {
 }
 
 func localizationFinalResponseDirectRelation(row localizationDigestRow, primaries []localizationDigestRow) bool {
-	if localizationFinalResponseSupportingProvenance(row.Provenance) {
-		return true
-	}
 	id := strings.TrimSpace(row.ID)
 	for _, primary := range primaries {
 		primaryID := strings.TrimSpace(primary.ID)
@@ -524,117 +715,221 @@ func localizationFinalResponseDirectRelation(row localizationDigestRow, primarie
 	return false
 }
 
-// localizationFinalResponseRows selects a bounded model-facing projection
-// without changing the retained evidence rows or their positional JSON arrays.
-func localizationFinalResponseRows(task string, current, rows []localizationDigestRow) []localizationFinalResponseRow {
-	if len(rows) == 0 {
-		return nil
+func localizationFinalResponseDirectory(file string) string {
+	file = strings.ReplaceAll(strings.TrimSpace(file), "\\", "/")
+	index := strings.LastIndex(file, "/")
+	if index <= 0 {
+		return ""
 	}
-	primaries := make([]localizationDigestRow, 0, localizationFinalResponsePrimaryLimit)
-	supporting := make([]localizationDigestRow, 0, localizationFinalResponseSupportingLimit)
-	selected := make(map[string]struct{}, localizationFinalResponsePrimaryLimit+localizationFinalResponseSupportingLimit)
-	appendRow := func(dst *[]localizationDigestRow, limit int, row localizationDigestRow) bool {
-		id := strings.TrimSpace(row.ID)
-		if id == "" || strings.TrimSpace(row.File) == "" || len(*dst) >= limit {
-			return false
-		}
-		if _, exists := selected[id]; exists {
-			return false
-		}
-		selected[id] = struct{}{}
-		*dst = append(*dst, row)
-		return true
-	}
+	return strings.ToLower(file[:index])
+}
 
-	rowsByID := make(map[string]localizationDigestRow, len(rows))
-	for _, row := range rows {
-		rowsByID[strings.TrimSpace(row.ID)] = row
+func localizationFinalResponseSameDirectory(row localizationDigestRow, primaries []localizationDigestRow) bool {
+	directory := localizationFinalResponseDirectory(row.File)
+	if directory == "" {
+		return false
 	}
-	// A successful authorized read is the freshest bounded evidence and leads
-	// the presentation even when its retained predecessor carried more metadata.
-	for _, row := range current {
-		if retained, exists := rowsByID[strings.TrimSpace(row.ID)]; exists {
-			appendRow(&primaries, localizationFinalResponsePrimaryLimit, retained)
+	for _, primary := range primaries {
+		if directory == localizationFinalResponseDirectory(primary.File) {
+			return true
 		}
 	}
-	for _, row := range rows {
-		if localizationFinalResponsePrimaryProvenance(row.Provenance) {
-			appendRow(&primaries, localizationFinalResponsePrimaryLimit, row)
-		}
-	}
+	return false
+}
 
-	taskTerms := exploreTerminalTerms(task)
-	ownerKeys := make(map[string]struct{}, len(current))
-	for _, row := range current {
-		key := localizationDigestRowOwnerKey(row)
-		if key == "" {
-			if retained, exists := rowsByID[strings.TrimSpace(row.ID)]; exists {
-				key = localizationDigestRowOwnerKey(retained)
-			}
-		}
-		if key != "" {
-			ownerKeys[key] = struct{}{}
+func localizationFinalResponseOwnerFamily(row localizationDigestRow) string {
+	identity := strings.TrimSpace(row.QualName)
+	if identity == "" {
+		identity = strings.TrimSpace(row.ID)
+		if cut := strings.LastIndex(identity, "::"); cut >= 0 {
+			identity = identity[cut+2:]
 		}
 	}
-	bestSameOwner := -1
-	var bestSameOwnerScore localizationFinalResponseTaskScore
-	if len(primaries) < localizationFinalResponsePrimaryLimit && len(ownerKeys) > 0 {
-		for index, row := range rows {
-			if _, exists := selected[strings.TrimSpace(row.ID)]; exists {
-				continue
-			}
-			key := localizationDigestRowOwnerKey(row)
-			if _, sameOwner := ownerKeys[key]; key == "" || !sameOwner {
-				continue
-			}
-			score := scoreLocalizationFinalResponseTask(taskTerms, row)
-			if bestSameOwner < 0 || localizationFinalResponseBetterTaskScore(score, bestSameOwnerScore) {
-				bestSameOwner, bestSameOwnerScore = index, score
-			}
-		}
-		if bestSameOwner >= 0 {
-			appendRow(&primaries, localizationFinalResponsePrimaryLimit, rows[bestSameOwner])
-		}
+	if cut := strings.LastIndexByte(identity, '.'); cut > 0 {
+		identity = identity[:cut]
 	}
+	tokens := rerank.Tokenize(identity)
+	if len(tokens) == 0 {
+		return ""
+	}
+	family := exploreTerminalTermRoot(strings.ToLower(strings.TrimSpace(tokens[len(tokens)-1])))
+	if len(family) < 6 {
+		return ""
+	}
+	switch family {
+	case "handler", "service", "controller", "manager", "client", "implementation":
+		return ""
+	default:
+		return family
+	}
+}
 
-	bestTaskMatch := -1
-	var bestTaskScore localizationFinalResponseTaskScore
-	if len(primaries) < localizationFinalResponsePrimaryLimit && len(taskTerms) > 0 {
-		for index, row := range rows {
-			if _, exists := selected[strings.TrimSpace(row.ID)]; exists {
-				continue
-			}
-			score := scoreLocalizationFinalResponseTask(taskTerms, row)
-			if score.matched == 0 {
-				continue
-			}
-			if bestTaskMatch < 0 || localizationFinalResponseBetterTaskScore(score, bestTaskScore) {
-				bestTaskMatch, bestTaskScore = index, score
-			}
-		}
-		if bestTaskMatch >= 0 {
-			appendRow(&primaries, localizationFinalResponsePrimaryLimit, rows[bestTaskMatch])
+func localizationFinalResponseSharesOwnerFamily(row localizationDigestRow, primaries []localizationDigestRow) bool {
+	family := localizationFinalResponseOwnerFamily(row)
+	if family == "" {
+		return false
+	}
+	for _, primary := range primaries {
+		if family == localizationFinalResponseOwnerFamily(primary) {
+			return true
 		}
 	}
-	for _, row := range rows {
-		appendRow(&primaries, localizationFinalResponsePrimaryLimit, row)
-	}
+	return false
+}
 
+// localizationFinalResponseRows renders the retained evidence order directly.
+// Filtering only rejects invalid, duplicate, or over-limit rows; it never
+// promotes a later row ahead of an earlier Files/Symbols/Evidence position.
+// For a task-aware page, two leading rows remain PRIMARY and the third slot may
+// label one later complementary implementation row. Label selection never
+// changes the row's position or EVIDENCE number.
+func localizationFinalResponseRows(task string, _ []localizationDigestRow, rows []localizationDigestRow) []localizationFinalResponseRow {
+	presented := make([]localizationFinalResponseRow, 0, min(len(rows), localizationReplayEvidenceLimit))
+	seen := make(map[string]struct{}, localizationReplayEvidenceLimit)
 	for _, row := range rows {
-		if localizationFinalResponseDirectRelation(row, primaries) {
-			appendRow(&supporting, localizationFinalResponseSupportingLimit, row)
+		row.ID = strings.TrimSpace(row.ID)
+		row.File = strings.TrimSpace(row.File)
+		if row.ID == "" || row.File == "" {
+			continue
 		}
-	}
-	for _, row := range rows {
-		appendRow(&supporting, localizationFinalResponseSupportingLimit, row)
-	}
-
-	presented := make([]localizationFinalResponseRow, 0, len(primaries)+len(supporting))
-	for _, row := range primaries {
-		presented = append(presented, localizationFinalResponseRow{row: row, primary: true})
-	}
-	for _, row := range supporting {
+		if _, exists := seen[row.ID]; exists {
+			continue
+		}
+		seen[row.ID] = struct{}{}
+		row.Rank = len(presented) + 1
 		presented = append(presented, localizationFinalResponseRow{row: row})
+		if len(presented) == localizationReplayEvidenceLimit {
+			break
+		}
+	}
+	for index := 0; index < min(len(presented), localizationFinalResponsePrimaryLimit); index++ {
+		presented[index].primary = true
+	}
+	if strings.TrimSpace(task) == "" || len(presented) <= localizationFinalResponsePrimaryLimit {
+		return presented
+	}
+
+	seedLimit := min(2, len(presented))
+	relationSeedLimit := min(localizationFinalResponsePrimaryLimit+2, len(presented))
+	relationSeeds := make([]localizationDigestRow, 0, relationSeedLimit)
+	primaryFiles := make(map[string]struct{}, seedLimit)
+	for index := 0; index < relationSeedLimit; index++ {
+		relationSeeds = append(relationSeeds, presented[index].row)
+		if index < seedLimit {
+			primaryFiles[strings.ToLower(strings.TrimSpace(presented[index].row.File))] = struct{}{}
+		}
+	}
+	taskTerms := exploreTerminalTerms(task)
+	// The complementary PRIMARY slot should add task coverage, not repeat the
+	// identifiers already guaranteed by the two leading PRIMARY rows. Score
+	// only the remaining task terms; graph/provenance signals still decide ties
+	// and cases with no marginal lexical coverage.
+	for _, seed := range relationSeeds[:seedLimit] {
+		identifierText := localizationFinalResponseIdentifierText(seed)
+		for term := range taskTerms {
+			if exploreConceptTermPresent(identifierText, term) {
+				delete(taskTerms, term)
+			}
+		}
+	}
+	taskTermFrequency := make(map[string]int, len(taskTerms))
+	for index := seedLimit; index < len(presented); index++ {
+		identifierText := localizationFinalResponseIdentifierText(presented[index].row)
+		for term := range taskTerms {
+			if exploreConceptTermPresent(identifierText, term) {
+				taskTermFrequency[term]++
+			}
+		}
+	}
+	bestIndex := -1
+	bestScore := localizationFinalResponseTaskScore{}
+	bestRareTaskCoverage := 0
+	bestDirect, bestSameDirectory, bestStrongTaskAlignment := false, false, false
+	bestTaskComplement := false
+	bestSyntacticAnchor := false
+	bestPrimaryProvenance, bestSupportingProvenance := false, false
+	for index := seedLimit; index < len(presented); index++ {
+		row := presented[index].row
+		if _, duplicateFile := primaryFiles[strings.ToLower(strings.TrimSpace(row.File))]; duplicateFile {
+			continue
+		}
+		score := scoreLocalizationFinalResponseTask(taskTerms, row)
+		strongTaskAlignment := score.matched >= 2
+		rareTaskCoverage := 0
+		identifierText := localizationFinalResponseIdentifierText(row)
+		for term, frequency := range taskTermFrequency {
+			if frequency == 1 && exploreConceptTermPresent(identifierText, term) {
+				rareTaskCoverage++
+			}
+		}
+		direct := localizationFinalResponseDirectRelation(row, relationSeeds)
+		typeLike := strings.EqualFold(strings.TrimSpace(row.Kind), "type") || strings.EqualFold(strings.TrimSpace(row.Kind), "class")
+		sameDirectory := localizationFinalResponseSameDirectory(row, relationSeeds[:seedLimit]) &&
+			(typeLike || localizationFinalResponseSharesOwnerFamily(row, relationSeeds[:seedLimit]))
+		primaryProvenance := localizationFinalResponsePrimaryProvenance(row.Provenance)
+		supportingProvenance := localizationFinalResponseSupportingProvenance(row.Provenance)
+		syntacticAnchor := row.Provenance == localizationProvenanceSyntacticAnchor
+		// Only a graph-backed marker outranks ordinary lexical scoring. A plain
+		// task_complement remains a weak display hint and cannot displace a stronger
+		// same-directory or task-aligned artifact.
+		taskComplement := row.Provenance == localizationProvenanceTaskRelationComplement
+		eligible := direct || supportingProvenance || score.matched >= 2 ||
+			(primaryProvenance && score.matched > 0) ||
+			(sameDirectory && score.matched > 0)
+		if !eligible || (bestSyntacticAnchor && !syntacticAnchor) {
+			continue
+		}
+		better := bestIndex < 0 ||
+			(syntacticAnchor && !bestSyntacticAnchor) ||
+			(direct && !bestDirect) ||
+			(direct == bestDirect && taskComplement && !bestTaskComplement) ||
+			(direct == bestDirect && taskComplement == bestTaskComplement && rareTaskCoverage > bestRareTaskCoverage) ||
+			(direct == bestDirect && taskComplement == bestTaskComplement && rareTaskCoverage == bestRareTaskCoverage && strongTaskAlignment && !bestStrongTaskAlignment) ||
+			(direct == bestDirect && taskComplement == bestTaskComplement && rareTaskCoverage == bestRareTaskCoverage && strongTaskAlignment == bestStrongTaskAlignment && sameDirectory && !bestSameDirectory) ||
+			(direct == bestDirect && taskComplement == bestTaskComplement && rareTaskCoverage == bestRareTaskCoverage && strongTaskAlignment == bestStrongTaskAlignment && sameDirectory == bestSameDirectory && supportingProvenance && !bestSupportingProvenance) ||
+			(direct == bestDirect && taskComplement == bestTaskComplement && rareTaskCoverage == bestRareTaskCoverage && strongTaskAlignment == bestStrongTaskAlignment && sameDirectory == bestSameDirectory && supportingProvenance == bestSupportingProvenance && localizationFinalResponseBetterTaskScore(score, bestScore)) ||
+			(direct == bestDirect && taskComplement == bestTaskComplement && rareTaskCoverage == bestRareTaskCoverage && strongTaskAlignment == bestStrongTaskAlignment && sameDirectory == bestSameDirectory && supportingProvenance == bestSupportingProvenance && score == bestScore && primaryProvenance && !bestPrimaryProvenance)
+		if !better {
+			continue
+		}
+		bestIndex = index
+		bestScore = score
+		bestRareTaskCoverage = rareTaskCoverage
+		bestDirect = direct
+		bestTaskComplement = taskComplement
+		bestSyntacticAnchor = syntacticAnchor
+		bestSameDirectory = sameDirectory
+		bestStrongTaskAlignment = strongTaskAlignment
+		bestPrimaryProvenance = primaryProvenance
+		bestSupportingProvenance = supportingProvenance
+	}
+	if bestIndex >= seedLimit {
+		presented[localizationFinalResponsePrimaryLimit-1].primary = false
+		presented[bestIndex].primary = true
+	}
+
+	// PRIMARY is a confidence claim, not simply a position. Preserve EVIDENCE
+	// order, but demote leading rows that have no task-term, graph, or provenance
+	// support. This keeps the role labels aligned with the evidence
+	// a model is actually being asked to trust.
+	allEvidenceRows := make([]localizationDigestRow, 0, len(presented))
+	for _, candidate := range presented {
+		allEvidenceRows = append(allEvidenceRows, candidate.row)
+	}
+	primaryTaskTerms := exploreTerminalTerms(task)
+	for index := 1; index < len(presented); index++ {
+		if !presented[index].primary {
+			continue
+		}
+		row := presented[index].row
+		score := scoreLocalizationFinalResponseTask(primaryTaskTerms, row)
+		if localizationFinalResponseTaskSupportsPrimary(row, score) ||
+			localizationFinalResponseDirectRelation(row, allEvidenceRows) ||
+			localizationFinalResponsePrimaryProvenance(row.Provenance) ||
+			localizationFinalResponseSupportingProvenance(row.Provenance) {
+			continue
+		}
+		presented[index].primary = false
 	}
 	return presented
 }
@@ -672,6 +967,23 @@ func renderLocalizationProvisionalResponseForTask(task string, current, rows []l
 	}
 }
 
+func localizationFinalResponseProvenanceCue(provenance string) string {
+	switch strings.TrimSpace(provenance) {
+	case localizationProvenanceDivergentDefault:
+		return "CAUSAL OWNER — upstream default/state owner"
+	case localizationProvenanceDivergentDefaultType:
+		return "OWNING TYPE"
+	case localizationProvenanceImplementationTarget:
+		return "IMPLEMENTATION TARGET"
+	case localizationProvenanceSourceLiteralCallee:
+		return "LITERAL-RESOLVED CALLEE"
+	case localizationProvenanceTaskComplement, localizationProvenanceTaskRelationComplement:
+		return "TASK COMPLEMENT"
+	default:
+		return ""
+	}
+}
+
 func renderLocalizationAnswerPage(
 	presented []localizationFinalResponseRow, heading, empty, directive string,
 ) string {
@@ -688,11 +1000,15 @@ func renderLocalizationAnswerPage(
 		}
 		file := localizationFinalResponseField(item.row.File)
 		id := localizationFinalResponseField(item.row.ID)
+		cue := localizationFinalResponseProvenanceCue(item.row.Provenance)
 		if item.row.Line > 0 {
-			fmt.Fprintf(&response, "- %s — %s:%d — %s\n", role, file, item.row.Line, id)
-			continue
+			fmt.Fprintf(&response, "- EVIDENCE #%d — %s — %s:%d — %s\n", item.row.Rank, role, file, item.row.Line, id)
+		} else {
+			fmt.Fprintf(&response, "- EVIDENCE #%d — %s — %s — %s\n", item.row.Rank, role, file, id)
 		}
-		fmt.Fprintf(&response, "- %s — %s — %s\n", role, file, id)
+		if cue != "" {
+			fmt.Fprintf(&response, "  PROVENANCE #%d — %s\n", item.row.Rank, cue)
+		}
 	}
 	response.WriteString("\n")
 	response.WriteString(directive)
@@ -725,11 +1041,12 @@ func refreshLocalizationDigestResponses(digest *localizationEvidenceDigest, task
 // caller's own statements against 2% on pages without it. Ask for the answer,
 // name what the answer should carry, and leave the caller free to disagree —
 // its disagreement is right more often than not.
-const localizationAnswerReadyDirective = "Localization for this task is complete. Answer now from this evidence, naming the files and symbols you rely on. If it does not fit the request, say so and name what does — your judgement about the code is welcome, another navigation call is not."
+const localizationAnswerReadyDirective = "Localization for this task is complete: the bounded search examined the supplied anchors, and this is the full retained result. For a localization-only request, answer now using compact FILES, SYMBOLS, and EVIDENCE sections, preserving each PRIMARY tuple once in EVIDENCE order. Do not call another tool just to gain confidence, repeat, or cross-check this localization: PRIMARY rows are the best-supported answer, and SUPPORTING rows are context, not a signal that the search is unfinished. An identical localize call will replay this result. On a broader coding task, this closes only localization; if the user's request includes diagnosis, implementation, or verification, continue normally, and all tools remain available."
 
 const (
 	localizationAnswerHeading      = "LOCALIZATION:"
 	localizationProvisionalHeading = "LOCALIZATION (UNCONFIRMED):"
+	localizationBoundedHeading     = "LOCALIZATION COMPLETE (BOUNDED EVIDENCE):"
 )
 
 // The provisional page exists because a session can stop at any turn: the
@@ -743,10 +1060,10 @@ const (
 // with them beats stopping with nothing — and stop.
 const localizationProvisionalDirective = "Unconfirmed. Prefer the step this response prescribes; if you stop here instead, answer with these candidates and say they are unconfirmed."
 
-// localizationProvisionalRowLimit keeps the unconfirmed page to the rows most
-// likely to be the answer. Every identity it lists is already in the
-// envelope's evidence, so a longer page buys repetition, not information.
-const localizationProvisionalRowLimit = localizationFinalResponsePrimaryLimit
+// localizationProvisionalRowLimit starts from every retained evidence row.
+// The renderer sheds only the canonical tail when the final-response byte cap
+// requires it, so the PRIMARY role limit never hides otherwise retained rows.
+const localizationProvisionalRowLimit = localizationReplayEvidenceLimit
 
 func localizationDigestRowsByID(digest *localizationEvidenceDigest) map[string]localizationDigestRow {
 	retained := make(map[string]localizationDigestRow)
@@ -942,6 +1259,45 @@ func localizationCompletionWithDigest(completion localizationCompletion, digest 
 		}
 		return completion
 	}
+	if completion.Instruction == localizationBoundedConclusionInstruction {
+		response := completion.FinalResponse
+		if response == "" && digest != nil && digest.provisionalResponse != "" {
+			response = digest.provisionalResponse
+		} else if response == "" && digest != nil && len(digest.Evidence) > 0 {
+			response = renderLocalizationProvisionalResponseForTask("", nil, digest.Evidence)
+		}
+		response = strings.TrimSpace(response)
+		if response != "" {
+			switch {
+			case strings.HasPrefix(response, localizationAnswerHeading):
+				response = localizationBoundedHeading + strings.TrimPrefix(response, localizationAnswerHeading)
+			case strings.HasPrefix(response, localizationProvisionalHeading):
+				response = localizationBoundedHeading + strings.TrimPrefix(response, localizationProvisionalHeading)
+			case !strings.HasPrefix(response, localizationBoundedHeading):
+				response = localizationBoundedHeading + "\n" + response
+			}
+			for {
+				stripped := false
+				for _, directive := range []string{
+					localizationAnswerReadyDirective,
+					localizationBoundedConclusionDirective,
+					localizationProvisionalDirective,
+				} {
+					if strings.HasSuffix(response, directive) {
+						response = strings.TrimSpace(strings.TrimSuffix(response, directive))
+						stripped = true
+						break
+					}
+				}
+				if !stripped {
+					break
+				}
+			}
+			response += "\n\n" + localizationBoundedConclusionDirective
+			completion.FinalResponse = response
+		}
+		return completion
+	}
 	if digest != nil && digest.finalResponse != "" {
 		completion.FinalResponse = digest.finalResponse
 	} else if completion.FinalResponse == "" {
@@ -1038,7 +1394,8 @@ func localizationAnswerReadyResult(completion localizationCompletion) *mcpgo.Cal
 	// Older retained completions may predate the in-response convergence cue.
 	// Preserve their successful replay shape without duplicating the directive
 	// for newly rendered terminal evidence.
-	if !strings.HasSuffix(visible, localizationAnswerReadyDirective) {
+	if !strings.HasPrefix(visible, localizationBoundedHeading+"\n") &&
+		!strings.HasSuffix(visible, localizationAnswerReadyDirective) {
 		visible += "\n\n" + localizationAnswerReadyDirective
 	}
 	result := mcpgo.NewToolResultText(visible)
@@ -1046,8 +1403,8 @@ func localizationAnswerReadyResult(completion localizationCompletion) *mcpgo.Cal
 }
 
 // newLocalizationEvidenceDigest retains rows without a request in hand. Callers
-// that know the request use newLocalizationEvidenceDigestForTask so the
-// presented rows are scored against it.
+// that know the request use newLocalizationEvidenceDigestForTask so retained
+// evidence and its response page are built together.
 func newLocalizationEvidenceDigest(envelope localizationExploreEnvelope) *localizationEvidenceDigest {
 	return newLocalizationEvidenceDigestForTask("", envelope)
 }

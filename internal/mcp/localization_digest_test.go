@@ -9,6 +9,8 @@ import (
 	"testing"
 
 	mcpgo "github.com/mark3labs/mcp-go/mcp"
+
+	"github.com/zzet/gortex/internal/localizationauth"
 )
 
 func testEvidenceDigest() *localizationEvidenceDigest {
@@ -72,15 +74,37 @@ func requireLocalizationTerminalReplay(t *testing.T, result *mcpgo.CallToolResul
 		t.Fatalf("terminal replay = %#v, want successful MCP result", result)
 	}
 	text, ok := singleTextContent(result)
-	if !ok || !strings.Contains(text, localizationAnswerReadyDirective) {
+	if !ok {
 		t.Fatalf("terminal replay content = %#v", result.Content)
 	}
-	for _, required := range []string{
+	requiredPhrases := []string{
 		"Localization for this task is complete",
-		"Answer now",
-		"naming the files and symbols you rely on",
-		"another navigation call is not",
-	} {
+		"bounded search examined the supplied anchors",
+		"full retained result",
+		"For a localization-only request, answer now",
+		"Do not call another tool just to gain confidence, repeat, or cross-check",
+		"PRIMARY rows are the best-supported answer",
+		"SUPPORTING rows are context",
+		"compact FILES, SYMBOLS, and EVIDENCE sections",
+		"On a broader coding task, this closes only localization",
+		"all tools remain available",
+	}
+	if strings.HasPrefix(text, localizationBoundedHeading+"\n") {
+		requiredPhrases = []string{
+			"The bounded localization search is exhausted",
+			"full retained result",
+			"For a localization-only request, answer now",
+			"Do not call another tool just to gain confidence, repeat, or cross-check",
+			"PRIMARY rows are the best-supported answer",
+			"SUPPORTING rows are context",
+			"compact FILES, SYMBOLS, and EVIDENCE sections",
+			"On a broader coding task, this closes only localization",
+			"all tools remain available",
+		}
+	} else if !strings.Contains(text, localizationAnswerReadyDirective) {
+		t.Fatalf("terminal replay omitted its answer-ready directive: %q", text)
+	}
+	for _, required := range requiredPhrases {
 		if !strings.Contains(text, required) {
 			t.Fatalf("terminal replay text %q does not contain %q", text, required)
 		}
@@ -112,7 +136,11 @@ func requireLocalizationTerminalReplay(t *testing.T, result *mcpgo.CallToolResul
 	if text != contract.Completion.FinalResponse {
 		t.Fatalf("terminal replay text diverged from final_response: %q", text)
 	}
-	if !strings.HasSuffix(contract.Completion.FinalResponse, localizationAnswerReadyDirective) {
+	if strings.HasPrefix(contract.Completion.FinalResponse, localizationBoundedHeading+"\n") {
+		if !strings.HasSuffix(contract.Completion.FinalResponse, localizationBoundedConclusionDirective) {
+			t.Fatalf("bounded terminal directive is outside final_response: %q", contract.Completion.FinalResponse)
+		}
+	} else if !strings.HasSuffix(contract.Completion.FinalResponse, localizationAnswerReadyDirective) {
 		t.Fatalf("terminal convergence directive is outside final_response: %q", contract.Completion.FinalResponse)
 	}
 	return contract
@@ -197,8 +225,8 @@ func TestRefinementPromotionRetainsDigestForReplay(t *testing.T) {
 		t.Fatal("post-promotion navigation reserved a handler")
 	}
 	contract := requireLocalizationTerminalReplay(t, terminal, "search", "symbols")
-	if !strings.Contains(contract.Completion.FinalResponse, "- PRIMARY — repo/storage/disk.go:42 — repo/storage/disk.go::DiskStorage.Load") ||
-		!strings.Contains(contract.Completion.FinalResponse, "- PRIMARY — repo/storage/cloud.go:17 — repo/storage/cloud.go::CloudStorage.Load") {
+	if !strings.Contains(contract.Completion.FinalResponse, "- EVIDENCE #1 — PRIMARY — repo/storage/disk.go:42 — repo/storage/disk.go::DiskStorage.Load") ||
+		!strings.Contains(contract.Completion.FinalResponse, "- EVIDENCE #2 — PRIMARY — repo/storage/cloud.go:17 — repo/storage/cloud.go::CloudStorage.Load") {
 		t.Fatalf("promotion lost retained aligned evidence: %q", contract.Completion.FinalResponse)
 	}
 }
@@ -273,15 +301,15 @@ func TestDigestByteCapShedsEvidenceTail(t *testing.T) {
 	if len(encoded) > localizationDigestMaxBytes {
 		t.Fatalf("digest = %d bytes, want <= %d", len(encoded), localizationDigestMaxBytes)
 	}
-	if len(digest.Evidence) == 0 || len(digest.Evidence) >= localizationReplayEvidenceLimit {
-		t.Fatalf("byte cap retained %d rows, want a non-empty shed prefix", len(digest.Evidence))
+	if len(digest.Evidence) != localizationReplayEvidenceLimit {
+		t.Fatalf("byte cap retained %d rows, want all %d bounded identities after optional-field compaction", len(digest.Evidence), localizationReplayEvidenceLimit)
 	}
 	if len(digest.Files) != len(digest.Evidence) || len(digest.Symbols) != len(digest.Evidence) {
 		t.Fatalf("files=%d symbols=%d evidence=%d, want positional rows", len(digest.Files), len(digest.Symbols), len(digest.Evidence))
 	}
 	for index, file := range digest.Files {
-		if file != "repo/big/file.go" || digest.Evidence[index].Rank != index+1 {
-			t.Fatalf("unaligned compacted row %d: file=%q evidence=%#v", index, file, digest.Evidence[index])
+		if file != "repo/big/file.go" || digest.Evidence[index].Rank != index+1 || digest.Evidence[index].Signature != "" {
+			t.Fatalf("unaligned or uncompressed row %d: file=%q evidence=%#v", index, file, digest.Evidence[index])
 		}
 	}
 	if len(digest.finalResponse) > localizationFinalResponseMaxBytes {
@@ -696,8 +724,15 @@ func TestTaskAwareDigestMergeRetainsLongTailSameOwnerCohort(t *testing.T) {
 		return false
 	}
 	baseline := mergeLocalizationEvidenceDigest([]localizationDigestRow{current}, retained)
-	if contains(baseline, targetID) {
-		t.Fatal("fixture did not force the unrelated tail to shed the coherent target")
+	baselineTarget := -1
+	for index, evidence := range baseline.Evidence {
+		if evidence.ID == targetID {
+			baselineTarget = index
+			break
+		}
+	}
+	if baselineTarget < 4 {
+		t.Fatalf("fixture did not leave the coherent target in the unrelated tail: position=%d evidence=%#v", baselineTarget, baseline.Evidence)
 	}
 
 	digest := mergeLocalizationEvidenceDigestForTask(
@@ -972,12 +1007,12 @@ func TestLocalizationFinalResponseKeepsDuplicateFilesPositionallyAligned(t *test
 		t.Fatalf("positional digest = files %#v symbols %#v", digest.Files, digest.Symbols)
 	}
 	for index, row := range digest.Evidence {
-		marker := fmt.Sprintf("- PRIMARY — %s:%d — %s", row.File, row.Line, row.ID)
-		if row.Rank != index+1 || !strings.Contains(digest.finalResponse, marker) {
-			t.Fatalf("row %d not aligned in final_response:\n%s", index, digest.finalResponse)
+		marker := fmt.Sprintf("- EVIDENCE #%d — PRIMARY — %s:%d — %s", index+1, row.File, row.Line, row.ID)
+		if row.Rank != index+1 || strings.Count(digest.finalResponse, marker) != 1 {
+			t.Fatalf("row %d not aligned exactly once in final_response:\n%s", index, digest.finalResponse)
 		}
 	}
-	for _, parallelSection := range []string{"FILES:", "SYMBOLS:", "EVIDENCE:", "#1"} {
+	for _, parallelSection := range []string{"FILES:", "SYMBOLS:"} {
 		if strings.Contains(digest.finalResponse, parallelSection) {
 			t.Fatalf("final_response retained ambiguous parallel section %q:\n%s", parallelSection, digest.finalResponse)
 		}
@@ -988,7 +1023,235 @@ func TestLocalizationFinalResponseKeepsDuplicateFilesPositionallyAligned(t *test
 	}
 }
 
-func TestLocalizationFinalResponseCapsRolesAndPrioritizesProofRelations(t *testing.T) {
+func TestDigestCompactsOptionalFieldsBeforeLateImplementationIdentity(t *testing.T) {
+	task := "Nondeterminism in ignore::WalkBuilder parallel multi-root walk with current_dir, standard_filters, threads, and .gitignore"
+	rows := []localizationEvidence{
+		{ID: "crates/ignore/src/walk.rs::WalkBuilder", Name: "WalkBuilder", Kind: "type", File: "crates/ignore/src/walk.rs", Line: 483},
+		{ID: "crates/ignore/src/walk.rs::WalkBuilder.current_dir", Name: "current_dir", Kind: "method", File: "crates/ignore/src/walk.rs", Line: 989},
+		{ID: "crates/ignore/src/walk.rs::WalkBuilder.add", Name: "add", Kind: "method", File: "crates/ignore/src/walk.rs", Line: 649},
+		{ID: "crates/ignore/src/walk.rs::WalkBuilder.standard_filters", Name: "standard_filters", Kind: "method", File: "crates/ignore/src/walk.rs", Line: 789},
+		{ID: "crates/core/flags/hiargs.rs::HiArgs.walk_builder", Name: "walk_builder", Kind: "method", File: "crates/core/flags/hiargs.rs", Line: 874},
+		{ID: "crates/ignore/src/walk.rs::walk_collect_entries_parallel", Name: "walk_collect_entries_parallel", Kind: "function", File: "crates/ignore/src/walk.rs", Line: 2115},
+		{ID: "crates/ignore/src/walk.rs::walk_collect_parallel", Name: "walk_collect_parallel", Kind: "function", File: "crates/ignore/src/walk.rs", Line: 2099},
+		{ID: "crates/ignore/src/walk.rs::WalkBuilder.ignore", Name: "ignore", Kind: "method", File: "crates/ignore/src/walk.rs", Line: 823},
+		{ID: "crates/ignore/src/dir.rs::IgnoreBuilder", Name: "IgnoreBuilder", Kind: "type", File: "crates/ignore/src/dir.rs", Line: 609},
+	}
+	for index := range rows {
+		rows[index].Rank = index + 1
+		rows[index].Signature = strings.Repeat("optional signature detail ", 80)
+	}
+	digest := newLocalizationEvidenceDigestForTask(task, localizationExploreEnvelope{Evidence: rows})
+	if len(digest.Evidence) != len(rows) {
+		t.Fatalf("retained %d identities, want all %d after optional-field compaction: %#v", len(digest.Evidence), len(rows), digest.Evidence)
+	}
+	for index, row := range digest.Evidence {
+		if row.ID != rows[index].ID || row.Rank != index+1 {
+			t.Fatalf("identity %d reordered: got %#v want %q", index+1, row, rows[index].ID)
+		}
+	}
+	if !strings.Contains(digest.finalResponse, "- EVIDENCE #9 — PRIMARY — crates/ignore/src/dir.rs:609 — crates/ignore/src/dir.rs::IgnoreBuilder") ||
+		!strings.Contains(digest.finalResponse, "- EVIDENCE #3 — SUPPORTING — crates/ignore/src/walk.rs:649 — crates/ignore/src/walk.rs::WalkBuilder.add") {
+		t.Fatalf("late complementary implementation did not receive the third PRIMARY role:\n%s", digest.finalResponse)
+	}
+	encoded, err := json.Marshal(digest)
+	if err != nil || len(encoded) > localizationDigestMaxBytes || len(digest.finalResponse) > localizationFinalResponseMaxBytes {
+		t.Fatalf("bounded digest bytes=%d final=%d err=%v", len(encoded), len(digest.finalResponse), err)
+	}
+}
+
+func TestLocalizationEnvelopeFollowsCanonicalDigestOrder(t *testing.T) {
+	envelope := localizationExploreEnvelope{
+		Files:   []string{"pkg/first.go", "pkg/second.go", "pkg/third.go"},
+		Symbols: []string{"first", "second", "third"},
+		Evidence: []localizationEvidence{
+			{Rank: 1, ID: "first", File: "pkg/first.go", Source: "first body"},
+			{Rank: 2, ID: "second", File: "pkg/second.go", Source: "second body"},
+			{Rank: 3, ID: "third", File: "pkg/third.go", Source: "third body"},
+		},
+	}
+	digest := &localizationEvidenceDigest{Evidence: []localizationDigestRow{
+		{ID: "third", File: "pkg/third.go", Provenance: localizationProvenanceTaskComplement},
+		{ID: "first", File: "pkg/first.go"},
+	}}
+	rebuildLocalizationDigestSkeleton(digest)
+
+	alignLocalizationEnvelopeWithDigest(&envelope, digest)
+
+	if want := []string{"pkg/third.go", "pkg/first.go", "pkg/second.go"}; !reflect.DeepEqual(envelope.Files, want) {
+		t.Fatalf("files = %v, want canonical digest prefix %v", envelope.Files, want)
+	}
+	if want := []string{"third", "first", "second"}; !reflect.DeepEqual(envelope.Symbols, want) {
+		t.Fatalf("symbols = %v, want canonical digest prefix %v", envelope.Symbols, want)
+	}
+	if len(envelope.Evidence) != 3 || envelope.Evidence[0].ID != "third" || envelope.Evidence[0].Rank != 1 ||
+		envelope.Evidence[1].ID != "first" || envelope.Evidence[1].Rank != 2 ||
+		envelope.Evidence[2].ID != "second" || envelope.Evidence[2].Rank != 3 {
+		t.Fatalf("evidence is not positionally aligned: %#v", envelope.Evidence)
+	}
+	if envelope.Evidence[0].Source != "third body" {
+		t.Fatalf("canonical reorder detached source body: %#v", envelope.Evidence[0])
+	}
+	if envelope.Evidence[0].Provenance != localizationProvenanceTaskComplement {
+		t.Fatalf("visible provenance = %q, want digest provenance", envelope.Evidence[0].Provenance)
+	}
+}
+
+func TestLocalizationDigestPackingDropIndexProtectsLiveDependencies(t *testing.T) {
+	completion := newLocalizationRefinementCompletionForSymbols("protected", []string{"protected"})
+	completion.refinementRoutes = map[string]localizationRefinementRoute{
+		"protected": {implementationSymbol: "proof", proofSymbol: "route-proof"},
+	}
+	digest := &localizationEvidenceDigest{Evidence: []localizationDigestRow{
+		{ID: "free-head", File: "pkg/free-head.go"},
+		{ID: "protected", File: "pkg/protected.go"},
+		{ID: "proof", File: "pkg/proof.go"},
+		{ID: "route-proof", File: "pkg/route-proof.go"},
+		{ID: "free-tail", File: "pkg/free-tail.go"},
+	}}
+	if got := localizationDigestPackingDropIndex(digest, completion, ""); got != 4 {
+		t.Fatalf("drop index = %d, want unprotected tail 4", got)
+	}
+	if got := localizationDigestPackingDropIndex(digest, completion, "free-tail"); got != 0 {
+		t.Fatalf("drop index with satisfied tail = %d, want remaining unprotected row 0", got)
+	}
+}
+
+func TestLocalizationFinalResponsePromotesSameDirectoryOwnerFamily(t *testing.T) {
+	task := "parallel multi-root walk must preserve current directory ignore handling"
+	rows := []localizationDigestRow{
+		{ID: "crates/ignore/src/walk.rs::WalkBuilder", Name: "WalkBuilder", QualName: "WalkBuilder", Kind: "type", File: "crates/ignore/src/walk.rs", Line: 100},
+		{ID: "crates/ignore/src/walk.rs::WalkBuilder.standard_filters", Name: "standard_filters", QualName: "WalkBuilder.standard_filters", Kind: "method", File: "crates/ignore/src/walk.rs", Line: 789},
+		{ID: "crates/ignore/src/walk.rs::WalkBuilder.add", Name: "add", QualName: "WalkBuilder.add", Kind: "method", File: "crates/ignore/src/walk.rs", Line: 500},
+		{ID: "crates/core/flags/hiargs.rs::HiArgs.walk_builder", Name: "walk_builder", QualName: "HiArgs.walk_builder", Kind: "method", File: "crates/core/flags/hiargs.rs", Line: 874, Provenance: localizationProvenanceTaskComplement},
+		{ID: "crates/ignore/src/walk.rs::walk_collect_entries_parallel", Name: "walk_collect_entries_parallel", Kind: "function", File: "crates/ignore/src/walk.rs", Line: 2115},
+		{ID: "crates/ignore/src/walk.rs::WalkBuilder.build_parallel", Name: "build_parallel", QualName: "WalkBuilder.build_parallel", Kind: "method", File: "crates/ignore/src/walk.rs", Line: 1200},
+		{ID: "crates/core/flags/hiargs.rs::HiArgs.path_printer_builder", Name: "path_printer_builder", QualName: "HiArgs.path_printer_builder", Kind: "method", File: "crates/core/flags/hiargs.rs", Line: 900},
+		{ID: "crates/ignore/src/walk.rs::WalkBuilder.current_dir", Name: "current_dir", QualName: "WalkBuilder.current_dir", Kind: "method", File: "crates/ignore/src/walk.rs", Line: 610},
+		{ID: "crates/ignore/src/walk.rs::WalkBuilder.ignore", Name: "ignore", QualName: "WalkBuilder.ignore", Kind: "method", File: "crates/ignore/src/walk.rs", Line: 823},
+		{ID: "crates/ignore/src/dir.rs::IgnoreBuilder.current_dir", Name: "current_dir", QualName: "IgnoreBuilder.current_dir", Kind: "method", File: "crates/ignore/src/dir.rs", Line: 701},
+	}
+	response := renderLocalizationFinalResponseForTask(task, nil, rows)
+	if !strings.Contains(response, "- EVIDENCE #10 — PRIMARY — crates/ignore/src/dir.rs:701 — crates/ignore/src/dir.rs::IgnoreBuilder.current_dir") ||
+		!strings.Contains(response, "- EVIDENCE #4 — SUPPORTING — crates/core/flags/hiargs.rs:874 — crates/core/flags/hiargs.rs::HiArgs.walk_builder") {
+		t.Fatalf("same-directory owner-family implementation did not replace external wrapper role:\n%s", response)
+	}
+}
+
+func TestLocalizationFinalResponseExplainsCausalPrimaryProvenance(t *testing.T) {
+	response := renderLocalizationFinalResponse([]localizationDigestRow{
+		{Rank: 1, ID: "src/Handler/RotatingFileHandler.php::RotatingFileHandler.__construct", File: "src/Handler/RotatingFileHandler.php", Line: 41, Provenance: localizationProvenanceDivergentDefault},
+		{Rank: 2, ID: "src/Handler/RotatingFileHandler.php::RotatingFileHandler", File: "src/Handler/RotatingFileHandler.php", Line: 25, Provenance: localizationProvenanceDivergentDefaultType},
+	})
+	if !strings.Contains(response, "PROVENANCE #1 — CAUSAL OWNER — upstream default/state owner") ||
+		!strings.Contains(response, "PROVENANCE #2 — OWNING TYPE") {
+		t.Fatalf("causal PRIMARY rows lack model-facing provenance cues:\n%s", response)
+	}
+}
+
+func TestLocalizationFinalResponseLabelsDirectComplementWithoutReorderingEvidence(t *testing.T) {
+	task := "CultureNotFoundException ku on Xamarin.Android while calling ToWords with CultureInfo pl after Kurdish support"
+	rows := []localizationDigestRow{
+		{ID: "src/Humanizer/NumberToWordsExtension.cs::NumberToWordsExtension.ToWords_L55", Name: "ToWords", Kind: "method", File: "src/Humanizer/NumberToWordsExtension.cs", Line: 55},
+		{ID: "src/Humanizer/Configuration/LocaliserRegistry.cs::LocaliserRegistry.Register", Name: "Register", Kind: "method", File: "src/Humanizer/Configuration/LocaliserRegistry.cs", Line: 55},
+		{ID: "src/Humanizer/Configuration/Configurator.cs::Configurator", Name: "Configurator", Kind: "type", File: "src/Humanizer/Configuration/Configurator.cs", Line: 16},
+		{ID: "src/Humanizer/Configuration/Configurator.cs::Configurator.GetNumberToWordsConverter", Name: "GetNumberToWordsConverter", Kind: "method", File: "src/Humanizer/Configuration/Configurator.cs", Line: 85, Provenance: "direct_callee"},
+		{ID: "src/Humanizer/NoMatchFoundException.cs::NoMatchFoundException.init", Name: "NoMatchFoundException.init", Kind: "method", File: "src/Humanizer/NoMatchFoundException.cs", Line: 20},
+		{ID: "src/Humanizer/NumberToWordsExtension.cs::NumberToWordsExtension.ToWords_L92", Name: "ToWords", Kind: "method", File: "src/Humanizer/NumberToWordsExtension.cs", Line: 92},
+		{ID: "src/Humanizer/GrammaticalGender.cs::GrammaticalGender", Name: "GrammaticalGender", Kind: "type", File: "src/Humanizer/GrammaticalGender.cs", Line: 6},
+		{ID: "src/Humanizer/Configuration/FormatterRegistry.cs::FormatterRegistry.RegisterCzechSlovakPolishFormatter", Name: "RegisterCzechSlovakPolishFormatter", Kind: "method", File: "src/Humanizer/Configuration/FormatterRegistry.cs", Line: 62, Callees: []string{"src/Humanizer/Configuration/LocaliserRegistry.cs::LocaliserRegistry.Register"}},
+	}
+	response := renderLocalizationFinalResponseForTask(task, nil, rows)
+	if strings.Count(response, " — PRIMARY — ") != localizationFinalResponsePrimaryLimit {
+		t.Fatalf("unexpected PRIMARY count:\n%s", response)
+	}
+	if !strings.Contains(response, "- EVIDENCE #8 — PRIMARY — src/Humanizer/Configuration/FormatterRegistry.cs:62 — src/Humanizer/Configuration/FormatterRegistry.cs::FormatterRegistry.RegisterCzechSlovakPolishFormatter") ||
+		!strings.Contains(response, "- EVIDENCE #3 — SUPPORTING — src/Humanizer/Configuration/Configurator.cs:16 — src/Humanizer/Configuration/Configurator.cs::Configurator") {
+		t.Fatalf("direct implementation complement was not labeled in canonical order:\n%s", response)
+	}
+	last := -1
+	for index := range rows {
+		marker := fmt.Sprintf("- EVIDENCE #%d —", index+1)
+		position := strings.Index(response, marker)
+		if position <= last {
+			t.Fatalf("evidence order diverged at %s:\n%s", marker, response)
+		}
+		last = position
+	}
+}
+
+func TestLocalizationFinalResponseDemotesUnsupportedPrimaryWithoutReorderingEvidence(t *testing.T) {
+	task := "Ignore matching must strip a leading ./ before checking the parent directory and path in Ignore.matched_ignore during directory walking"
+	rows := []localizationDigestRow{
+		{ID: "crates/ignore/src/dir.rs::Ignore.matched_ignore", Name: "matched_ignore", QualName: "Ignore.matched_ignore", Kind: "method", File: "crates/ignore/src/dir.rs", Line: 370},
+		{ID: "crates/core/flags/hiargs.rs::BinaryDetection", Name: "BinaryDetection", QualName: "BinaryDetection", Kind: "type", File: "crates/core/flags/hiargs.rs", Line: 2538},
+		{ID: "crates/ignore/src/walk.rs::Walk.next", Name: "next", QualName: "Walk.next", Kind: "method", File: "crates/ignore/src/walk.rs", Line: 178},
+		{ID: "crates/core/main.rs::eprint_nothing_searched", Name: "eprint_nothing_searched", QualName: "eprint_nothing_searched", Kind: "function", File: "crates/core/main.rs", Line: 246},
+		{ID: "crates/ignore/src/gitignore.rs::Glob.is_whitelist", Name: "is_whitelist", QualName: "Glob.is_whitelist", Kind: "method", File: "crates/ignore/src/gitignore.rs", Line: 597},
+	}
+	presented := localizationFinalResponseRows(task, nil, rows)
+	if len(presented) != len(rows) {
+		t.Fatalf("presented = %#v, want all rows", presented)
+	}
+	if !presented[0].primary {
+		t.Fatal("source-backed matched_ignore lost PRIMARY role")
+	}
+	if presented[1].primary || presented[3].primary {
+		t.Fatalf("unsupported rows retained PRIMARY roles: binary=%v eprint=%v", presented[1].primary, presented[3].primary)
+	}
+	for index := range presented {
+		if presented[index].row.ID != rows[index].ID || presented[index].row.Rank != index+1 {
+			t.Fatalf("evidence order changed at %d: got %#v want %s rank %d", index, presented[index].row, rows[index].ID, index+1)
+		}
+	}
+}
+
+func TestLocalizationFinalResponsePromotesSyntacticImplementationOverFlagMetadata(t *testing.T) {
+	task := "rg panic caused by --replace, --multiline, a particular pattern, and search text containing repeats and newlines; slice index starts at x but ends at y"
+	rows := []localizationDigestRow{
+		{ID: "crates/core/flags/hiargs.rs::suggest_multiline", Name: "suggest_multiline", QualName: "suggest_multiline", Kind: "function", File: "crates/core/flags/hiargs.rs", Line: 1450},
+		{ID: "crates/core/flags/lowargs.rs::BinaryMode.Auto", Name: "Auto", QualName: "BinaryMode.Auto", Kind: "variable", File: "crates/core/flags/lowargs.rs", Line: 239},
+		{ID: "crates/printer/src/json.rs::JSONSink.replace", Name: "replace", QualName: "JSONSink.replace", Kind: "method", File: "crates/printer/src/json.rs", Line: 686, Callees: []string{"crates/printer/src/util.rs::Replacer.replace_all"}},
+		{ID: "crates/searcher/src/testutil.rs::TesterConfig.search_slice", Name: "search_slice", QualName: "TesterConfig.search_slice", Kind: "method", File: "crates/searcher/src/testutil.rs", Line: 710},
+		{ID: "crates/printer/src/util.rs::Replacer.replace_all", Name: "replace_all", QualName: "Replacer.replace_all", Kind: "method", File: "crates/printer/src/util.rs", Line: 51, Provenance: localizationProvenanceSyntacticAnchor, Callers: []string{"crates/printer/src/json.rs::JSONSink.replace"}},
+		{ID: "crates/searcher/src/lines.rs::lines", Name: "lines", QualName: "lines", Kind: "function", File: "crates/searcher/src/lines.rs", Line: 216},
+		{ID: "crates/printer/src/util.rs::replace_separator", Name: "replace_separator", QualName: "replace_separator", Kind: "function", File: "crates/printer/src/util.rs", Line: 320},
+		{ID: "crates/searcher/src/searcher/mod.rs::Searcher.multi_line_with_matcher", Name: "multi_line_with_matcher", QualName: "Searcher.multi_line_with_matcher", Kind: "method", File: "crates/searcher/src/searcher/mod.rs", Line: 896, Provenance: localizationProvenanceTaskRelationComplement},
+	}
+	presented := localizationFinalResponseRows(task, nil, rows)
+	if presented[1].primary {
+		t.Fatal("incidental BinaryMode.Auto flag metadata remained PRIMARY")
+	}
+	if !presented[4].primary {
+		t.Fatal("task-spelled replace anchor was not promoted to PRIMARY")
+	}
+	for index := range presented {
+		if presented[index].row.ID != rows[index].ID || presented[index].row.Rank != index+1 {
+			t.Fatalf("evidence order changed at %d: got %#v want %s rank %d", index, presented[index].row, rows[index].ID, index+1)
+		}
+	}
+}
+
+func TestLocalizationFinalResponsePrefersStrongTaskArtifactOverWeakComplementProvenance(t *testing.T) {
+	task := "Simplify CI coverage configuration: repeated testconfig.json settings, Azure Pipelines EmitCompilerGeneratedFiles, and ReportGenerator sourcedirs"
+	rows := []localizationDigestRow{
+		{ID: "scripts/flowctl.py::build_review_prompt", Name: "build_review_prompt", Kind: "function", File: "scripts/flowctl.py", Line: 20},
+		{ID: "tests/Humanizer.Analyzers.Tests/testconfig.json", Name: "testconfig.json", Kind: "file", File: "tests/Humanizer.Analyzers.Tests/testconfig.json", Line: 1},
+		{ID: "src/Humanizer.SourceGenerators/TokenMapInput.cs::TokenMapInput", Name: "TokenMapInput", Kind: "type", File: "src/Humanizer.SourceGenerators/TokenMapInput.cs", Line: 15},
+		{ID: "src/Humanizer.SourceGenerators/TokenMapInput.cs::TokenMapInput.ReadBoolean", Name: "ReadBoolean", Kind: "method", File: "src/Humanizer.SourceGenerators/TokenMapInput.cs", Line: 60},
+		{ID: "src/Humanizer.SourceGenerators/TokenMapInput.cs::TokenMapInput.CreateDiagnostic", Name: "CreateDiagnostic", Kind: "method", File: "src/Humanizer.SourceGenerators/TokenMapInput.cs", Line: 80},
+		{ID: "src/Humanizer.SourceGenerators/LocaleRegistryInput.cs::LocaleRegistryInput.Emit", Name: "Emit", Kind: "method", File: "src/Humanizer.SourceGenerators/LocaleRegistryInput.cs", Line: 150},
+		{ID: "src/Humanizer.SourceGenerators/GenerationHelpers.cs::HumanizerSourceGenerator.BooleanValue", Name: "BooleanValue", QualName: "HumanizerSourceGenerator.BooleanValue", Kind: "method", File: "src/Humanizer.SourceGenerators/GenerationHelpers.cs", Line: 516, Provenance: localizationProvenanceTaskComplement},
+		{ID: "tests/Humanizer.SourceGenerators.Tests/testconfig.json", Name: "testconfig.json", Kind: "file", File: "tests/Humanizer.SourceGenerators.Tests/testconfig.json", Line: 1},
+		{ID: "azure-pipelines.yml", Name: "azure-pipelines.yml", Kind: "file", File: "azure-pipelines.yml", Line: 1},
+	}
+	response := renderLocalizationFinalResponseForTask(task, nil, rows)
+	if !strings.Contains(response, "- EVIDENCE #9 — PRIMARY — azure-pipelines.yml:1 — azure-pipelines.yml") ||
+		!strings.Contains(response, "- EVIDENCE #7 — SUPPORTING — src/Humanizer.SourceGenerators/GenerationHelpers.cs:516 — src/Humanizer.SourceGenerators/GenerationHelpers.cs::HumanizerSourceGenerator.BooleanValue") {
+		t.Fatalf("strong task-aligned artifact did not beat weak complement provenance:\n%s", response)
+	}
+}
+
+func TestLocalizationFinalResponseCapsRolesAndPreservesCanonicalOrder(t *testing.T) {
 	rows := make([]localizationDigestRow, 10)
 	for index := range rows {
 		rows[index] = localizationDigestRow{
@@ -997,33 +1260,113 @@ func TestLocalizationFinalResponseCapsRolesAndPrioritizesProofRelations(t *testi
 			Kind: "method", File: fmt.Sprintf("pkg/file%02d.go", index), Line: index + 10,
 		}
 	}
+	// Later provenance hints used to reorder these rows ahead of Evidence #1.
+	// They remain metadata on the canonical row instead of a second ranking.
 	rows[7].Provenance = localizationProvenanceImplementationTarget
 	rows[8].Provenance = localizationProvenanceImplementationRoute
 	rows[9].Provenance = "direct_callee"
 
 	response := renderLocalizationFinalResponse(rows)
-	if got := strings.Count(response, "- PRIMARY —"); got != localizationFinalResponsePrimaryLimit {
+	if got := strings.Count(response, " — PRIMARY — "); got != localizationFinalResponsePrimaryLimit {
 		t.Fatalf("primary rows = %d, want %d:\n%s", got, localizationFinalResponsePrimaryLimit, response)
 	}
-	if got := strings.Count(response, "- SUPPORTING —"); got != localizationFinalResponseSupportingLimit {
+	if got := strings.Count(response, " — SUPPORTING — "); got != localizationFinalResponseSupportingLimit {
 		t.Fatalf("supporting rows = %d, want %d:\n%s", got, localizationFinalResponseSupportingLimit, response)
 	}
-	for _, want := range []string{
-		"- PRIMARY — pkg/file07.go:17 — repo/pkg/file07.go::Worker07.Run",
-		"- SUPPORTING — pkg/file08.go:18 — repo/pkg/file08.go::Worker08.Run",
-		"- SUPPORTING — pkg/file09.go:19 — repo/pkg/file09.go::Worker09.Run",
-	} {
-		if !strings.Contains(response, want) {
-			t.Fatalf("bounded response omitted prioritized tuple %q:\n%s", want, response)
+	last := -1
+	for index, row := range rows {
+		role := "SUPPORTING"
+		if index < localizationFinalResponsePrimaryLimit {
+			role = "PRIMARY"
 		}
+		want := fmt.Sprintf("- EVIDENCE #%d — %s — %s:%d — %s", index+1, role, row.File, row.Line, row.ID)
+		position := strings.Index(response, want)
+		if position <= last || strings.Count(response, want) != 1 {
+			t.Fatalf("canonical row %d was reordered or duplicated: want %q after byte %d:\n%s", index+1, want, last, response)
+		}
+		last = position
 	}
 	for _, line := range strings.Split(response, "\n") {
-		if strings.HasPrefix(line, "- ") && strings.Count(line, " — ") != 2 {
-			t.Fatalf("response row is not one aligned role/file/symbol tuple: %q", line)
+		if strings.HasPrefix(line, "- ") && strings.Count(line, " — ") != 3 {
+			t.Fatalf("response row is not one aligned rank/role/file/symbol tuple: %q", line)
 		}
 	}
-	if !strings.HasSuffix(response, localizationAnswerReadyDirective) || strings.Contains(response, "#1") {
-		t.Fatalf("response lost the stable directive or restored ordinal cross-references:\n%s", response)
+	if !strings.HasSuffix(response, localizationAnswerReadyDirective) {
+		t.Fatalf("response lost the stable directive:\n%s", response)
+	}
+}
+
+func TestLocalizationFinalResponseKeepsRankOneAndMarginalRowsInEveryPage(t *testing.T) {
+	rows := []localizationDigestRow{
+		{ID: "monolog/handlers.py::RotatingFileHandler", Name: "RotatingFileHandler", Kind: "class", File: "monolog/handlers.py", Line: 10},
+		{ID: "monolog/handlers.py::StreamHandler", Name: "StreamHandler", Kind: "class", File: "monolog/handlers.py", Line: 20, Provenance: localizationProvenanceImplementationTarget},
+		{ID: "monolog/handlers.py::WatchedFileHandler", Name: "WatchedFileHandler", Kind: "class", File: "monolog/handlers.py", Line: 30, Provenance: localizationProvenanceImplementationTarget},
+		{ID: "monolog/handlers.py::FileHandler", Name: "FileHandler", Kind: "class", File: "monolog/handlers.py", Line: 40, Provenance: localizationProvenanceImplementationTarget},
+	}
+	current := []localizationDigestRow{rows[1]}
+	pages := []string{
+		renderLocalizationFinalResponseForTask("find RotatingFileHandler", current, rows),
+		renderLocalizationProvisionalResponseForTask("find RotatingFileHandler", current, rows),
+	}
+	for _, page := range pages {
+		last := -1
+		for index, row := range rows {
+			marker := fmt.Sprintf("EVIDENCE #%d", index+1)
+			position := strings.Index(page, marker)
+			if position <= last || !strings.Contains(page[position:], row.ID) {
+				t.Fatalf("page lost canonical row %d (%s):\n%s", index+1, row.ID, page)
+			}
+			last = position
+		}
+		if !strings.Contains(page, "- EVIDENCE #1 — PRIMARY — monolog/handlers.py:10 — monolog/handlers.py::RotatingFileHandler") ||
+			!strings.Contains(page, "- EVIDENCE #4 — SUPPORTING — monolog/handlers.py:40 — monolog/handlers.py::FileHandler") {
+			t.Fatalf("page lost rank-one or marginal evidence:\n%s", page)
+		}
+	}
+}
+
+func TestLocalizationCompletionWithDigestPreservesBoundedConclusionPage(t *testing.T) {
+	digest := newLocalizationEvidenceDigest(localizationExploreEnvelope{
+		Evidence: []localizationEvidence{
+			{Rank: 1, ID: "monolog/handlers.py::RotatingFileHandler", Name: "RotatingFileHandler", Kind: "class", File: "monolog/handlers.py", Line: 10},
+			{Rank: 2, ID: "monolog/handlers.py::StreamHandler", Name: "StreamHandler", Kind: "class", File: "monolog/handlers.py", Line: 20},
+			{Rank: 3, ID: "monolog/handlers.py::WatchedFileHandler", Name: "WatchedFileHandler", Kind: "class", File: "monolog/handlers.py", Line: 30},
+			{Rank: 4, ID: "monolog/handlers.py::FileHandler", Name: "FileHandler", Kind: "class", File: "monolog/handlers.py", Line: 40},
+		},
+	})
+	originalFinal := digest.finalResponse
+	originalProvisional := digest.provisionalResponse
+	completion := newLocalizationBoundedConclusionCompletion(digest)
+
+	// Host metadata reattaches the request digest after the bounded conclusion
+	// has been constructed. That must not turn the exhausted-search page back
+	// into either the digest's ordinary answer or a provisional call-more page.
+	rebound := localizationCompletionWithDigest(completion, digest)
+	if !strings.HasPrefix(rebound.FinalResponse, localizationBoundedHeading+"\n") {
+		t.Fatalf("bounded conclusion lost its exhausted-search heading:\n%s", rebound.FinalResponse)
+	}
+	if rebound.FinalResponse == digest.finalResponse {
+		t.Fatalf("bounded conclusion was overwritten by the confirmed digest response:\n%s", rebound.FinalResponse)
+	}
+	last := -1
+	for index, evidence := range digest.Evidence {
+		marker := fmt.Sprintf("EVIDENCE #%d", index+1)
+		position := strings.Index(rebound.FinalResponse, marker)
+		if position <= last || !strings.Contains(rebound.FinalResponse[position:], evidence.ID) {
+			t.Fatalf("bounded conclusion lost canonical row %d (%s):\n%s", index+1, evidence.ID, rebound.FinalResponse)
+		}
+		last = position
+	}
+	if strings.Count(rebound.FinalResponse, localizationBoundedConclusionDirective) != 1 ||
+		strings.Contains(rebound.FinalResponse, localizationAnswerReadyDirective) ||
+		strings.Contains(rebound.FinalResponse, localizationProvisionalDirective) {
+		t.Fatalf("bounded conclusion directives are not canonical:\n%s", rebound.FinalResponse)
+	}
+	if !strings.HasSuffix(rebound.FinalResponse, localizationBoundedConclusionDirective) {
+		t.Fatalf("bounded conclusion directive is not final:\n%s", rebound.FinalResponse)
+	}
+	if digest.finalResponse != originalFinal || digest.provisionalResponse != originalProvisional {
+		t.Fatal("reattaching a bounded conclusion mutated the source digest")
 	}
 }
 
@@ -1043,8 +1386,8 @@ func TestLocalizationFinalResponsePromotesTaskAlignedSameOwnerMethod(t *testing.
 		retained,
 	)
 	for _, want := range []string{
-		"- PRIMARY — repo/gate.go:80 — repo/gate.go::BatchGate.drainPending",
-		"- PRIMARY — repo/gate.go:64 — repo/gate.go::BatchGate.discardPending",
+		"- EVIDENCE #1 — PRIMARY — repo/gate.go:80 — repo/gate.go::BatchGate.drainPending",
+		"- EVIDENCE #3 — PRIMARY — repo/gate.go:64 — repo/gate.go::BatchGate.discardPending",
 	} {
 		if !strings.Contains(digest.finalResponse, want) {
 			t.Fatalf("same-owner response omitted %q:\n%s", want, digest.finalResponse)
@@ -1067,7 +1410,7 @@ func TestLocalizationFinalResponsePromotesIdentifierOnlyTaskStem(t *testing.T) {
 		[]localizationDigestRow{current},
 		retained,
 	)
-	want := "- PRIMARY — repo/formatter.go:52 — repo/formatter.go::Formatter.applyAll"
+	want := "- EVIDENCE #3 — PRIMARY — repo/formatter.go:52 — repo/formatter.go::Formatter.applyAll"
 	if !strings.Contains(digest.finalResponse, want) {
 		t.Fatalf("identifier task-stem response omitted %q:\n%s", want, digest.finalResponse)
 	}
@@ -1080,8 +1423,8 @@ func TestLocalizationAnswerReadyResultReplaysAlignedStableContract(t *testing.T)
 	contract := requireLocalizationTerminalReplay(t, result, "", "")
 	wantRows := []string{
 		"LOCALIZATION:\n",
-		"- PRIMARY — repo/storage/disk.go:42 — repo/storage/disk.go::DiskStorage.Load",
-		"- PRIMARY — repo/storage/cloud.go:17 — repo/storage/cloud.go::CloudStorage.Load",
+		"- EVIDENCE #1 — PRIMARY — repo/storage/disk.go:42 — repo/storage/disk.go::DiskStorage.Load",
+		"- EVIDENCE #2 — PRIMARY — repo/storage/cloud.go:17 — repo/storage/cloud.go::CloudStorage.Load",
 	}
 	for _, want := range wantRows {
 		if !strings.Contains(contract.Completion.FinalResponse, want) {
@@ -1242,7 +1585,7 @@ func TestDecorateLocalizationReadResultMirrorsContentOnlyPayloadForHosts(t *test
 }
 
 func TestPermittedRefinementReadInvokesHandlerAndPreservesPayload(t *testing.T) {
-	srv := setupPresetServer(t, ToolPolicyConfig{Preset: "core", Mode: "defer"})
+	srv := setupHardLocalizationRecoveryServer(t)
 	ctx := WithSessionID(context.Background(), "refinement_read_payload")
 	initFrame := []byte(`{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"codex","version":"1.0"}}}`)
 	if reply := srv.MCPServer().HandleMessage(ctx, initFrame); reply == nil {
@@ -1320,8 +1663,7 @@ func TestPermittedRefinementReadInvokesHandlerAndPreservesPayload(t *testing.T) 
 	if err := json.Unmarshal(initialEncoded, &initialContract); err != nil {
 		t.Fatalf("decode initial terminal contract: %v", err)
 	}
-	initialHost, ok := result.Meta.AdditionalFields[localizationHostMetaKey].(localizationHostEnvelope)
-	if !ok || !initialContract.Terminal || initialContract.Completion.FinalResponse == "" {
+	if _, ok := result.Meta.AdditionalFields[localizationHostMetaKey].(localizationHostEnvelope); !ok || !initialContract.Terminal || initialContract.Completion.FinalResponse == "" {
 		t.Fatalf("answer_ready PostToolUse envelope = contract %#v host %#v", initialContract, result.Meta)
 	}
 	wire, err := json.Marshal(result)
@@ -1344,34 +1686,27 @@ func TestPermittedRefinementReadInvokesHandlerAndPreservesPayload(t *testing.T) 
 		Name:      "search",
 		Arguments: map[string]any{"operation": "  SyMbOlS  ", "query": "Load"},
 	}}
-	terminal, err := srv.handleFacade(ctx, "search", searchRequest)
-	if err != nil {
-		t.Fatalf("post-refinement navigation error = %v", err)
+	navigation, err := srv.handleFacade(ctx, "search", searchRequest)
+	if err != nil || navigation == nil || navigation.IsError {
+		t.Fatalf("post-refinement navigation = (%#v, %v)", navigation, err)
 	}
-	if searchCalls != 0 {
-		t.Fatalf("search handler calls after answer_ready = %d, want 0", searchCalls)
+	if searchCalls != 1 {
+		t.Fatalf("search handler calls after answer_ready = %d, want 1", searchCalls)
 	}
-	replayContract := requireLocalizationTerminalReplay(t, terminal, "search", "symbols")
-	replayHost, ok := terminal.Meta.AdditionalFields[localizationHostMetaKey].(localizationHostEnvelope)
-	if !ok {
-		t.Fatalf("post-terminal replay host envelope missing: %#v", terminal.Meta)
-	}
-	if replayContract.Completion.FinalResponse != initialContract.Completion.FinalResponse ||
-		replayHost.Contract.Completion.FinalResponse != initialHost.Contract.Completion.FinalResponse ||
-		!reflect.DeepEqual(replayHost.Evidence, initialHost.Evidence) {
-		t.Fatalf("host-ignored terminal replay diverged: initial=%#v/%#v replay=%#v/%#v", initialContract, initialHost, replayContract, replayHost)
+	if text, _ := singleTextContent(navigation); text != "unexpected search result" {
+		t.Fatalf("post-refinement navigation payload = %q", text)
 	}
 }
 
-func TestAnswerReadyNavigationDispatchNeverInvokesLegacyHandler(t *testing.T) {
-	srv := setupPresetServer(t, ToolPolicyConfig{Preset: "core", Mode: "defer"})
-	ctx := WithSessionID(context.Background(), "terminal_handler_intercept")
+func TestAnswerReadyNavigationDispatchKeepsCodingToolsOpen(t *testing.T) {
+	srv := setupHardLocalizationRecoveryServer(t)
+	ctx := WithSessionID(context.Background(), "answer_ready_keeps_coding_open")
 	initFrame := []byte(`{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"codex","version":"1.0"}}}`)
 	if reply := srv.MCPServer().HandleMessage(ctx, initFrame); reply == nil {
 		t.Fatal("initialize returned nil")
 	}
 
-	spec, ok := srv.facades.operation("search", "symbols")
+	searchSpec, ok := srv.facades.operation("search", "symbols")
 	if !ok {
 		t.Fatal("search.symbols facade operation is missing")
 	}
@@ -1383,41 +1718,46 @@ func TestAnswerReadyNavigationDispatchNeverInvokesLegacyHandler(t *testing.T) {
 	if !ok {
 		t.Fatal("change.detect facade operation is missing")
 	}
-	handlerCalls := 0
+	navigationCalls := 0
 	changeCalls := 0
-	srv.facades.capture(mcpgo.NewTool(spec.Legacy), func(context.Context, mcpgo.CallToolRequest) (*mcpgo.CallToolResult, error) {
-		handlerCalls++
-		return mcpgo.NewToolResultText(strings.Repeat("expensive", 10_000)), nil
+	srv.facades.capture(mcpgo.NewTool(searchSpec.Legacy), func(context.Context, mcpgo.CallToolRequest) (*mcpgo.CallToolResult, error) {
+		navigationCalls++
+		return mcpgo.NewToolResultText("live search"), nil
 	})
 	srv.facades.capture(mcpgo.NewTool(readSpec.Legacy), func(context.Context, mcpgo.CallToolRequest) (*mcpgo.CallToolResult, error) {
-		handlerCalls++
-		return mcpgo.NewToolResultText(strings.Repeat("source", 10_000)), nil
+		navigationCalls++
+		return mcpgo.NewToolResultText("live source"), nil
 	})
 	srv.facades.capture(mcpgo.NewTool(changeSpec.Legacy), func(context.Context, mcpgo.CallToolRequest) (*mcpgo.CallToolResult, error) {
 		changeCalls++
 		return mcpgo.NewToolResultText(`{"changed":[]}`), nil
 	})
 	completion := newLocalizationCompletion(true, "")
+	completion.Enforceable = true
+	completion.enforceableOnAnswerReady = true
 	completion.digest = testEvidenceDigest()
 	srv.localizationFor(ctx).armForTask(completion, "find the storage load implementations")
 
-	request := mcpgo.CallToolRequest{Params: mcpgo.CallToolParams{
+	searchRequest := mcpgo.CallToolRequest{Params: mcpgo.CallToolParams{
 		Name: "search",
 		Arguments: map[string]any{
 			"operation": "  SyMbOlS  ",
 			"query":     "Load",
 		},
 	}}
-	for repeat := 0; repeat < 10; repeat++ {
-		result, err := srv.handleFacade(ctx, "search", request)
-		if err != nil {
-			t.Fatalf("repeat %d result = (%+v, %v)", repeat, result, err)
+	for repeat := 0; repeat < 3; repeat++ {
+		result, err := srv.handleFacade(ctx, "search", searchRequest)
+		if err != nil || result == nil || result.IsError {
+			t.Fatalf("repeat %d live search = (%+v, %v)", repeat, result, err)
 		}
-		requireLocalizationTerminalReplay(t, result, "search", "symbols")
+		if text, _ := singleTextContent(result); text != "live search" {
+			t.Fatalf("repeat %d live search payload = %q", repeat, text)
+		}
 	}
-	if handlerCalls != 0 {
-		t.Fatalf("legacy handler invoked %d times after answer_ready", handlerCalls)
+	if navigationCalls != 3 {
+		t.Fatalf("search handler calls after answer_ready = %d, want 3", navigationCalls)
 	}
+
 	readRequest := mcpgo.CallToolRequest{Params: mcpgo.CallToolParams{
 		Name: "read",
 		Arguments: map[string]any{
@@ -1426,22 +1766,24 @@ func TestAnswerReadyNavigationDispatchNeverInvokesLegacyHandler(t *testing.T) {
 		},
 	}}
 	readResult, err := srv.handleFacade(ctx, "read", readRequest)
-	if err != nil {
-		t.Fatalf("post-terminal read = (%+v, %v)", readResult, err)
+	if err != nil || readResult == nil || readResult.IsError {
+		t.Fatalf("post-answer-ready read = (%+v, %v)", readResult, err)
 	}
-	requireLocalizationTerminalReplay(t, readResult, "read", "source")
-	if handlerCalls != 0 {
-		t.Fatalf("read handler invoked %d times after answer_ready", handlerCalls)
+	if text, _ := singleTextContent(readResult); text != "live source" {
+		t.Fatalf("post-answer-ready read payload = %q", text)
+	}
+	if navigationCalls != 4 {
+		t.Fatalf("navigation handler calls after read = %d, want 4", navigationCalls)
 	}
 
-	// The pre-validation gate also catches malformed recovery attempts instead
-	// of spending a turn on schema errors.
-	request.Params.Arguments = map[string]any{"operation": "not_an_operation"}
-	result, err := srv.handleFacade(ctx, "search", request)
-	if err != nil {
-		t.Fatalf("malformed post-terminal request = (%+v, %v)", result, err)
+	searchRequest.Params.Arguments = map[string]any{"operation": "not_an_operation"}
+	invalid, err := srv.handleFacade(ctx, "search", searchRequest)
+	if err != nil || invalid == nil || !invalid.IsError {
+		t.Fatalf("malformed post-answer-ready search = (%+v, %v), want validation error", invalid, err)
 	}
-	requireLocalizationTerminalReplay(t, result, "search", "not_an_operation")
+	if navigationCalls != 4 {
+		t.Fatalf("malformed search dispatched a handler: calls=%d", navigationCalls)
+	}
 
 	changeRequest := mcpgo.CallToolRequest{Params: mcpgo.CallToolParams{
 		Name:      "change",
@@ -1449,13 +1791,12 @@ func TestAnswerReadyNavigationDispatchNeverInvokesLegacyHandler(t *testing.T) {
 	}}
 	changeResult, err := srv.handleFacade(ctx, "change", changeRequest)
 	if err != nil || changeResult == nil || changeResult.IsError || changeCalls != 1 {
-		t.Fatalf("post-terminal change.detect = (%+v, %v), calls=%d", changeResult, err, changeCalls)
+		t.Fatalf("post-answer-ready change.detect = (%+v, %v), calls=%d", changeResult, err, changeCalls)
 	}
 	if text, _ := singleTextContent(changeResult); strings.Contains(text, localizationAnswerReadyDirective) {
-		t.Fatal("post-terminal change.detect was incorrectly intercepted")
+		t.Fatal("post-answer-ready change.detect was incorrectly intercepted")
 	}
 
-	// Capabilities has a dedicated handler and remains usable after localization.
 	capabilitiesFrame := []byte(`{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"capabilities","arguments":{}}}`)
 	raw, err := json.Marshal(srv.MCPServer().HandleMessage(ctx, capabilitiesFrame))
 	if err != nil {
@@ -1469,9 +1810,184 @@ func TestAnswerReadyNavigationDispatchNeverInvokesLegacyHandler(t *testing.T) {
 		t.Fatalf("decode capabilities response: %v", err)
 	}
 	if called.Error != nil || called.Result == nil || called.Result.IsError {
-		t.Fatalf("terminal capabilities response = error %#v result %#v", called.Error, called.Result)
+		t.Fatalf("post-answer-ready capabilities = error %#v result %#v", called.Error, called.Result)
 	}
 	if text, _ := singleTextContent(called.Result); strings.Contains(text, localizationAnswerReadyDirective) {
-		t.Fatalf("capabilities was incorrectly intercepted: %q", text)
+		t.Fatalf("capabilities was replaced by localization replay: %q", text)
+	}
+}
+
+func TestCoreLocalizeDoesNotArmTerminalHostAuthority(t *testing.T) {
+	t.Setenv("GORTEX_HOOK_SESSION_DIR", t.TempDir())
+	srv := setupPresetServer(t, ToolPolicyConfig{Preset: "core", Mode: "defer"})
+	ctx := WithSessionID(context.Background(), "core_localize_without_host_lock")
+	spec, ok := srv.facades.operation("explore", "localize")
+	if !ok {
+		t.Fatal("explore.localize facade operation is missing")
+	}
+	calls := 0
+	completion := newLocalizationCompletion(true, "")
+	completion.digest = testEvidenceDigest()
+	srv.facades.capture(mcpgo.NewTool(spec.Legacy), func(context.Context, mcpgo.CallToolRequest) (*mcpgo.CallToolResult, error) {
+		calls++
+		return localizationAnswerReadyResult(completion), nil
+	})
+	token, ok := localizationauth.NewToken()
+	if !ok {
+		t.Fatal("failed to mint localization auth token")
+	}
+	result, err := srv.handleFacade(ctx, "explore", mcpgo.CallToolRequest{Params: mcpgo.CallToolParams{
+		Name: "explore",
+		Arguments: map[string]any{
+			"operation":                  "localize",
+			"task":                       "find the storage load implementations",
+			localizationauth.ArgumentKey: token,
+		},
+	}})
+	if err != nil || result == nil || result.IsError || calls != 1 {
+		t.Fatalf("core localize = (%+v, %v), calls=%d", result, err, calls)
+	}
+	host, ok := result.Meta.AdditionalFields[localizationHostMetaKey].(localizationHostEnvelope)
+	if !ok || !host.Contract.Terminal {
+		t.Fatalf("core localize omitted authenticated advisory context: %#v", result.Meta)
+	}
+	receipt, published := localizationauth.Consume(token)
+	if !published || receipt.FinalResponse == "" {
+		t.Fatalf("core localize omitted advisory receipt: %#v", receipt)
+	}
+}
+
+func TestUnresolvedPolicyLocalizeDoesNotArmTerminalHostAuthority(t *testing.T) {
+	t.Setenv("GORTEX_HOOK_SESSION_DIR", t.TempDir())
+	srv := setupPresetServer(t, ToolPolicyConfig{Preset: "core", Mode: "defer"})
+	srv.toolPolicy = nil
+	srv.toolPolicyOperatorPinned = true
+	ctx := WithSessionID(context.Background(), "unresolved_policy_localize_without_host_lock")
+	spec, ok := srv.facades.operation("explore", "localize")
+	if !ok {
+		t.Fatal("explore.localize facade operation is missing")
+	}
+	calls := 0
+	completion := newLocalizationCompletion(true, "")
+	completion.digest = testEvidenceDigest()
+	srv.facades.capture(mcpgo.NewTool(spec.Legacy), func(context.Context, mcpgo.CallToolRequest) (*mcpgo.CallToolResult, error) {
+		calls++
+		return localizationAnswerReadyResult(completion), nil
+	})
+	token, ok := localizationauth.NewToken()
+	if !ok {
+		t.Fatal("failed to mint localization auth token")
+	}
+	result, err := srv.handleFacade(ctx, "explore", mcpgo.CallToolRequest{Params: mcpgo.CallToolParams{
+		Name: "explore",
+		Arguments: map[string]any{
+			"operation":                  "localize",
+			"task":                       "find the storage load implementations",
+			localizationauth.ArgumentKey: token,
+		},
+	}})
+	if err != nil || result == nil || result.IsError || calls != 1 {
+		t.Fatalf("unresolved-policy localize = (%+v, %v), calls=%d", result, err, calls)
+	}
+	host, ok := result.Meta.AdditionalFields[localizationHostMetaKey].(localizationHostEnvelope)
+	if !ok || !host.Contract.Terminal {
+		t.Fatalf("unresolved-policy localize omitted authenticated advisory context: %#v", result.Meta)
+	}
+	receipt, published := localizationauth.Consume(token)
+	if !published || receipt.FinalResponse == "" {
+		t.Fatalf("unresolved-policy localize omitted advisory receipt: %#v", receipt)
+	}
+}
+
+func TestAnswerReadyNavigationRemainsOpenForCodingSessionPresets(t *testing.T) {
+	for _, preset := range []string{"core", "full"} {
+		t.Run(preset, func(t *testing.T) {
+			srv := setupPresetServer(t, ToolPolicyConfig{Preset: preset, Mode: "defer"})
+			ctx := WithSessionID(context.Background(), preset+"_coding_after_localize")
+			initFrame := []byte(`{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"codex","version":"1.0"}}}`)
+			if reply := srv.MCPServer().HandleMessage(ctx, initFrame); reply == nil {
+				t.Fatal("initialize returned nil")
+			}
+
+			spec, ok := srv.facades.operation("search", "symbols")
+			if !ok {
+				t.Fatal("search.symbols facade operation is missing")
+			}
+			handlerCalls := 0
+			srv.facades.capture(mcpgo.NewTool(spec.Legacy), func(context.Context, mcpgo.CallToolRequest) (*mcpgo.CallToolResult, error) {
+				handlerCalls++
+				return mcpgo.NewToolResultText(`{"results":[]}`), nil
+			})
+			completion := newLocalizationCompletion(true, "")
+			completion.Enforceable = true
+			completion.enforceableOnAnswerReady = true
+			completion.digest = testEvidenceDigest()
+			srv.localizationFor(ctx).armForTask(completion, "find the storage load implementations")
+
+			// Exercise the production wrapper, not handleFacade directly. Even an
+			// enforceable answer_ready state must be advisory outside the explicit
+			// benchmark profile, so a long-running coding session keeps navigating.
+			toolName := "search"
+			arguments := map[string]any{"operation": "symbols", "query": "Load"}
+			if preset == "full" {
+				toolName = spec.Legacy
+				arguments = map[string]any{"query": "Load"}
+			}
+			searchFrame, err := json.Marshal(map[string]any{
+				"jsonrpc": "2.0", "id": 2, "method": "tools/call",
+				"params": map[string]any{"name": toolName, "arguments": arguments},
+			})
+			if err != nil {
+				t.Fatalf("marshal search request: %v", err)
+			}
+			raw, err := json.Marshal(srv.MCPServer().HandleMessage(ctx, searchFrame))
+			if err != nil {
+				t.Fatalf("marshal post-localization search: %v", err)
+			}
+			var called struct {
+				Error  any                   `json:"error"`
+				Result *mcpgo.CallToolResult `json:"result"`
+			}
+			if err := json.Unmarshal(raw, &called); err != nil {
+				t.Fatalf("decode post-localization search: %v", err)
+			}
+			if called.Error != nil || called.Result == nil || called.Result.IsError {
+				t.Fatalf("%s post-localization search = error %#v result %#v", preset, called.Error, called.Result)
+			}
+			if preset == "core" && handlerCalls != 1 {
+				t.Fatalf("%s facade search handler calls = %d, want 1", preset, handlerCalls)
+			}
+			if text, _ := singleTextContent(called.Result); strings.Contains(text, localizationAnswerReadyDirective) {
+				t.Fatalf("%s coding navigation was incorrectly intercepted: %q", preset, text)
+			}
+		})
+	}
+}
+
+func TestAnswerReadyDirectiveStopsLocalizationOnlyCrossCheckWithoutBlockingCoding(t *testing.T) {
+	for _, required := range []string{
+		"bounded search examined the supplied anchors",
+		"full retained result",
+		"For a localization-only request, answer now",
+		"Do not call another tool just to gain confidence, repeat, or cross-check this localization",
+		"PRIMARY rows are the best-supported answer",
+		"SUPPORTING rows are context, not a signal that the search is unfinished",
+		"An identical localize call will replay this result",
+		"On a broader coding task, this closes only localization",
+		"diagnosis, implementation, or verification",
+		"all tools remain available",
+	} {
+		if !strings.Contains(localizationAnswerReadyDirective, required) {
+			t.Fatalf("answer-ready directive missing %q: %s", required, localizationAnswerReadyDirective)
+		}
+	}
+	for _, forbidden := range []string{
+		"additional Gortex navigation call was not run",
+		"make no further tool calls",
+		"if the evidence is contradictory",
+	} {
+		if strings.Contains(localizationAnswerReadyDirective, forbidden) {
+			t.Fatalf("answer-ready directive contains blocking or ambiguous wording %q: %s", forbidden, localizationAnswerReadyDirective)
+		}
 	}
 }

@@ -91,13 +91,10 @@ func TestToolsListByteCeilings(t *testing.T) {
 	require.Lessf(t, locBytes, agentBytes,
 		"localization (%d bytes) must stay leaner than the agent floor (%d bytes)", locBytes, agentBytes)
 
-	locSet := map[string]bool{}
-	for _, n := range locNames {
-		locSet[n] = true
-	}
-	require.True(t, locSet["smart_context"], "the one-shot opener must ship eagerly in the localization surface")
-	require.True(t, locSet[LazyToolsSearchName], "tools_search must survive every preset")
-	require.False(t, locSet["edit_file"], "the localization surface is read-only")
+	require.Len(t, locNames, 6, "localization must publish exactly four facade tools plus profile/search discovery")
+	require.ElementsMatch(t, []string{
+		"explore", "search", "read", "capabilities", "tool_profile", LazyToolsSearchName,
+	}, locNames, "localization tools/list must stay on the six-tool handshake")
 	require.Lessf(t, coreBytes, corePresetBaselineBytes,
 		"core preset must shrink below its pre-diet baseline (%d), got %d", corePresetBaselineBytes, coreBytes)
 	require.Lessf(t, fullBytes, fullPresetBaselineBytes,

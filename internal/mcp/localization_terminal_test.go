@@ -12,6 +12,16 @@ import (
 	"github.com/zzet/gortex/internal/graph"
 )
 
+func newStrictLocalizationFacadeTestServer(registry *facadeRegistry) *Server {
+	return &Server{
+		facades:                  registry,
+		localization:             newLocalizationTerminalState(),
+		sessions:                 newSessionMap(),
+		toolPolicy:               &toolPolicy{preset: "localization"},
+		toolPolicyOperatorPinned: true,
+	}
+}
+
 func TestHandleFacadeRejectsLocalizationBypassesWithoutClearingState(t *testing.T) {
 	registry := newFacadeRegistry()
 	calls := 0
@@ -19,19 +29,20 @@ func TestHandleFacadeRejectsLocalizationBypassesWithoutClearingState(t *testing.
 		calls++
 		return mcpgo.NewToolResultText("unexpected"), nil
 	})
-	server := &Server{facades: registry, localization: &localizationTerminalState{}}
+	server := newStrictLocalizationFacadeTestServer(registry)
 	ctx := WithSessionID(context.Background(), "localize-validation")
 	terminal := server.localizationFor(ctx)
 	terminal.armForTask(newLocalizationCompletion(true, ""), "Locate Foo")
 
 	requests := []struct {
-		name string
-		args map[string]any
+		name       string
+		args       map[string]any
+		wantReplay bool
 	}{
 		{name: "task top-level override", args: map[string]any{"operation": "task", "task": "Locate Bar", "localize": true}},
 		{name: "task nested override", args: map[string]any{"operation": "task", "task": "Locate Bar", "options": map[string]any{"localize": true}}},
-		{name: "empty localize", args: map[string]any{"operation": "localize", "task": ""}},
-		{name: "nested localize task", args: map[string]any{"operation": "localize", "options": map[string]any{"task": "Locate Bar"}}},
+		{name: "empty localize", args: map[string]any{"operation": "localize", "task": ""}, wantReplay: true},
+		{name: "nested localize task", args: map[string]any{"operation": "localize", "options": map[string]any{"task": "Locate Bar"}}, wantReplay: true},
 	}
 	for _, request := range requests {
 		t.Run(request.name, func(t *testing.T) {
@@ -43,9 +54,13 @@ func TestHandleFacadeRejectsLocalizationBypassesWithoutClearingState(t *testing.
 				t.Fatalf("handleFacade() transport error = %v", err)
 			}
 			operation, _ := request.args["operation"].(string)
-			requireLocalizationTerminalReplay(t, result, "explore", normalizeFacadeOperation(operation))
-			if blocked := terminal.block("search", "symbols", nil); blocked == nil {
-				t.Fatal("invalid localization request cleared terminal state")
+			if request.wantReplay {
+				requireLocalizationTerminalReplay(t, result, "explore", normalizeFacadeOperation(operation))
+			} else if result == nil || !result.IsError {
+				t.Fatalf("invalid localization bypass = %#v, want tool error", result)
+			}
+			if !terminal.answerReady() {
+				t.Fatal("localization request cleared retained answer-ready state")
 			}
 		})
 	}
@@ -61,7 +76,7 @@ func TestHandleFacadeValidatesMalformedExplicitNewUserBoundary(t *testing.T) {
 		calls++
 		return mcpgo.NewToolResultText("unexpected"), nil
 	})
-	server := &Server{facades: registry, localization: &localizationTerminalState{}}
+	server := newStrictLocalizationFacadeTestServer(registry)
 	ctx := WithSessionID(context.Background(), "malformed-new-task-boundary")
 	terminal := server.localizationFor(ctx)
 	terminal.armForTask(newLocalizationCompletion(true, ""), "Locate Foo")
@@ -427,7 +442,7 @@ func TestHandleFacadeRefinementReadReturnsAnswerReadyCompletion(t *testing.T) {
 		analyzeCalls++
 		return mcpgo.NewToolResultText(`{"result":"unexpected"}`), nil
 	})
-	server := &Server{facades: registry, localization: newLocalizationTerminalState(), sessions: newSessionMap()}
+	server := newStrictLocalizationFacadeTestServer(registry)
 	ctx := WithSessionID(context.Background(), "refinement-read-completion")
 	server.localizationFor(ctx).armRefinementRoutesForTask(
 		"locate resolver behavior",
@@ -479,13 +494,16 @@ func TestHandleFacadeRefinementReadReturnsAnswerReadyCompletion(t *testing.T) {
 		"kind":   "why",
 		"target": map[string]any{"symbol": candidate},
 	}
-	blockedAnalyze, err := server.handleFacade(ctx, "analyze", analyzeReq)
-	if err != nil {
-		t.Fatalf("terminal analyze returned transport error: %v", err)
+	analyzeResult, err := server.handleFacade(ctx, "analyze", analyzeReq)
+	if err != nil || analyzeResult == nil || analyzeResult.IsError {
+		t.Fatalf("post-localization analyze failed: result=%#v err=%v", analyzeResult, err)
 	}
-	requireLocalizationTerminalReplay(t, blockedAnalyze, "analyze", "why")
-	if analyzeCalls != 0 {
-		t.Fatalf("terminal analyze reached its legacy handler %d time(s)", analyzeCalls)
+	analyzeBody, ok := singleTextContent(analyzeResult)
+	if !ok || analyzeBody != `{"result":"unexpected"}` {
+		t.Fatalf("post-localization analyze payload = %q, want dispatched legacy result", analyzeBody)
+	}
+	if analyzeCalls != 1 {
+		t.Fatalf("post-localization analyze legacy calls = %d, want 1", analyzeCalls)
 	}
 }
 
@@ -517,18 +535,14 @@ func TestLocalizationTerminalStateIsPerSession(t *testing.T) {
 	}
 }
 
-func TestHandleFacadeTaskCannotEscapeTerminalState(t *testing.T) {
+func TestHandleFacadeTaskDispatchesAfterLocalizationAnswerReady(t *testing.T) {
 	registry := newFacadeRegistry()
-	called := false
+	calls := 0
 	registry.capture(mcpgo.NewTool("explore"), func(context.Context, mcpgo.CallToolRequest) (*mcpgo.CallToolResult, error) {
-		called = true
-		return mcpgo.NewToolResultText("unexpected"), nil
+		calls++
+		return mcpgo.NewToolResultText("diagnostic neighborhood"), nil
 	})
-	server := &Server{
-		facades:      registry,
-		localization: newLocalizationTerminalState(),
-		sessions:     newSessionMap(),
-	}
+	server := newStrictLocalizationFacadeTestServer(registry)
 	ctx := WithSessionID(context.Background(), "diagnosis")
 	terminal := server.localizationFor(ctx)
 	terminal.armForTask(newLocalizationCompletion(true, ""), "locate the failing writer")
@@ -540,16 +554,28 @@ func TestHandleFacadeTaskCannotEscapeTerminalState(t *testing.T) {
 		req.Params.Name = "explore"
 		req.Params.Arguments = map[string]any{"operation": "task", "task": task}
 		result, err := server.handleFacade(ctx, "explore", req)
-		if err != nil {
-			t.Fatalf("ordinary task escaped terminal state: result=%#v err=%v", result, err)
+		if err != nil || result == nil || result.IsError {
+			t.Fatalf("ordinary task failed after localization: result=%#v err=%v", result, err)
 		}
-		requireLocalizationTerminalReplay(t, result, "explore", "task")
+		body, ok := singleTextContent(result)
+		if !ok || body != "diagnostic neighborhood" {
+			t.Fatalf("ordinary task payload = %q, want dispatched legacy result", body)
+		}
 	}
-	if called {
-		t.Fatal("ordinary explore(task) dispatched after localization completed")
+	if calls != 2 {
+		t.Fatalf("ordinary explore(task) legacy calls = %d, want 2", calls)
 	}
-	if blocked := terminal.block("search", "symbols", nil); blocked == nil {
-		t.Fatal("ordinary explore(task) cleared terminal state")
+
+	repeat := mcpgo.CallToolRequest{}
+	repeat.Params.Name = "explore"
+	repeat.Params.Arguments = map[string]any{"operation": "localize", "task": "locate the failing writer"}
+	replay, err := server.handleFacade(ctx, "explore", repeat)
+	if err != nil {
+		t.Fatalf("repeated localization returned transport error: %v", err)
+	}
+	requireLocalizationTerminalReplay(t, replay, "explore", "localize")
+	if calls != 2 {
+		t.Fatalf("repeated localization reached legacy handler: calls=%d, want 2", calls)
 	}
 }
 
@@ -563,11 +589,7 @@ func TestHandleFacadeTaskRunsWhenTerminalInactive(t *testing.T) {
 		}
 		return mcpgo.NewToolResultText("ordinary diagnostic neighborhood"), nil
 	})
-	server := &Server{
-		facades:      registry,
-		localization: newLocalizationTerminalState(),
-		sessions:     newSessionMap(),
-	}
+	server := newStrictLocalizationFacadeTestServer(registry)
 	ctx := WithSessionID(context.Background(), "inactive-diagnosis")
 	req := mcpgo.CallToolRequest{}
 	req.Params.Name = "explore"
@@ -591,7 +613,7 @@ func TestHandleFacadeExplicitNewUserTaskCrossesTerminalBoundary(t *testing.T) {
 		}
 		return mcpgo.NewToolResultText("diagnostic neighborhood"), nil
 	})
-	server := &Server{facades: registry, localization: newLocalizationTerminalState(), sessions: newSessionMap()}
+	server := newStrictLocalizationFacadeTestServer(registry)
 	ctx := WithSessionID(context.Background(), "explicit-task-boundary")
 	terminal := server.localizationFor(ctx)
 	prior := newLocalizationCompletion(true, "")
@@ -639,7 +661,7 @@ func TestHandleFacadeExactReadCommitsOnlyOnSuccess(t *testing.T) {
 		}
 		return mcpgo.NewToolResultText("func Run() {}"), nil
 	})
-	server := &Server{facades: registry, localization: newLocalizationTerminalState(), sessions: newSessionMap()}
+	server := newStrictLocalizationFacadeTestServer(registry)
 	ctx := WithSessionID(context.Background(), "exact-read")
 	exactCompletion := newLocalizationCompletion(false, "repo/pkg/file.go::Run")
 	exactCompletion.enforceableOnAnswerReady = true
@@ -668,10 +690,13 @@ func TestHandleFacadeExactReadCommitsOnlyOnSuccess(t *testing.T) {
 		t.Fatalf("bounded exact-read recovery = result=%#v err=%v calls=%d", third, err, calls)
 	}
 	fourth, err := server.handleFacade(ctx, "read", req)
-	if err != nil || calls != 3 {
-		t.Fatalf("post-recovery exact read = result=%#v err=%v calls=%d", fourth, err, calls)
+	if err != nil || fourth == nil || fourth.IsError || calls != 4 {
+		t.Fatalf("post-recovery exact read = result=%#v err=%v calls=%d, want dispatched success", fourth, err, calls)
 	}
-	requireLocalizationTerminalReplay(t, fourth, "read", "source")
+	fourthBody, ok := singleTextContent(fourth)
+	if !ok || fourthBody != "func Run() {}" {
+		t.Fatalf("post-recovery exact read payload = %q, want dispatched legacy result", fourthBody)
+	}
 }
 
 func TestHandleFacadeExhaustedCorrectionFailureCarriesTerminalCompletion(t *testing.T) {
@@ -689,7 +714,7 @@ func TestHandleFacadeExhaustedCorrectionFailureCarriesTerminalCompletion(t *test
 		}
 		return nil, errors.New("persistent correction failure")
 	})
-	server := &Server{facades: registry, localization: newLocalizationTerminalState(), sessions: newSessionMap()}
+	server := newStrictLocalizationFacadeTestServer(registry)
 	ctx := WithSessionID(context.Background(), "exhausted-correction")
 	server.localizationFor(ctx).armRefinementRoutesForTask(
 		"locate resolver behavior",
@@ -738,10 +763,12 @@ func TestHandleFacadeExhaustedCorrectionFailureCarriesTerminalCompletion(t *test
 		t.Fatalf("exhausted failure omitted terminal completion: %q", thirdBody)
 	}
 	requireFacadeIdentity(t, third, facadeOperationSpec{Facade: "read", Operation: "source", Legacy: "get_symbol_source"})
-	if blocked, err := read(alternate); err != nil {
-		t.Fatalf("post-terminal read returned transport error: %v", err)
-	} else {
-		requireLocalizationTerminalReplay(t, blocked, "read", "source")
+	postTerminal, err := read(alternate)
+	if err == nil || !strings.Contains(err.Error(), "persistent correction failure") {
+		t.Fatalf("post-terminal read = (%#v, %v), want dispatched legacy error", postTerminal, err)
+	}
+	if postTerminal != nil || alternateCalls != 3 {
+		t.Fatalf("post-terminal read result=%#v calls=%d, want nil result and 3 legacy calls", postTerminal, alternateCalls)
 	}
 }
 
@@ -801,7 +828,7 @@ func TestHandleFacadeFailedDifferentLocalizePreservesTerminalState(t *testing.T)
 		calls++
 		return mcpgo.NewToolResultError("localization failed"), nil
 	})
-	server := &Server{facades: registry, localization: &localizationTerminalState{}}
+	server := newStrictLocalizationFacadeTestServer(registry)
 	ctx := WithSessionID(context.Background(), "failed-different-localize")
 	terminal := server.localizationFor(ctx)
 	terminal.armForTask(newLocalizationCompletion(true, ""), "Locate Foo")
@@ -836,7 +863,7 @@ func TestHandleFacadeExplicitNewUserTaskCommitsOnSuccess(t *testing.T) {
 		server.localizationFor(ctx).armForTask(newLocalizationCompletion(true, ""), req.GetString("task", ""))
 		return mcpgo.NewToolResultText("localized"), nil
 	})
-	server = &Server{facades: registry, localization: newLocalizationTerminalState(), sessions: newSessionMap()}
+	server = newStrictLocalizationFacadeTestServer(registry)
 	ctx := WithSessionID(context.Background(), "new-user-boundary")
 	terminal := server.localizationFor(ctx)
 	terminal.armForTask(newLocalizationCompletion(true, ""), "Locate Foo")
@@ -871,7 +898,7 @@ func TestHandleFacadeNewUserTaskPanicRollsBack(t *testing.T) {
 	registry.capture(mcpgo.NewTool("explore"), func(context.Context, mcpgo.CallToolRequest) (*mcpgo.CallToolResult, error) {
 		panic("localization panic")
 	})
-	server := &Server{facades: registry, localization: newLocalizationTerminalState(), sessions: newSessionMap()}
+	server := newStrictLocalizationFacadeTestServer(registry)
 	ctx := WithSessionID(context.Background(), "new-user-panic")
 	terminal := server.localizationFor(ctx)
 	terminal.armForTask(newLocalizationCompletion(true, ""), "Locate Foo")
@@ -909,7 +936,7 @@ func TestHandleFacadeConcurrentLocalizeAdmitsOnlyOne(t *testing.T) {
 		server.localizationFor(ctx).armForTask(newLocalizationCompletion(true, ""), req.GetString("task", ""))
 		return mcpgo.NewToolResultText("localized"), nil
 	})
-	server = &Server{facades: registry, localization: newLocalizationTerminalState(), sessions: newSessionMap()}
+	server = newStrictLocalizationFacadeTestServer(registry)
 	ctx := WithSessionID(context.Background(), "concurrent-localize")
 	firstReq := mcpgo.CallToolRequest{}
 	firstReq.Params.Name = "explore"
@@ -990,7 +1017,7 @@ func TestHandleFacadeExactReadPanicRestoresReservation(t *testing.T) {
 		}
 		return mcpgo.NewToolResultText("source"), nil
 	})
-	server := &Server{facades: registry, localization: &localizationTerminalState{}}
+	server := newStrictLocalizationFacadeTestServer(registry)
 	ctx := WithSessionID(context.Background(), "exact-read-panic")
 	terminal := server.localizationFor(ctx)
 	const symbol = "repo/internal/file.go::Target"
@@ -1022,12 +1049,15 @@ func TestHandleFacadeExactReadPanicRestoresReservation(t *testing.T) {
 		t.Fatalf("third exact read recovery = (%v, %v), want success", third, err)
 	}
 	fourth, err := server.handleFacade(ctx, "read", req)
-	if err != nil {
-		t.Fatalf("fourth exact read = (%v, %v), want terminal block", fourth, err)
+	if err != nil || fourth == nil || fourth.IsError {
+		t.Fatalf("fourth exact read = (%v, %v), want dispatched success", fourth, err)
 	}
-	requireLocalizationTerminalReplay(t, fourth, "read", "source")
-	if calls != 3 {
-		t.Fatalf("legacy source calls = %d, want 3", calls)
+	fourthBody, ok := singleTextContent(fourth)
+	if !ok || fourthBody != "source" {
+		t.Fatalf("fourth exact read payload = %q, want dispatched legacy result", fourthBody)
+	}
+	if calls != 4 {
+		t.Fatalf("legacy source calls = %d, want 4", calls)
 	}
 }
 
@@ -1038,7 +1068,7 @@ func TestHandleFacadeLocalizeBlocksParaphrasesWithoutBoundary(t *testing.T) {
 		calls++
 		return mcpgo.NewToolResultText("unexpected"), nil
 	})
-	server := &Server{facades: registry, localization: newLocalizationTerminalState(), sessions: newSessionMap()}
+	server := newStrictLocalizationFacadeTestServer(registry)
 	ctx := WithSessionID(context.Background(), "repeat-localize")
 	terminal := server.localizationFor(ctx)
 	terminal.armForTask(newLocalizationCompletion(true, ""), "Locate Run Handler")

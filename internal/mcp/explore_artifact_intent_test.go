@@ -3,6 +3,7 @@ package mcp
 import (
 	"context"
 	"fmt"
+	"path/filepath"
 	"strings"
 	"testing"
 	"unicode/utf8"
@@ -41,11 +42,74 @@ func TestClassifyExploreArtifactIntentUsesIndependentSignals(t *testing.T) {
 	if !got.active || got.explicitCount != 0 || !got.semantic {
 		t.Fatalf("intent=%#v", got)
 	}
-	if len(got.probes) != exploreArtifactProbeLimit || got.probes[0] != "CollectCoverage" || got.probes[1] != "COVERAGE_FORMAT" {
+	if len(got.probes) != exploreArtifactProbeLimit || !containsFold(got.probes, "CollectCoverage") || !containsFold(got.probes, "COVERAGE_FORMAT") {
 		t.Fatalf("probes=%q", got.probes)
 	}
 	if len(got.paths) == 0 { // semantic filename channel (ci/coverage)
 		t.Fatal("semantic artifact terms must seed the independent path channel")
+	}
+}
+
+func TestClassifyExploreArtifactIntentRanksDistinctiveBuildSignals(t *testing.T) {
+	t.Parallel()
+	task := "LOCALIZE ONLY: testconfig.json settings differ across Pipelines and CI coverage. MTP is enabled, TF_BUILD is true, and /p:EmitCompilerGeneratedFiles=true."
+	got := classifyExploreArtifactIntent(task)
+	if !got.active || !containsFold(got.paths, "pipeline") || !containsFold(got.paths, "build") {
+		t.Fatalf("intent=%#v", got)
+	}
+	if len(got.probes) != exploreArtifactProbeLimit || got.probes[0] != "EmitCompilerGeneratedFiles" || got.probes[1] != "TF_BUILD" {
+		t.Fatalf("distinctive probes lost to directive words: %q", got.probes)
+	}
+}
+
+func TestRankExploreArtifactHitsPreservesIndependentRootLeads(t *testing.T) {
+	t.Parallel()
+	intent := classifyExploreArtifactIntent("testconfig.json differs across Pipelines and CI coverage; TF_BUILD is true and /p:EmitCompilerGeneratedFiles=true")
+	paths := []string{
+		"tests/a/testconfig.json", "tests/b/testconfig.json", "tests/c/testconfig.json",
+		"tests/d/testconfig.json", "tests/e/testconfig.json", "tests/f/testconfig.json",
+		"Directory.Build.props", "azure-pipelines.yml",
+		".flow/checkpoints/fix-build-ci-code-coverage.json",
+		".flow/fix-ci-code-coverage.json",
+	}
+	hits := make([]*exploreArtifactHit, 0, len(paths))
+	for _, path := range paths {
+		hits = append(hits, &exploreArtifactHit{path: path})
+	}
+	ranked := rankExploreArtifactPathHits(hits, intent)
+	for _, hit := range ranked {
+		if hit.path == "Directory.Build.props" {
+			hit.contentHit = true
+			hit.score += 5
+		}
+		if strings.HasPrefix(hit.path, ".flow/") && hit.score > 50 {
+			t.Fatalf("semantic term stuffing accumulated score for %s: %d", hit.path, hit.score)
+		}
+	}
+	selected := selectExploreArtifactResults(ranked, exploreArtifactResultLimit)
+	if !artifactHitsContainPath(selected, "Directory.Build.props") || !artifactHitsContainPath(selected, "azure-pipelines.yml") {
+		t.Fatalf("independent root leads were starved: %#v", selected)
+	}
+	duplicates := 0
+	for _, hit := range selected {
+		if strings.EqualFold(filepath.Base(hit.path), "testconfig.json") {
+			duplicates++
+		}
+	}
+	if duplicates > 2 {
+		t.Fatalf("repeated basename consumed %d result slots", duplicates)
+	}
+}
+
+func TestClassifyExploreArtifactIntentAcceptsStrongArtifactTaskWithIncidentalSourceNouns(t *testing.T) {
+	t.Parallel()
+	task := "Localize bug report “Simplify CI code coverage configuration”. Identify the source/configuration files and precise symbols that would need changing to reduce/centralize the current Microsoft.Testing.Platform (MTP) code coverage settings (DeterministicReport=true, ExcludeAssembliesWithoutSources=None, ModulePaths.Include limiting coverage to Humanizer/Humanizer.Analyzers/Humanizer.SourceGenerators) and Azure Pipelines invocation settings (/p:EmitCompilerGeneratedFiles=true; ReportGenerator sourcedirs=$(Build.SourcesDirectory) and settings:rawMode=false while merging per-test-project Cobertura files). Preserve all user identifiers. Do not fix."
+	got := classifyExploreArtifactIntent(task)
+	if !got.active || !got.semantic || len(got.probes) < 2 {
+		t.Fatalf("strong mixed artifact intent was vetoed: %#v", got)
+	}
+	if !containsFold(got.probes, "DeterministicReport") || !containsFold(got.probes, "ExcludeAssembliesWithoutSources") {
+		t.Fatalf("distinctive artifact probes were not retained: %q", got.probes)
 	}
 }
 
@@ -163,6 +227,47 @@ func TestExploreArtifactFileRecognition(t *testing.T) {
 			t.Errorf("%q recognized as artifact", path)
 		}
 	}
+}
+
+func TestExploreArtifactPathEligibleFiltersImplicitToolMetadata(t *testing.T) {
+	t.Parallel()
+	implicit := classifyExploreArtifactIntent("Simplify CI code coverage configuration using testconfig.json and ReportGenerator")
+	for _, path := range []string{
+		".codex/agents/build-scout.toml",
+		".flow/.checkpoint-fix-ci-code-coverage.json",
+		".gitnexus/cache/coverage.json",
+	} {
+		if exploreArtifactPathEligible(implicit, path) {
+			t.Errorf("implicit tool metadata %q is eligible", path)
+		}
+	}
+	for _, path := range []string{"Directory.Build.props", "azure-pipelines.yml", ".github/workflows/ci.yml"} {
+		if !exploreArtifactPathEligible(implicit, path) {
+			t.Errorf("repository artifact %q was filtered", path)
+		}
+	}
+	explicit := classifyExploreArtifactIntent("Change .codex/agents/build-scout.toml build configuration")
+	if !exploreArtifactPathEligible(explicit, ".codex/agents/build-scout.toml") {
+		t.Fatal("an explicitly named tool configuration must remain eligible")
+	}
+}
+
+func containsFold(values []string, want string) bool {
+	for _, value := range values {
+		if strings.EqualFold(value, want) {
+			return true
+		}
+	}
+	return false
+}
+
+func artifactHitsContainPath(hits []*exploreArtifactHit, want string) bool {
+	for _, hit := range hits {
+		if hit != nil && strings.EqualFold(hit.path, want) {
+			return true
+		}
+	}
+	return false
 }
 
 func queryOptionsForArtifactTest() query.QueryOptions { return query.QueryOptions{} }

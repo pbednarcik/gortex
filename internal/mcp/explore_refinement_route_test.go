@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"reflect"
+	"strings"
 	"testing"
 
 	"github.com/zzet/gortex/internal/graph"
@@ -185,14 +186,18 @@ func TestBuildLocalizationRefinementResultKeepsWireAndStateAuthorizationEqual(t 
 	result, completion, bounded, digest := buildLocalizationRefinementResultForTask(
 		preferred.ID, "find the replace implementation", targets, exploreDefaultBudgetTokens, routes,
 	)
-	if completion.State != localizationStateNeedsRefinement {
-		t.Fatalf("completion state = %q, want %q", completion.State, localizationStateNeedsRefinement)
+	if completion.State != localizationStateAnswerReady {
+		t.Fatalf("completion state = %q, want %q", completion.State, localizationStateAnswerReady)
 	}
-	state := &localizationTerminalState{}
-	state.armRefinementRoutesForTask(
-		"find the replace implementation", completion.refinementSymbol,
-		completion.AllowedSymbols, bounded, digest,
-	)
+	if completion.Enforceable || completion.AllowedToolCalls != 0 {
+		t.Fatalf("packed refinement completion = %#v, want non-enforceable terminal conclusion", completion)
+	}
+	if _, ok := bounded[preferred.ID]; !ok {
+		t.Fatalf("bounded route = %#v, want retained preferred refinement choice", bounded)
+	}
+	if digest == nil {
+		t.Fatal("packed refinement has no digest")
+	}
 	text, ok := singleTextContent(result)
 	if !ok {
 		t.Fatal("localization refinement result has no single text payload")
@@ -201,12 +206,27 @@ func TestBuildLocalizationRefinementResultKeepsWireAndStateAuthorizationEqual(t 
 	if err := json.Unmarshal([]byte(text), &envelope); err != nil {
 		t.Fatalf("decode localization envelope: %v", err)
 	}
-	stateCompletion := state.completionLocked()
-	if !reflect.DeepEqual(envelope.Completion.AllowedSymbols, stateCompletion.AllowedSymbols) {
-		t.Fatalf("wire allowed symbols = %v, state allowed symbols = %v", envelope.Completion.AllowedSymbols, stateCompletion.AllowedSymbols)
+	if envelope.Completion.State != completion.State || envelope.Completion.AllowedToolCalls != completion.AllowedToolCalls {
+		t.Fatalf("wire completion = %#v, returned completion = %#v", envelope.Completion, completion)
+	}
+	if !envelope.Terminal || !strings.HasPrefix(envelope.Completion.FinalResponse, localizationBoundedHeading+"\n") {
+		t.Fatalf("packed refinement envelope = %#v, want terminal bounded-evidence conclusion", envelope)
+	}
+	if len(envelope.Completion.AllowedSymbols) != 0 {
+		t.Fatalf("wire allowed symbols = %v, want none after packed body retires read", envelope.Completion.AllowedSymbols)
 	}
 	if envelope.Completion.refinementSymbol != "" || len(envelope.Completion.refinementRoutes) != 0 {
 		t.Fatalf("wire decoded private routing state: %#v", envelope.Completion)
+	}
+	foundPackedPreferred := false
+	for _, evidence := range envelope.Evidence {
+		if evidence.ID == preferred.ID && strings.TrimSpace(evidence.Source) != "" {
+			foundPackedPreferred = true
+			break
+		}
+	}
+	if !foundPackedPreferred {
+		t.Fatalf("preferred evidence body was not packed: %#v", envelope.Evidence)
 	}
 }
 

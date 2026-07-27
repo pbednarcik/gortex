@@ -269,8 +269,10 @@ func (s *Server) wrapLegacyFacade(name string, raw server.ToolHandlerFunc) serve
 	return func(ctx context.Context, req mcpgo.CallToolRequest) (*mcpgo.CallToolResult, error) {
 		args := req.GetArguments()
 		_, explicitOperation := args["operation"]
-		facadeSession := s.effectiveSessionPolicy(ctx).preset == FacadeSurfaceVersion
-		if !facadeSession && !explicitOperation {
+		policy := s.effectiveSessionPolicy(ctx)
+		facadeSession := policy != nil && isFacadePreset(policy.preset)
+		legacyLocalize := name == "explore" && req.GetBool("localize", false)
+		if !facadeSession && !explicitOperation && !legacyLocalize {
 			return raw(ctx, req)
 		}
 		if name == "analyze" {
@@ -420,6 +422,8 @@ func parseLocalizationNewUserBoundary(facade, operation string, arguments map[st
 func (s *Server) handleFacade(ctx context.Context, facade string, req mcpgo.CallToolRequest) (*mcpgo.CallToolResult, error) {
 	started := time.Now()
 	input, _ := req.Params.Arguments.(map[string]any)
+	// Correlate the response with the host hook so it can attach advisory
+	// final-response context. Receipt strength never grants deny authority.
 	localizationAuthToken := localizationauth.TakeArgument(input)
 	operation := resolveFacadeOperationAlias(facade, normalizeFacadeOperation(req.GetString("operation", "")))
 	if facade == "analyze" {
@@ -438,6 +442,9 @@ func (s *Server) handleFacade(ctx context.Context, facade string, req mcpgo.Call
 		operation = normalizeFacadeReadOperation(operation, req.GetArguments())
 	}
 	terminal := s.localizationFor(ctx)
+	// An explicit localize call owns a bounded evidence transaction in every
+	// profile. The transaction may prescribe one recovery read/search, but an
+	// answer_ready result never becomes a permission gate over later coding.
 	freshLocalizeFlow := facade == "explore" && operation == "localize"
 	newUserTask, invalidBoundary := parseLocalizationNewUserBoundary(facade, operation, req.GetArguments())
 	if invalidBoundary != nil {
@@ -445,12 +452,13 @@ func (s *Server) handleFacade(ctx context.Context, facade string, req mcpgo.Call
 		return invalidBoundary, nil
 	}
 	newUserExploreFlow := facade == "explore" && newUserTask && (operation == "task" || operation == "localize")
+	answerReadyContinuation := terminal.answerReady() && !freshLocalizeFlow
 	// Parse enough of an explicit new-task boundary to validate it, then apply
 	// the cheap terminal gate before operation lookup, shorthand resolution,
 	// overlay construction, and legacy dispatch. Non-navigation facades never
 	// enter this gate.
 	recoveryGeneration := uint64(0)
-	if !newUserExploreFlow {
+	if !newUserExploreFlow && !answerReadyContinuation {
 		var blocked *mcpgo.CallToolResult
 		blocked, recoveryGeneration = terminal.interceptAnswerReady(facade, operation, req.GetArguments())
 		if blocked != nil {
@@ -513,7 +521,7 @@ func (s *Server) handleFacade(ctx context.Context, facade string, req mcpgo.Call
 	// transactional reservation. Task text never implies a boundary. A task
 	// boundary stages inactive navigation so later diagnosis calls are admitted
 	// only after the first explore call succeeds.
-	transactionalExploreFlow := freshLocalizeFlow || newUserExploreFlow
+	transactionalExploreFlow := freshLocalizeFlow
 	localizeReservation := uint64(0)
 	localizeFinished := false
 	if transactionalExploreFlow {
@@ -523,9 +531,6 @@ func (s *Server) handleFacade(ctx context.Context, facade string, req mcpgo.Call
 			s.recordFacadeTelemetry(facade, operation, facadeOutcomeBlocked, time.Since(started))
 			publishLocalizationAuthReceipt(localizationAuthToken, blocked)
 			return blocked, nil
-		}
-		if !freshLocalizeFlow {
-			terminal.keepOpenForTask(req.GetString("task", ""))
 		}
 	}
 	localizationReadReservation := uint64(0)
@@ -539,7 +544,7 @@ func (s *Server) handleFacade(ctx context.Context, facade string, req mcpgo.Call
 			terminal.finishLocalize(localizeReservation, false)
 		}
 	}()
-	if !transactionalExploreFlow {
+	if !transactionalExploreFlow && !answerReadyContinuation {
 		blocked, reservation := terminal.authorizeWithToken(facade, operation, req.GetArguments())
 		if blocked != nil {
 			s.recordFacadeTelemetry(facade, operation, facadeOutcomeBlocked, time.Since(started))
@@ -577,6 +582,11 @@ func (s *Server) handleFacade(ctx context.Context, facade string, req mcpgo.Call
 	if transactionalExploreFlow {
 		terminal.finishLocalize(localizeReservation, succeeded)
 		localizeFinished = true
+	}
+	if newUserExploreFlow && !freshLocalizeFlow && succeeded {
+		// A diagnosis-oriented task is an explicit transition out of any retained
+		// localization transaction. Its later navigation must start from live code.
+		terminal.keepOpenForTask(req.GetString("task", ""))
 	}
 	publishLocalizationAuthReceipt(localizationAuthToken, result)
 	return result, err
@@ -671,15 +681,43 @@ func (s *Server) localizationTextMatchNode(ctx context.Context, match enrichedTe
 		}
 		return nil, ""
 	}
-	path := strings.TrimSpace(match.Path)
+	path := strings.ReplaceAll(strings.TrimSpace(match.Path), "\\", "/")
 	if path == "" {
 		return nil, ""
+	}
+	fileNodes := s.graph.GetFileNodes(path)
+	expectedRepo := ""
+	// Multi-repository text search renders paths as <repo-prefix>/<file>, while
+	// graph file indexes retain the repository-relative path plus RepoPrefix.
+	// Resolve that wire form only when the stripped candidates prove the same
+	// repository identity; never let a coincidental suffix cross repositories.
+	if len(fileNodes) == 0 {
+		repoPrefix := ""
+		for _, candidate := range s.graph.RepoPrefixes() {
+			candidate = strings.TrimSpace(strings.ReplaceAll(candidate, "\\", "/"))
+			if strings.HasPrefix(path, candidate+"/") && len(candidate) > len(repoPrefix) {
+				repoPrefix = candidate
+			}
+		}
+		if repoPrefix != "" {
+			relativePath := strings.TrimPrefix(path, repoPrefix+"/")
+			for _, node := range s.graph.GetFileNodes(relativePath) {
+				if node != nil && strings.EqualFold(strings.TrimSpace(node.RepoPrefix), repoPrefix) {
+					fileNodes = append(fileNodes, node)
+				}
+			}
+			if len(fileNodes) > 0 {
+				path = relativePath
+				expectedRepo = repoPrefix
+			}
+		}
 	}
 	var owner *graph.Node
 	var fileNode *graph.Node
 	ownerSpan := int(^uint(0) >> 1)
-	for _, node := range s.graph.GetFileNodes(path) {
-		if node == nil || !s.nodeInSessionScope(ctx, node) {
+	for _, node := range fileNodes {
+		if node == nil || !s.nodeInSessionScope(ctx, node) ||
+			(expectedRepo != "" && !strings.EqualFold(strings.TrimSpace(node.RepoPrefix), expectedRepo)) {
 			continue
 		}
 		if node.Kind == graph.KindFile {
@@ -708,7 +746,9 @@ func (s *Server) localizationTextMatchNode(ctx context.Context, match enrichedTe
 		return owner, "permitted_search_text_owner"
 	}
 	if fileNode == nil {
-		if node := s.graph.GetNode(path); node != nil && node.Kind == graph.KindFile && s.nodeInSessionScope(ctx, node) {
+		if node := s.graph.GetNode(path); node != nil && node.Kind == graph.KindFile &&
+			s.nodeInSessionScope(ctx, node) &&
+			(expectedRepo == "" || strings.EqualFold(strings.TrimSpace(node.RepoPrefix), expectedRepo)) {
 			fileNode = node
 		}
 	}
@@ -798,6 +838,10 @@ func decorateExhaustedLocalizationReadFailure(
 func inferFacadeOperation(facade string, input map[string]any) string {
 	target, _ := input["target"].(map[string]any)
 	switch facade {
+	case "explore":
+		if localize, _ := input["localize"].(bool); localize {
+			return "localize"
+		}
 	case "read":
 		switch {
 		case facadeSelectorPresent(target["file"]):
@@ -2506,7 +2550,7 @@ func facadeRequestShape(spec facadeOperationSpec, properties map[string]any, req
 // registration still carries a legacy schema.
 func (s *Server) applyFacadeSurface(ctx context.Context, tools []mcpgo.Tool) []mcpgo.Tool {
 	p := s.effectiveSessionPolicy(ctx)
-	if p == nil || p.preset != FacadeSurfaceVersion {
+	if p == nil || !isFacadePreset(p.preset) {
 		out := tools[:0]
 		for _, tool := range tools {
 			if isDedicatedFacadeTool(tool.Name) {
@@ -2521,16 +2565,25 @@ func (s *Server) applyFacadeSurface(ctx context.Context, tools []mcpgo.Tool) []m
 		}
 		return out
 	}
-	byName := make(map[string]mcpgo.Tool, len(facadeToolNames()))
+	byName := make(map[string]mcpgo.Tool, len(facadeToolNames())+2)
 	for _, tool := range tools {
 		if isFacadeToolName(tool.Name) {
 			byName[tool.Name] = s.facadeToolDefinition(tool.Name)
+		} else if p.preset == "localization" && isAlwaysKeptTool(tool.Name) {
+			byName[tool.Name] = tool
 		}
 	}
-	out := make([]mcpgo.Tool, 0, len(facadeToolNames()))
+	out := make([]mcpgo.Tool, 0, len(facadeToolNames())+2)
 	for _, name := range facadeToolNames() {
 		if tool, ok := byName[name]; ok {
 			out = append(out, tool)
+		}
+	}
+	if p.preset == "localization" {
+		for _, name := range []string{"tool_profile", LazyToolsSearchName} {
+			if tool, ok := byName[name]; ok {
+				out = append(out, tool)
+			}
 		}
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].Name < out[j].Name })

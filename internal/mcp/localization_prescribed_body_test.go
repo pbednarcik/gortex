@@ -51,8 +51,11 @@ func TestASingleTargetPrescriptionShipsItsBodyAndReleasesTheRead(t *testing.T) {
 		newLocalizationRefinementCompletion(symbol), task, targets, 1600)
 	envelope := decodeLocalizationEnvelope(t, result)
 
-	if finalized.State != localizationStateLocalized {
-		t.Fatalf("a satisfied single-target prescription still commands its read: %#v", finalized)
+	if finalized.State != localizationStateAnswerReady || finalized.Enforceable {
+		t.Fatalf("a satisfied single-target prescription did not become a bounded conclusion: %#v", finalized)
+	}
+	if !envelope.Terminal || !strings.HasPrefix(finalized.FinalResponse, localizationBoundedHeading+"\n") {
+		t.Fatalf("a released prescription did not publish its bounded-evidence page: %#v", finalized)
 	}
 	if finalized.AllowedToolCalls != 0 || strings.Contains(finalized.Instruction, "read(") {
 		t.Fatalf("a released prescription still asks for a call: %#v", finalized)
@@ -198,5 +201,48 @@ func TestAnUnpackedPrescriptionStillAsksForTheRead(t *testing.T) {
 	_, _, _, finalized := buildLocalizationExploreResultForTaskFinalized(completion, task, targets, 1000)
 	if finalized.State == localizationStateAnswerReady {
 		t.Fatalf("a prescription was retired without its body: %#v", finalized)
+	}
+}
+
+// The server has already ranked and hydrated every refinement candidate. The
+// model should not pay another full turn merely to choose and read the same
+// preferred source. Alternate candidates remain visible as ranked evidence.
+func TestBuildRefinementPacksOnlyThePreferredCandidate(t *testing.T) {
+	const task = "DiskStorage.Load returns an empty path when loading a stored record"
+	symbol, targets := prescribedBodyTargets(
+		`func (d *DiskStorage) Load(path string) ([]byte, error) { return os.ReadFile(path) }`)
+	alternate := targets[1].node.ID
+	routes := map[string]localizationRefinementRoute{
+		symbol:    {},
+		alternate: {},
+	}
+
+	result, finalized, bounded, _ := buildLocalizationRefinementResultForTask(
+		symbol, task, targets, 1600, routes)
+	envelope := decodeLocalizationEnvelope(t, result)
+
+	if finalized.State == localizationStateNeedsRefinement {
+		t.Fatalf("the hydrated preferred refinement still requires a second call: completion=%#v evidence=%#v", finalized, envelope.Evidence)
+	}
+	if finalized.AllowedToolCalls != 0 {
+		t.Fatalf("the one-shot refinement still permits another call: %#v", finalized)
+	}
+	if len(bounded) > 1 {
+		t.Fatalf("more than the preferred route remained authorized: %#v", bounded)
+	}
+	if len(envelope.Evidence) < 2 || envelope.Evidence[1].ID != alternate {
+		t.Fatalf("the alternate candidate disappeared from ranked evidence: %#v", envelope.Evidence)
+	}
+	var preferredBody, alternateBody bool
+	for _, evidence := range envelope.Evidence {
+		switch evidence.ID {
+		case symbol:
+			preferredBody = strings.TrimSpace(evidence.Source) != ""
+		case alternate:
+			alternateBody = strings.TrimSpace(evidence.Source) != ""
+		}
+	}
+	if !preferredBody || alternateBody {
+		t.Fatalf("body packing preferred=%t alternate=%t; want only preferred", preferredBody, alternateBody)
 	}
 }

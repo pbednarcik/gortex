@@ -94,8 +94,9 @@ type localizationRefinementRoute struct {
 }
 
 // localizationTerminalContract is the single wire shape used in visible MCP
-// payloads and authoritative host-only metadata. Hosts must treat _meta as the
-// authority; the visible copy remains useful to agents and legacy harnesses.
+// payloads and authenticated host metadata. The metadata lets a host correlate
+// advisory context with the server response; it is never a permission boundary.
+// The visible copy remains useful to agents and legacy harnesses.
 type localizationTerminalContract struct {
 	Completion localizationCompletion `json:"completion"`
 	Terminal   bool                   `json:"terminal"`
@@ -151,7 +152,7 @@ func newLocalizationPlannedRecoveryCompletion(operation, anchor string) localiza
 // completion.instruction carries the same obligation as one that reads the
 // rendered page. required_action stays "respond" — the terminal gate matches
 // that exact value.
-const localizationAnswerReadyInstruction = "Answer now from completion.final_response, naming the files and symbols you rely on. If its evidence does not fit the request, say so and name what does. Either way, do not call another tool."
+const localizationAnswerReadyInstruction = "Localization is complete: the bounded search examined the supplied anchors, and completion.final_response is the full retained result. For a localization-only request, answer now from completion.final_response using compact FILES, SYMBOLS, and EVIDENCE sections, preserving each PRIMARY tuple once in EVIDENCE order. Do not call another tool just to gain confidence, repeat, or cross-check this localization: PRIMARY rows are the best-supported answer, and SUPPORTING rows are context, not a signal that the search is unfinished. On a broader coding task, this closes only localization; if the user's request includes diagnosis, implementation, or verification, continue normally, and all tools remain available, including editing, building, testing, and verification."
 
 func newLocalizationCompletion(answerReady bool, exactSymbol string) localizationCompletion {
 	if answerReady {
@@ -165,6 +166,48 @@ func newLocalizationCompletion(answerReady bool, exactSymbol string) localizatio
 		}
 	}
 	return newLocalizationExactReadCompletion(exactSymbol, false)
+}
+
+const localizationBoundedConclusionInstruction = "The bounded localization search is exhausted; completion.final_response contains the full retained task-supported result. For a localization-only request, answer now from completion.final_response using compact FILES, SYMBOLS, and EVIDENCE sections, preserving each PRIMARY tuple once in EVIDENCE order. Do not call another tool just to gain confidence, repeat, or cross-check this localization: PRIMARY rows are the best-supported answer, and SUPPORTING rows are context, not a signal that the search is unfinished. On a broader coding task, this closes only localization; if the user's request includes diagnosis, implementation, or verification, continue normally, and all tools remain available, including editing, building, testing, and verification."
+
+const localizationBoundedConclusionDirective = "The bounded localization search is exhausted; this is the full retained result supported by the indexed task evidence. For a localization-only request, answer now using compact FILES, SYMBOLS, and EVIDENCE sections, preserving each PRIMARY tuple once in EVIDENCE order. Do not call another tool just to gain confidence, repeat, or cross-check this localization: PRIMARY rows are the best-supported answer, and SUPPORTING rows are context, not a signal that the search is unfinished. On a broader coding task, this closes only localization; if the user's request includes diagnosis, implementation, or verification, continue normally, and all tools remain available, including editing, building, testing, and verification."
+
+// newLocalizationBoundedConclusionCompletion terminalizes localization
+// navigation without promoting bounded best-effort evidence to a confirmed
+// answer. The digest clone preserves canonical row order and leaves the caller
+// free to continue diagnosis, implementation, and verification.
+func newLocalizationBoundedConclusionCompletion(digest *localizationEvidenceDigest) localizationCompletion {
+	boundedDigest := &localizationEvidenceDigest{}
+	if digest != nil {
+		*boundedDigest = *digest
+	}
+	response := boundedDigest.finalResponse
+	if response == "" {
+		response = renderLocalizationFinalResponse(boundedDigest.Evidence)
+	}
+	response = strings.TrimSpace(response)
+	switch {
+	case strings.HasPrefix(response, localizationAnswerHeading):
+		response = localizationBoundedHeading + strings.TrimPrefix(response, localizationAnswerHeading)
+	case strings.HasPrefix(response, localizationProvisionalHeading):
+		response = localizationBoundedHeading + strings.TrimPrefix(response, localizationProvisionalHeading)
+	case !strings.HasPrefix(response, localizationBoundedHeading):
+		response = localizationBoundedHeading + "\n" + response
+	}
+	for _, directive := range []string{localizationAnswerReadyDirective, localizationProvisionalDirective, localizationBoundedConclusionDirective} {
+		if strings.HasSuffix(response, directive) {
+			response = strings.TrimSpace(strings.TrimSuffix(response, directive))
+		}
+	}
+	response += "\n\n" + localizationBoundedConclusionDirective
+	boundedDigest.finalResponse = response
+	boundedDigest.provisionalResponse = response
+
+	completion := newLocalizationCompletion(true, "")
+	completion.Instruction = localizationBoundedConclusionInstruction
+	completion.FinalResponse = response
+	completion.digest = boundedDigest
+	return localizationCompletionWithDigest(completion, boundedDigest)
 }
 
 // newLocalizationSingleResultCompletion reports that localization has enough
@@ -532,6 +575,18 @@ func (s *localizationTerminalState) completionLocked() localizationCompletion {
 	}
 	completion.digest = s.digest
 	return localizationCompletionWithDigest(completion, s.digest)
+}
+
+// answerReady reports whether the bounded localization transaction has already
+// produced its retained result. Facade dispatch uses this to let later coding
+// navigation execute, while an identical explore.localize request still replays.
+func (s *localizationTerminalState) answerReady() bool {
+	if s == nil {
+		return false
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.state == localizationStateAnswerReady
 }
 
 // interceptAnswerReady is the cheap pre-validation gate used by facade
@@ -1354,8 +1409,8 @@ func localizationTaskFingerprint(task string) string {
 
 // authorize checks a navigation call and reserves the single permitted
 // localization read when applicable. The caller must finish the reservation
-// after invocation so a failed read restores the allowance instead of silently
-// consuming it.
+// after invocation so the state can restore a prescribed refinement failure or
+// terminalize one accepted recovery without silently consuming either event.
 func (s *localizationTerminalState) authorize(facade, operation string, arguments map[string]any) (*mcpgo.CallToolResult, bool) {
 	blocked, token := s.authorizeWithToken(facade, operation, arguments)
 	return blocked, token != 0
@@ -1374,9 +1429,9 @@ func (s *localizationTerminalState) authorizeWithToken(facade, operation string,
 	if s.state == localizationStateInactive {
 		return nil, 0
 	}
-	// answer_ready terminates only localization navigation. Catch those facades
-	// before their handlers can run and return a compact typed instruction;
-	// unrelated work remains dispatchable through the early return above.
+	// The state-level authorizer retains deterministic replay for callers that
+	// explicitly choose bounded localization semantics. Facade dispatch bypasses
+	// this branch for answer_ready coding continuations.
 	if s.state == localizationStateAnswerReady {
 		return localizationTerminalResult(s.completionLocked(), facade, operation), 0
 	}
@@ -1507,18 +1562,20 @@ func (s *localizationTerminalState) finishReservedReadTokenInternal(
 	if capturedResult {
 		mergedDigest = mergeLocalizationEvidenceDigestForTask(s.taskFingerprint, currentEvidence, s.digest)
 	}
+	terminalDigest := mergedDigest
 	if captureRequired && zeroResult {
 		// An explicitly recorded empty typed page is a bounded zero-result, not
-		// evidence that can safely terminalize the session. A synthetic handler
-		// with no capture record keeps the legacy transition contract.
+		// evidence that can confirm localization. Mark it unsuccessful so an
+		// accepted recovery publishes the terminal unconfirmed conclusion. A
+		// synthetic handler with no capture record keeps the legacy contract.
 		success = false
 	}
 	defer func() {
-		if !captureRequired || s.state != localizationStateAnswerReady {
+		if s.state != localizationStateAnswerReady {
 			return
 		}
-		if capturedResult {
-			s.digest = mergedDigest
+		if terminalDigest != nil {
+			s.digest = terminalDigest
 		}
 		// A recorded empty page or handler failure carries no new evidence, but
 		// the retained digest still belongs to this token's generation and task.
@@ -1530,38 +1587,25 @@ func (s *localizationTerminalState) finishReservedReadTokenInternal(
 	case localizationStateRecoveryInFlight:
 		requested := s.inFlightRecoveryAnchor
 		operation := s.inFlightRecoveryOperation
-		plannedRecovery := s.localizationRecoveryPlannedLocked()
 		s.inFlightRecoveryAnchor = ""
 		s.inFlightRecoveryOperation = ""
 		legacyRecovery := !captureRequired || (wireSuccess && !evidenceRecorded) ||
 			(operation == "" && strings.TrimSpace(s.taskFingerprint) == "")
-		confidentRecovery := legacyRecovery || (capturedResult && mergedDigest != nil && len(mergedDigest.Evidence) > 0 &&
-			localizationRecoveryEvidenceAlignedWithLead(s.taskFingerprint, s.taskLead, requested, operation, currentEvidence))
-		if success && confidentRecovery {
-			s.recoveryOperation = ""
-			s.recoveryAnchor = ""
-			s.state = localizationStateAnswerReady
-			s.recoveryRetriesRemaining = 0
-			return s.completionLocked()
-		}
-		if success || (plannedRecovery && zeroResult) {
-			// A successful but structurally weak page is not an accepted recovery.
-			// A planned weak or empty page clears only the plan and returns to the
-			// byte-identical generic recovery contract with its allowance intact.
-			if plannedRecovery {
-				s.recoveryOperation = ""
-				s.recoveryAnchor = ""
+		confirmedRecovery := success && (legacyRecovery ||
+			(capturedResult && mergedDigest != nil && len(mergedDigest.Evidence) > 0 &&
+				localizationRecoveryEvidenceAlignedWithLead(s.taskFingerprint, s.taskLead, requested, operation, currentEvidence)))
+		if !confirmedRecovery {
+			// Authorization accepted this one bounded recovery. Weak, empty, and
+			// failed pages therefore conclude localization from the best retained
+			// evidence instead of reproducing the same needs_recovery contract.
+			if terminalDigest == nil {
+				terminalDigest = s.digest
 			}
-			s.state = localizationStateNeedsRecovery
-			return s.completionLocked()
-		}
-		if s.recoveryRetriesRemaining > 0 {
-			s.recoveryRetriesRemaining--
-			s.state = localizationStateNeedsRecovery
-			return s.completionLocked()
+			terminalDigest = newLocalizationBoundedConclusionCompletion(terminalDigest).digest
 		}
 		s.recoveryOperation = ""
 		s.recoveryAnchor = ""
+		s.recoveryRetriesRemaining = 0
 		s.state = localizationStateAnswerReady
 		return s.completionLocked()
 	case localizationStateExactReadInFlight:

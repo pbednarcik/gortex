@@ -217,7 +217,7 @@ func (q *queryLogger) record(s *Server, ctx context.Context, req mcp.CallToolReq
 	if s != nil {
 		rec.Repo, rec.Project = s.sessionLocality(ctx)
 		rec.Session = SessionIDFromContext(ctx)
-		if p := s.effectiveSessionPolicy(ctx); p != nil && p.preset == FacadeSurfaceVersion && isFacadeToolName(tool) {
+		if p := s.effectiveSessionPolicy(ctx); p != nil && isFacadePreset(p.preset) && isFacadeToolName(tool) {
 			rec.Surface = FacadeSurfaceVersion
 			rec.Facade = tool
 			rec.Operation = normalizeFacadeOperation(stringArg(args, "operation"))

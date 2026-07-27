@@ -50,6 +50,15 @@ func TestLocalizationReceiptSurvivesStrippedClaudeWire(t *testing.T) {
 			}
 			post := localizationPostToolPayload(t, tt.tool, "tool-use", identity, response)
 			output := captureHookStdout(t, func() { runPostToolUse(post) })
+			if !tt.enforceable {
+				if output != "" {
+					t.Fatalf("advisory receipt emitted localization-only context: %s", output)
+				}
+				if hasLocalizationTerminal(identity) {
+					t.Fatal("advisory receipt armed hard terminal state")
+				}
+				return
+			}
 
 			var decoded HookOutput
 			if err := json.Unmarshal([]byte(output), &decoded); err != nil {
@@ -64,16 +73,21 @@ func TestLocalizationReceiptSurvivesStrippedClaudeWire(t *testing.T) {
 				t.Fatalf("additionalContext changed final_response bytes\n got: %q\nwant: %q", gotContext, wantContext)
 			}
 			for _, required := range []string{
-				"Localization for this task is complete",
-				"completion.final_response",
-				"do not call another tool",
+				"bounded localization search completed",
+				"retained result",
+				"PRIMARY file/symbol tuples",
+				"continue with the appropriate tools",
+				"does not block the session",
 			} {
 				if !strings.Contains(gotContext, required) {
 					t.Fatalf("additionalContext %q does not contain %q", gotContext, required)
 				}
 			}
-			if got := hasLocalizationTerminal(identity); got != tt.enforceable {
-				t.Fatalf("hard marker = %v, want %v", got, tt.enforceable)
+			if strings.Contains(gotContext, "call no tool") {
+				t.Fatalf("advisory context retained hard-stop wording: %q", gotContext)
+			}
+			if hasLocalizationTerminal(identity) {
+				t.Fatal("terminal context armed a hard marker")
 			}
 		})
 	}
@@ -100,19 +114,23 @@ func TestLocalizationReceiptMarkerStrengthControlsPreToolUse(t *testing.T) {
 				t.Fatal("server receipt publish failed")
 			}
 			post := localizationPostToolPayload(t, tool, "terminal-tool", identity, strippedToolResponse())
-			if output := captureHookStdout(t, func() { runPostToolUse(post) }); output == "" {
-				t.Fatal("authenticated answer_ready did not emit terminal context")
+			postOutput := captureHookStdout(t, func() { runPostToolUse(post) })
+			if tt.enforceable && postOutput == "" {
+				t.Fatal("enforceable answer_ready did not emit terminal context")
+			}
+			if !tt.enforceable && postOutput != "" {
+				t.Fatalf("advisory answer_ready emitted localization-only context: %s", postOutput)
 			}
 
 			marker, marked := localizationTerminalMarkerFor(identity)
 			if !marked {
 				t.Fatal("authenticated answer_ready did not persist a marker")
 			}
-			if marker.Advisory != !tt.enforceable {
-				t.Fatalf("marker advisory = %v, want %v", marker.Advisory, !tt.enforceable)
+			if !marker.Advisory {
+				t.Fatal("localization receipt created a hard marker")
 			}
-			if got := hasLocalizationTerminal(identity); got != tt.enforceable {
-				t.Fatalf("hard marker = %v, want %v", got, tt.enforceable)
+			if hasLocalizationTerminal(identity) {
+				t.Fatal("localization receipt armed hard terminal state")
 			}
 
 			checks := []struct {
@@ -127,6 +145,8 @@ func TestLocalizationReceiptMarkerStrengthControlsPreToolUse(t *testing.T) {
 			}{
 				{name: "direct navigation", tool: gortexMCPToolPrefix + "read", input: map[string]any{"operation": "source"}, navigation: true},
 				{name: "plugin navigation", tool: gortexPluginMCPToolPrefix + "search", input: map[string]any{"operation": "symbols"}, navigation: true},
+				{name: "direct legacy search", tool: gortexMCPToolPrefix + "search_symbols", input: map[string]any{"query": "Load"}, navigation: true},
+				{name: "plugin legacy read", tool: gortexPluginMCPToolPrefix + "read_file", input: map[string]any{"path": "storage.go"}, navigation: true},
 				{name: "host read", tool: "Read", input: map[string]any{"file_path": "README.md"}, redirected: true},
 				{name: "host grep", tool: "Grep", input: map[string]any{"pattern": "load"}, redirected: true},
 				{name: "host glob", tool: "Glob", input: map[string]any{"pattern": "**/*.go"}, redirected: true},
@@ -144,29 +164,8 @@ func TestLocalizationReceiptMarkerStrengthControlsPreToolUse(t *testing.T) {
 							t.Fatalf("decode PreToolUse output %q: %v", encoded, err)
 						}
 					}
-					wantDenied := tt.enforceable || check.navigation || check.redirected
-					if !wantDenied {
-						if output.HookSpecificOutput != nil && output.HookSpecificOutput.PermissionDecision == "deny" {
-							t.Fatalf("advisory marker denied pass-through tool: %#v", output.HookSpecificOutput)
-						}
-						return
-					}
-					if output.HookSpecificOutput == nil || output.HookSpecificOutput.PermissionDecision != "deny" {
-						t.Fatalf("terminal marker did not deny tool: %#v", output)
-					}
-					wantReason := localizationAdvisoryDenyReason
-					if tt.enforceable {
-						wantReason = localizationTerminalDenyReason
-					}
-					got := output.HookSpecificOutput.PermissionDecisionReason
-					if !strings.HasPrefix(got, wantReason) {
-						t.Fatalf("terminal deny reason = %q, want prefix %q", got, wantReason)
-					}
-					// The refusal hands back the answer, so the caller has
-					// something to act on instead of another tool to try.
-					if answer := strings.TrimSpace(marker.FinalResponse); answer != "" &&
-						!strings.Contains(got, answer) {
-						t.Fatalf("terminal deny reason %q does not carry the retained answer %q", got, answer)
+					if output.HookSpecificOutput != nil && output.HookSpecificOutput.PermissionDecision == "deny" {
+						t.Fatalf("advisory marker denied %s: %#v", check.tool, output.HookSpecificOutput)
 					}
 				})
 			}
@@ -194,27 +193,33 @@ func TestLocalizationTerminalMarkerStrengthIsMonotonic(t *testing.T) {
 	}
 
 	marker, marked := localizationTerminalMarkerFor(identity)
-	if !marked || marker.Advisory || !hasLocalizationTerminal(identity) {
-		t.Fatalf("advisory receipt downgraded hard terminal marker: marker=%#v marked=%v", marker, marked)
+	if !marked || !marker.Advisory || hasLocalizationTerminal(identity) {
+		t.Fatalf("receipt strength escaped advisory-only policy: marker=%#v marked=%v", marker, marked)
 	}
-	raw, err := os.ReadFile(localizationTerminalMarkerPath(identity))
+	raw, err := os.ReadFile(localizationTerminalAdvisoryMarkerPath(identity))
 	if err != nil {
 		t.Fatal(err)
 	}
-	if strings.Contains(string(raw), `"advisory"`) {
-		t.Fatalf("legacy-compatible hard marker unexpectedly encoded advisory field: %s", raw)
+	if !strings.Contains(string(raw), `"advisory":true`) {
+		t.Fatalf("terminal marker did not persist advisory strength: %s", raw)
 	}
-	for _, tool := range []string{"Read", "WebSearch"} {
-		encoded := captureHookStdout(t, func() {
-			runPreToolUse(preToolPayload(t, tool, "", identity, map[string]any{"file_path": "README.md"}), 0, ModeEnrich)
-		})
-		var output HookOutput
-		if err := json.Unmarshal([]byte(encoded), &output); err != nil || output.HookSpecificOutput == nil {
-			t.Fatalf("invalid hard terminal deny for %s: %v\n%s", tool, err, encoded)
+	for _, tool := range []string{"Read", "WebSearch", gortexMCPToolPrefix + "change"} {
+		input := map[string]any{"operation": "impact"}
+		if tool == "Read" {
+			input = map[string]any{"file_path": "README.md"}
 		}
-		if output.HookSpecificOutput.PermissionDecision != "deny" ||
-			!strings.HasPrefix(output.HookSpecificOutput.PermissionDecisionReason, localizationTerminalDenyReason) {
-			t.Fatalf("hard marker did not remain enforceable for %s: %#v", tool, output.HookSpecificOutput)
+		encoded := captureHookStdout(t, func() {
+			runPreToolUse(preToolPayload(t, tool, "", identity, input), 0, ModeEnrich)
+		})
+		if encoded == "" {
+			continue
+		}
+		var output HookOutput
+		if err := json.Unmarshal([]byte(encoded), &output); err != nil {
+			t.Fatalf("invalid PreToolUse output for %s: %v\n%s", tool, err, encoded)
+		}
+		if output.HookSpecificOutput != nil && output.HookSpecificOutput.PermissionDecision == "deny" {
+			t.Fatalf("advisory marker denied %s: %#v", tool, output.HookSpecificOutput)
 		}
 	}
 }
@@ -577,8 +582,11 @@ func TestLocalizationProblemRewriteDirectAndPluginIsIdempotent(t *testing.T) {
 			if err := json.Unmarshal([]byte(terminalOutput), &terminalDecoded); err != nil || terminalDecoded.HookSpecificOutput == nil {
 				t.Fatalf("invalid terminal PreToolUse output: %v\n%s", err, terminalOutput)
 			}
-			if terminalDecoded.HookSpecificOutput.PermissionDecision != "deny" || terminalDecoded.HookSpecificOutput.UpdatedInput != nil {
-				t.Fatalf("terminal deny must precede task rewrite: %#v", terminalDecoded.HookSpecificOutput)
+			if terminalDecoded.HookSpecificOutput.PermissionDecision == "deny" {
+				t.Fatalf("advisory terminal marker blocked task rewrite: %#v", terminalDecoded.HookSpecificOutput)
+			}
+			if got := terminalDecoded.HookSpecificOutput.UpdatedInput["task"]; got != "model paraphrase" {
+				t.Fatalf("advisory terminal marker changed the continuing task: %#v", terminalDecoded.HookSpecificOutput)
 			}
 		})
 	}
@@ -814,15 +822,24 @@ func TestSessionStartNamesMountedExploreAndPreservesCompleteTask(t *testing.T) {
 		"preserves the recovery allowance",
 		"the rejected request does not count as the accepted recovery",
 		"Do not call host Read, Grep, Glob, or Bash",
-		"intentionally not executed and replays the same retained terminal payload",
-		"not stale or canned output or an integration failure",
+		"bounded localization is complete and retained",
+		"do not call another tool merely to repeat the same search",
+		"An identical `explore.localize` call replays the retained terminal payload",
+		"Ordinary Gortex tools remain live",
+		"for contradictory evidence or a diagnosis/change workflow",
 	} {
 		if !strings.Contains(briefing, required) {
 			t.Fatalf("SessionStart rule is missing %q:\n%s", required, briefing)
 		}
 	}
-	if strings.Contains(briefing, "call `explore(operation") {
-		t.Fatalf("SessionStart still suggests a bare explore call:\n%s", briefing)
+	for _, forbidden := range []string{
+		"call `explore(operation",
+		"Any later Gortex navigation call for that same task is intentionally not executed",
+		"not stale or canned output or an integration failure",
+	} {
+		if strings.Contains(briefing, forbidden) {
+			t.Fatalf("SessionStart still suggests blocked ordinary navigation %q:\n%s", forbidden, briefing)
+		}
 	}
 }
 

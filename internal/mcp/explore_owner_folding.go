@@ -271,7 +271,8 @@ func exploreFoldedTargetMandatory(target exploreTarget, reserved map[string]stru
 		return true
 	}
 	return target.sourceLiteral || target.sourceLiteralCallee || target.exactContent ||
-		target.conceptImplementation || target.typedAnchorProjection ||
+		target.causalChangeBridge || target.causalChangeLeaf || target.causalChangeOwner ||
+		target.conceptImplementation || target.conceptComplement || target.syntacticAnchor || target.typedAnchorProjection ||
 		target.divergentDefaultOwner || target.divergentDefaultType
 }
 
