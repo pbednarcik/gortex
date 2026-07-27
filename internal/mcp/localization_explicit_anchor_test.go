@@ -78,6 +78,34 @@ func TestPromoteExploreSourceRangeCandidatesMapsToEnclosingMethod(t *testing.T) 
 	}
 }
 
+func TestPromoteExploreSourceRangeCandidatesStripsIsolatedRepoLabel(t *testing.T) {
+	server, store := setupNavServer(t)
+	start := store.GetNode(navFindMethod(t, store, "Start"))
+	stop := store.GetNode(navFindMethod(t, store, "Stop"))
+	task := fmt.Sprintf("monolog/svc.go\nLines %d to %d", start.StartLine, start.EndLine)
+	ordinary := []*rerank.Candidate{{Node: stop, TextRank: 0, VectorRank: -1}}
+	got := server.promoteExploreSourceRangeCandidates(context.Background(), task, ordinary, query.QueryOptions{})
+	if len(got) != 2 || got[0].Node.ID != start.ID || got[1].Node.ID != stop.ID {
+		t.Fatalf("promoted candidates = %#v, want repo-prefixed citation to resolve indexed svc.go", got)
+	}
+}
+
+func TestExploreSourceRangeIndexRejectsAmbiguousSuffixes(t *testing.T) {
+	exact := &fileSymbolIndex{}
+	first := &fileSymbolIndex{}
+	second := &fileSymbolIndex{}
+	aliases := []string{"repo/pkg/svc.go", "pkg/svc.go", "svc.go"}
+	if got := exploreSourceRangeIndex(map[string]*fileSymbolIndex{aliases[0]: exact, aliases[1]: first, aliases[2]: second}, aliases); got != exact {
+		t.Fatalf("exact index = %p, want %p", got, exact)
+	}
+	if got := exploreSourceRangeIndex(map[string]*fileSymbolIndex{aliases[1]: first, aliases[2]: second}, aliases); got != nil {
+		t.Fatalf("ambiguous suffix index = %p, want nil", got)
+	}
+	if got := exploreSourceRangeIndex(map[string]*fileSymbolIndex{aliases[1]: first}, aliases); got != first {
+		t.Fatalf("unique suffix index = %p, want %p", got, first)
+	}
+}
+
 func TestExploreLocalizationTestLaneCandidateKeepsCitedTestRange(t *testing.T) {
 	node := &graph.Node{
 		ID: "tests/HandlerTest.php::testPassthruOnClose", Name: "testPassthruOnClose",

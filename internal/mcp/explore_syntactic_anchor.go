@@ -214,6 +214,7 @@ const (
 	exploreSourceRangeMaxAnchors  = 4
 	exploreSourceRangeContextSize = 320
 	exploreSourceRangeMaxSpan     = 512
+	exploreSourceRangeMaxAliases  = 4
 )
 
 var (
@@ -336,6 +337,53 @@ func exploreSourceRangeDefinitions(index *fileSymbolIndex, start, end int) []*gr
 	return out
 }
 
+// exploreSourceRangeGraphPathAliases returns a bounded exact-to-suffix lookup
+// order. Benchmark and issue text often prefixes paths with an isolated repo
+// label (for example monolog/src/... while a lone repo indexes src/...). The
+// exact path always wins; suffixes are only fallback lookup keys.
+func exploreSourceRangeGraphPathAliases(graphPath string) []string {
+	clean := filepath.ToSlash(filepath.Clean(graphPath))
+	if clean == "." || clean == "/" || clean == "" {
+		return nil
+	}
+	clean = strings.TrimPrefix(clean, "./")
+	out := make([]string, 0, exploreSourceRangeMaxAliases)
+	for len(out) < exploreSourceRangeMaxAliases && clean != "" {
+		out = append(out, clean)
+		slash := strings.IndexByte(clean, '/')
+		if slash < 0 || slash+1 >= len(clean) {
+			break
+		}
+		clean = clean[slash+1:]
+	}
+	return out
+}
+
+// exploreSourceRangeIndex chooses the exact indexed path when present. If it is
+// absent, exactly one suffix alias may resolve; multiple suffix hits are
+// deliberately rejected so an explicit citation never promotes an ambiguous
+// same-named file.
+func exploreSourceRangeIndex(indexes map[string]*fileSymbolIndex, aliases []string) *fileSymbolIndex {
+	if len(aliases) == 0 {
+		return nil
+	}
+	if exact := indexes[aliases[0]]; exact != nil {
+		return exact
+	}
+	var resolved *fileSymbolIndex
+	for _, alias := range aliases[1:] {
+		index := indexes[alias]
+		if index == nil {
+			continue
+		}
+		if resolved != nil && resolved != index {
+			return nil
+		}
+		resolved = index
+	}
+	return resolved
+}
+
 // promoteExploreSourceRangeCandidates puts task-cited declarations ahead of
 // semantic neighbours without reranking the completed search. Existing
 // candidates retain their scores; missing exact declarations are admitted with
@@ -352,22 +400,27 @@ func (s *Server) promoteExploreSourceRangeCandidates(
 		return ordinary
 	}
 	type resolvedRange struct {
-		spec      rangeSpec
-		graphPath string
+		spec       rangeSpec
+		graphPaths []string
 	}
 	resolved := make([]resolvedRange, 0, len(specs))
-	orderedPaths := make([]string, 0, len(specs))
-	seenPaths := make(map[string]struct{}, len(specs))
+	orderedPaths := make([]string, 0, len(specs)*exploreSourceRangeMaxAliases)
+	seenPaths := make(map[string]struct{}, len(specs)*exploreSourceRangeMaxAliases)
 	for _, spec := range specs {
 		absPath, relPath, err := s.resolveFilePath(spec.File)
 		if err != nil {
 			continue
 		}
-		graphPath := s.resolveOverlayGraphPath(relPath, absPath)
-		resolved = append(resolved, resolvedRange{spec: spec, graphPath: graphPath})
-		if _, duplicate := seenPaths[graphPath]; !duplicate {
-			seenPaths[graphPath] = struct{}{}
-			orderedPaths = append(orderedPaths, graphPath)
+		graphPaths := exploreSourceRangeGraphPathAliases(s.resolveOverlayGraphPath(relPath, absPath))
+		if len(graphPaths) == 0 {
+			continue
+		}
+		resolved = append(resolved, resolvedRange{spec: spec, graphPaths: graphPaths})
+		for _, graphPath := range graphPaths {
+			if _, duplicate := seenPaths[graphPath]; !duplicate {
+				seenPaths[graphPath] = struct{}{}
+				orderedPaths = append(orderedPaths, graphPath)
+			}
 		}
 	}
 	if len(resolved) == 0 {
@@ -377,7 +430,8 @@ func (s *Server) promoteExploreSourceRangeCandidates(
 	exactNodes := make([]*graph.Node, 0, len(resolved))
 	seenNodes := make(map[string]struct{}, len(resolved))
 	for _, item := range resolved {
-		for _, node := range exploreSourceRangeDefinitions(indexes[item.graphPath], item.spec.StartLine, item.spec.EndLine) {
+		index := exploreSourceRangeIndex(indexes, item.graphPaths)
+		for _, node := range exploreSourceRangeDefinitions(index, item.spec.StartLine, item.spec.EndLine) {
 			if node == nil || !exploreLocalizableKind(node.Kind) || !scope.ScopeAllows(node) ||
 				!s.nodeInSessionScope(ctx, node) {
 				continue
