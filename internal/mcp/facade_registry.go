@@ -102,18 +102,6 @@ func (r *facadeRegistry) legacy(name string) (capturedFacadeTool, bool) {
 	return tool, ok
 }
 
-func (r *facadeRegistry) legacyNavigation(name string) bool {
-	if r == nil {
-		return false
-	}
-	for _, spec := range r.byLegacy[name] {
-		if localizationNavigationFacade(spec.Facade) {
-			return true
-		}
-	}
-	return false
-}
-
 func (r *facadeRegistry) operations(facade string) []facadeOperationSpec {
 	if r == nil {
 		return nil
