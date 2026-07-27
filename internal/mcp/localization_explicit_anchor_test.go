@@ -78,6 +78,21 @@ func TestPromoteExploreSourceRangeCandidatesMapsToEnclosingMethod(t *testing.T) 
 	}
 }
 
+func TestExploreLocalizationTestLaneCandidateKeepsCitedTestRange(t *testing.T) {
+	node := &graph.Node{
+		ID: "tests/HandlerTest.php::testPassthruOnClose", Name: "testPassthruOnClose",
+		Kind: graph.KindMethod, FilePath: "tests/HandlerTest.php", Meta: map[string]any{"is_test": true},
+	}
+	candidate := &rerank.Candidate{Node: node, Signals: map[string]float64{exploreSourceRangeSignal: 1}}
+	if exploreLocalizationTestLaneCandidate("passthru level failure", candidate) {
+		t.Fatal("explicitly cited test range was demoted")
+	}
+	delete(candidate.Signals, exploreSourceRangeSignal)
+	if !exploreLocalizationTestLaneCandidate("passthru level failure", candidate) {
+		t.Fatal("ordinary test candidate was not demoted")
+	}
+}
+
 func TestExploreSyntacticAnchorsCollapseAssignedAndBareFlags(t *testing.T) {
 	anchors := exploreSyntacticAnchors(`rg panic caused by --replace, --multiline, a particular pattern, and search text containing repeats and newlines. Panic message: "slice index starts at x but ends at y" where x and y are integers and y < x. Reproduction: rg "(^|[^a-z])((([a-z]+)?)\s)?b(\s([a-z]+)?)($|[^a-z])" --replace=x --multiline lines2.txt where lines2.txt contains " b b b b b b b b\nc". Also reproduces with lines5.txt containing " b\nb\nb\nb\nc". Bug is very sensitive to exact pattern and text.`)
 	if len(anchors) != 2 {

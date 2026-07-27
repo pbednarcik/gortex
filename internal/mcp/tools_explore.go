@@ -2776,7 +2776,7 @@ func (s *Server) handleExplore(ctx context.Context, req mcp.CallToolRequest) (*m
 		if c == nil || c.Node == nil || !exploreLocalizableKind(c.Node.Kind) {
 			continue
 		}
-		if exploreLocalizationTestLaneNode(searchQuery, c.Node) || !exploreCodeDefinitionKind(c.Node.Kind) {
+		if exploreLocalizationTestLaneCandidate(searchQuery, c) || !exploreCodeDefinitionKind(c.Node.Kind) {
 			test = append(test, c)
 		} else {
 			prod = append(prod, c)
@@ -5262,6 +5262,16 @@ func exploreQuotedRecallHasExactSourceNode(
 // a `spec/` directory), so the draft detector votes too — unless the request is
 // about test code or names this candidate outright, in which case the test node
 // is the answer and keeps its production slot.
+func exploreLocalizationTestLaneCandidate(query string, candidate *rerank.Candidate) bool {
+	if candidate == nil || candidate.Node == nil {
+		return false
+	}
+	if candidate.Signals[exploreSourceRangeSignal] > 0 {
+		return false
+	}
+	return exploreLocalizationTestLaneNode(query, candidate.Node)
+}
+
 func exploreLocalizationTestLaneNode(query string, node *graph.Node) bool {
 	if node == nil {
 		return false

@@ -210,6 +210,7 @@ func exploreUnquotedCodeTokens(task string) []string {
 }
 
 const (
+	exploreSourceRangeSignal      = "explore_source_range"
 	exploreSourceRangeMaxAnchors  = 4
 	exploreSourceRangeContextSize = 320
 	exploreSourceRangeMaxSpan     = 512
@@ -412,6 +413,7 @@ func (s *Server) promoteExploreSourceRangeCandidates(
 			candidate = &clone
 		}
 		markExploreSyntacticAnchorCandidate(candidate)
+		candidate.Signals[exploreSourceRangeSignal] = 1
 		out = append(out, candidate)
 		promoted[node.ID] = struct{}{}
 	}
