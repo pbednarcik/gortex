@@ -3,6 +3,7 @@ package mcp
 import (
 	"context"
 	"fmt"
+	"strings"
 	"testing"
 
 	"github.com/zzet/gortex/internal/graph"
@@ -52,6 +53,54 @@ Similarly, strip longer messages within HipChatHandler::buildContent().`)
 		}
 	}
 	t.Fatalf("anchors = %#v, qualified member was displaced from bounded issue anchors", anchors)
+}
+
+func TestExploreQualifiedMemberSurvivesLongIssueShaping(t *testing.T) {
+	task := "Title: HipChatHandler: Parameter validation/handling\n" +
+		strings.Repeat("the report explains how an oversized value reaches the remote service without validation and why that behavior is confusing. ", 8) +
+		"Similarly, strip longer messages within HipChatHandler::buildContent()."
+	head := &graph.Node{
+		ID: "src/Monolog/Logger.php::Logger.API", Name: "API",
+		Kind: graph.KindConstant, FilePath: "src/Monolog/Logger.php", StartLine: 87, EndLine: 87,
+	}
+	owner := &graph.Node{
+		ID: "src/Monolog/Handler/HipChatHandler.php::HipChatHandler", Name: "HipChatHandler",
+		Kind: graph.KindType, FilePath: "src/Monolog/Handler/HipChatHandler.php", StartLine: 28, EndLine: 219,
+	}
+	member := &graph.Node{
+		ID: "src/Monolog/Handler/HipChatHandler.php::HipChatHandler.buildContent", Name: "buildContent",
+		Kind: graph.KindMethod, FilePath: "src/Monolog/Handler/HipChatHandler.php", StartLine: 89, EndLine: 101,
+	}
+	targets := []exploreTarget{
+		{node: head, source: "const API = 1;"},
+		{node: owner, source: "class HipChatHandler extends SocketHandler {}", syntacticAnchor: true},
+		{node: member, source: "private function buildContent($record) { return $record['formatted']; }", syntacticAnchor: true},
+	}
+	shaped := shapeExploreQuery(task)
+	if exploreLocalizationExplicitAnchor(shaped, member) {
+		t.Fatal("test setup failed: shaped query unexpectedly retained the late qualified member")
+	}
+	if !exploreTaskQualifiedSyntacticAnchorMatchesNode(task, member) {
+		t.Fatal("untouched task did not preserve the late qualified member")
+	}
+	if got := exploreLocalizationExplicitTarget(task, targets); got != member.ID {
+		t.Fatalf("explicit target = %q, want %q", got, member.ID)
+	}
+	if !exploreAnswerReady(task, targets) {
+		t.Fatal("hydrated exact qualified member did not make localization answer-ready")
+	}
+	draft := exploreAnswerDraft(task, targets)
+	if len(draft) == 0 || draft[0].node == nil || draft[0].node.ID != member.ID || !draft[0].exact {
+		t.Fatalf("draft head = %#v, want exact qualified member", draft)
+	}
+	bodyIDs := explorePreferredFullBodyIDs(task, targets, draft, 2)
+	if len(bodyIDs) == 0 || bodyIDs[0] != exploreDraftNodeKey(member) {
+		t.Fatalf("preferred source bodies = %v, want qualified member first", bodyIDs)
+	}
+	evidence := localizationEvidenceTargetsFromDraft(task, "", targets, draft)
+	if len(evidence) == 0 || evidence[0].node == nil || evidence[0].node.ID != member.ID {
+		t.Fatalf("evidence head = %#v, want qualified member", evidence)
+	}
 }
 
 func TestExploreSyntacticAnchorQualifiedMemberDoesNotReuseOwner(t *testing.T) {

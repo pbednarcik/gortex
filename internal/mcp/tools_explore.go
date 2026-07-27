@@ -478,7 +478,8 @@ func exploreAnswerDraft(task string, targets []exploreTarget) []exploreDraftEntr
 	}
 	makeEntry := func(n *graph.Node, source, evidence string, direct bool, parentRank int) (exploreDraftEntry, int) {
 		overlap, longest := exploreDraftTermOverlap(queryTerms, n)
-		explicitAnchor := exploreLocalizationExplicitAnchor(query, n)
+		explicitAnchor := exploreLocalizationExplicitAnchor(query, n) ||
+			exploreTaskQualifiedSyntacticAnchorMatchesNode(task, n)
 		exact := exploreDraftExactAnchor(query, n) || explicitAnchor
 		// Concept prompts often mention a nearby test helper while asking how the
 		// production path works. Do not let that lexical anchor outrank the
@@ -1267,6 +1268,16 @@ func exploreAnswerReady(task string, targets []exploreTarget) bool {
 		!exploreSyntacticAnchorEvidenceReady(task, targets) && !strongSourceLiteral {
 		return false
 	}
+	if class == rerank.QueryClassConcept {
+		for _, target := range targets {
+			callable := target.node != nil &&
+				(target.node.Kind == graph.KindFunction || target.node.Kind == graph.KindMethod)
+			if callable && strings.TrimSpace(target.source) != "" &&
+				exploreTaskQualifiedSyntacticAnchorMatchesNode(task, target.node) {
+				return true
+			}
+		}
+	}
 
 	// Paths, signatures, and identifier-shaped queries carry explicit anchors.
 	// A shared token is not enough: the ranked head must cover the complete
@@ -1538,6 +1549,13 @@ func exploreLocalizationExplicitAnchor(query string, n *graph.Node) bool {
 // accepted here: it can rank a neighborhood but must not prescribe the one
 // allowed post-localization source read.
 func exploreLocalizationExplicitTarget(task string, targets []exploreTarget) string {
+	// Preserve exact qualified members from the untouched issue before shaping
+	// can truncate a late Owner::member mention out of a long report body.
+	for _, target := range targets {
+		if target.node != nil && exploreTaskQualifiedSyntacticAnchorMatchesNode(task, target.node) {
+			return target.node.ID
+		}
+	}
 	query := shapeExploreQuery(task)
 	if exploreQueryClass(query) == rerank.QueryClassConcept {
 		query = stripLeadingExploreDirective(query)

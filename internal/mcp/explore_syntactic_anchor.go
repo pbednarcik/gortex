@@ -548,6 +548,25 @@ func exploreSyntacticAnchorMatchesNode(anchor exploreSyntacticAnchor, node *grap
 		exploreSyntacticAnchorMatchesPath(anchor, node)
 }
 
+// exploreTaskQualifiedSyntacticAnchorMatchesNode checks the untouched task so a
+// late Owner::member anchor survives long-report query shaping and truncation.
+// Only explicit qualified members use this route; ordinary prose and bare
+// identifiers continue to rely on the shaped query.
+func exploreTaskQualifiedSyntacticAnchorMatchesNode(task string, node *graph.Node) bool {
+	if node == nil || node.Kind == graph.KindType || node.Kind == graph.KindInterface ||
+		utf8.RuneCountInString(task) < shapeMinReportChars || !strings.ContainsAny(task, "\r\n") {
+		return false
+	}
+	for _, anchor := range exploreSyntacticAnchors(task) {
+		if anchor.qualifiedName != "" &&
+			(exploreSyntacticAnchorMatchesIdentifier(anchor, node.ID) ||
+				exploreSyntacticAnchorMatchesIdentifier(anchor, node.QualName)) {
+			return true
+		}
+	}
+	return false
+}
+
 func exploreSyntacticAnchorMatchesPath(anchor exploreSyntacticAnchor, node *graph.Node) bool {
 	if node == nil || !strings.ContainsAny(anchor.source, ".\\/") {
 		return false
