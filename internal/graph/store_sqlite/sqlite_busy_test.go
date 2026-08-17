@@ -760,3 +760,17 @@ func requireReindexedTarget(t *testing.T, store *Store, want string) {
 	require.Len(t, edges, 1)
 	assert.Equal(t, want, edges[0].To)
 }
+
+// TestWriterDSNSpacesWALAutoCheckpoints pins the widened auto-checkpoint
+// spacing on the writer DSN: the SQLite default (1000 pages ≈ 4 MB) forces a
+// checkpoint flush every few MB of a scattered index-write burst. Readers
+// never append to the WAL, so the reader DSN stays untouched.
+func TestWriterDSNSpacesWALAutoCheckpoints(t *testing.T) {
+	dsn := sqliteWriterDSN("x.sqlite")
+	if !strings.Contains(dsn, "_pragma=wal_autocheckpoint(8000)") {
+		t.Fatalf("writer DSN missing wal_autocheckpoint spacing: %s", dsn)
+	}
+	if strings.Contains(sqliteReaderDSN("x.sqlite"), "wal_autocheckpoint") {
+		t.Fatal("reader DSN should not carry wal_autocheckpoint")
+	}
+}

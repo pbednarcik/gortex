@@ -54,11 +54,29 @@ func sqlitePerConnectionPragmas() string {
 	return fmt.Sprintf("%s&_pragma=mmap_size(%d)", sqlitePerConnectionPragmasBase, sqliteMmapBytes())
 }
 
+// sqliteWALAutoCheckpointPages spaces WAL auto-checkpoints at 8k pages
+// (~32 MiB). The SQLite default of 1000 pages (~4 MB) forces a checkpoint —
+// frames copied into the main file plus an mmap-view flush — every few MB of
+// a scattered write burst, so index-write bursts spend a measurable share of
+// their time in flush calls rather than row writes. Wider spacing is NOT
+// free, though: pages resident in a large WAL are served to readers by
+// wal-index probe + pread instead of the main file's mmap, and the deferred
+// frames come due as one big drain — at 100k pages the three-phase seeded
+// bench shows read-back +46% and a 330 ms drain, a net production loss.
+// 8k pages keeps the write-side win (~12%) with flat read-back and
+// negligible drain. journal_size_limit still truncates the WAL after every
+// checkpoint; the indexer checkpoints TRUNCATE at the end of each global
+// batch, at Compact and at Close. Readers never append to the WAL, so only
+// the writer DSN carries the override.
+const sqliteWALAutoCheckpointPages = 8000
+
 func sqliteWriterDSN(path string) string {
 	// IMMEDIATE reserves the single SQLite writer at BEGIN. It avoids the
 	// un-retryable DEFERRED read-to-write promotion/BUSY_SNAPSHOT class.
 	params := sqliteBusyPragma + "&_pragma=journal_mode(WAL)&" +
-		sqlitePerConnectionPragmas() + "&_pragma=journal_size_limit(67108864)&_txlock=immediate"
+		sqlitePerConnectionPragmas() + "&_pragma=journal_size_limit(67108864)" +
+		fmt.Sprintf("&_pragma=wal_autocheckpoint(%d)", sqliteWALAutoCheckpointPages) +
+		"&_txlock=immediate"
 	return sqliteDSN(path, params)
 }
 

@@ -5,8 +5,8 @@ import (
 	"io"
 	"os"
 	"path/filepath"
-	"sort"
 	"testing"
+	"time"
 
 	"github.com/zzet/gortex/internal/graph"
 )
@@ -16,10 +16,15 @@ import (
 // the connection page cache and the sequential target ids insert nearly
 // sorted, so it overstates production throughput ~7x (70k vs ~10k rows/s on a
 // 2.2M-edge store). This one fattens the table with a background corpus of
-// production-length ids first, and binds the conversions to targets scattered
-// across that keyspace, so index maintenance pays the page-cache and
-// tree-depth costs the resolve pass actually sees. The sorted sub-benchmark
-// applies the batch in new-target order to price B-tree locality separately.
+// production-length ids first and binds the conversions to targets scattered
+// across that keyspace, then prices the FULL cost of a WAL auto-checkpoint
+// spacing choice across the three phases production pays: the write burst
+// itself, the read-back of freshly written pages through the read pool (the
+// guard/enrichment/dispatch pattern — pages still resident in a large WAL
+// are served by wal-index probe + pread instead of the main file's mmap),
+// and the end-of-batch TRUNCATE drain (where a deferred checkpoint bill
+// lands). Spacing is set per run via PRAGMA on the writer connection, so the
+// DSN default under test does not bias the sweep.
 
 const (
 	seededBackgroundEdges = 1_000_000
@@ -91,6 +96,32 @@ func copySeededTemplate(b *testing.B, src, dst string) {
 	}
 }
 
+// readBackConversions probes every converted row through the read pool the
+// way the guard and enrichment passes do: one index-only probe of the fresh
+// edges_by_to leaf and one main-table row fetch. While those pages sit in a
+// large WAL they cost a wal-index lookup + pread each instead of an mmap
+// access — the read-side tax of wide checkpoint spacing.
+func readBackConversions(b *testing.B, store *Store, batch []graph.EdgeReindex) {
+	b.Helper()
+	for _, r := range batch {
+		var n int
+		if err := store.db.QueryRow(
+			`SELECT COUNT(*) FROM edges WHERE to_id = ? AND kind = ?`,
+			r.Edge.To, string(r.Edge.Kind)).Scan(&n); err != nil {
+			b.Fatal(err)
+		}
+		if n == 0 {
+			b.Fatalf("converted target %q not found", r.Edge.To)
+		}
+		var conf float64
+		if err := store.db.QueryRow(
+			`SELECT confidence FROM edges WHERE file_path = ? AND line = ?`,
+			r.Edge.FilePath, r.Edge.Line).Scan(&conf); err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
 func BenchmarkReindexEdgesResolvedConversionsSeeded1M(b *testing.B) {
 	dir := b.TempDir()
 	template := filepath.Join(dir, "template.sqlite")
@@ -113,33 +144,46 @@ func BenchmarkReindexEdgesResolvedConversionsSeeded1M(b *testing.B) {
 		})
 	}
 
-	for _, sorted := range []bool{false, true} {
-		name := "unsorted"
-		if sorted {
-			name = "sortedByNewTo"
-		}
-		b.Run(name, func(b *testing.B) {
-			run := append([]graph.EdgeReindex(nil), batch...)
-			if sorted {
-				sort.Slice(run, func(x, y int) bool { return run[x].Edge.To < run[y].Edge.To })
-			}
+	for _, spacing := range []int{1000, 8000, 100000} {
+		b.Run(fmt.Sprintf("ckpt%d", spacing), func(b *testing.B) {
+			var writeTotal, readTotal, drainTotal time.Duration
 			b.ReportAllocs()
 			b.ReportMetric(seededConversionCount, "edges/op")
 			for i := 0; i < b.N; i++ {
 				b.StopTimer()
-				dbPath := filepath.Join(dir, fmt.Sprintf("run-%s-%d.sqlite", name, i))
+				dbPath := filepath.Join(dir, fmt.Sprintf("run-%d-%d.sqlite", spacing, i))
 				copySeededTemplate(b, template, dbPath)
 				store, err := Open(dbPath)
 				if err != nil {
 					b.Fatal(err)
 				}
-				b.StartTimer()
-				stats, err := store.reindexEdgesSetOriented(run)
-				b.StopTimer()
-				if err != nil {
+				if _, err := store.writerDB.Exec(
+					fmt.Sprintf("PRAGMA wal_autocheckpoint = %d", spacing)); err != nil {
 					_ = store.Close()
 					b.Fatal(err)
 				}
+				b.StartTimer()
+
+				phase := time.Now()
+				stats, err := store.reindexEdgesSetOriented(batch)
+				writeTotal += time.Since(phase)
+				if err != nil {
+					b.StopTimer()
+					_ = store.Close()
+					b.Fatal(err)
+				}
+				phase = time.Now()
+				readBackConversions(b, store, batch)
+				readTotal += time.Since(phase)
+				phase = time.Now()
+				if err := store.CheckpointWAL(); err != nil {
+					b.StopTimer()
+					_ = store.Close()
+					b.Fatal(err)
+				}
+				drainTotal += time.Since(phase)
+
+				b.StopTimer()
 				if stats.updatedRows != seededConversionCount || stats.deletedRows != 0 {
 					_ = store.Close()
 					b.Fatalf("unexpected fast-path stats: %+v", stats)
@@ -149,6 +193,10 @@ func BenchmarkReindexEdgesResolvedConversionsSeeded1M(b *testing.B) {
 				}
 				_ = os.Remove(dbPath)
 			}
+			n := float64(b.N)
+			b.ReportMetric(float64(writeTotal.Milliseconds())/n, "write-ms/op")
+			b.ReportMetric(float64(readTotal.Milliseconds())/n, "read-ms/op")
+			b.ReportMetric(float64(drainTotal.Milliseconds())/n, "drain-ms/op")
 		})
 	}
 }
