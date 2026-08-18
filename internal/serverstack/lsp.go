@@ -91,6 +91,33 @@ func RepoLikelyHasPythonIntent(absRoot string) bool {
 	return false
 }
 
+// RepoLikelyHasCSharpIntent reports whether a repo root carries a root-level
+// .NET project marker (a solution or project file), used to decide whether to
+// wire the resolve-time C# helper for a tracked repo. Root-level only, like
+// the TS/Python probes.
+func RepoLikelyHasCSharpIntent(absRoot string) bool {
+	for _, pattern := range []string{"*.sln", "*.slnx", "*.csproj"} {
+		if matches, err := filepath.Glob(filepath.Join(absRoot, pattern)); err == nil && len(matches) > 0 {
+			return true
+		}
+	}
+	return false
+}
+
+// CSharpResolverEnv opts the resolve-time C# LSP helper in. OFF by default —
+// unlike tsserver/pyright, the Roslyn workspace load behind csharp-ls costs
+// minutes and hundreds of MB on a large solution, so repos only pay it when
+// the operator asks for LSP-grade C# resolution ("1" / "true").
+const CSharpResolverEnv = "GORTEX_LSP_RESOLVER_CSHARP"
+
+// csharpResolverHelperEnabled reports whether the resolve-time C# helper may
+// be wired for repos with C# intent.
+func csharpResolverHelperEnabled() bool {
+	// Set-and-not-falsy, mirroring the sibling GORTEX_LSP_RESOLVER's
+	// value vocabulary — "on"/"yes" enable instead of failing silently.
+	return strings.TrimSpace(os.Getenv(CSharpResolverEnv)) != "" && !IsFalsyEnv(CSharpResolverEnv)
+}
+
 // BuildResolverLSPHelper constructs the resolve-time LSP helper for a
 // workspace, choosing the router-cached lazy path (poolSize <= 1, reuses
 // the router's idle reaper) or the fresh-spawn pool path (poolSize > 1,
@@ -144,6 +171,10 @@ func BuildResolverLSPHelperForRepo(router *lsp.Router, absRoot string, poolSize 
 
 	add(preferredSpecName(router.Available, ".ts"), RepoLikelyHasTypeScriptIntent(absRoot))
 	add(preferredSpecName(router.Available, ".py"), RepoLikelyHasPythonIntent(absRoot))
+	// C# is opt-in (CSharpResolverEnv): the Roslyn workspace load behind the
+	// helper is far heavier than the TS/Python servers'.
+	add(preferredSpecName(router.Available, ".cs"),
+		csharpResolverHelperEnabled() && RepoLikelyHasCSharpIntent(absRoot))
 
 	return lsp.NewResolverHelperMux(helpers...), specs
 }

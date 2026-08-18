@@ -1914,6 +1914,29 @@ func (p *Provider) dialOrSpawn(workspaceRoot string) (*Client, error) {
 	if isJdtlsCommand(p.command) {
 		args = jdtlsDataArgs(args, workspaceRoot)
 	}
+	// Pin the workspace's resolved solution (env or lone root .sln/.slnx)
+	// so the loaded workspace is deterministic and matches the targeted
+	// pre-restore — see csharpSolutionArgs. Log the choice and any dropped
+	// env entries: a silently ignored mis-spelling otherwise presents as an
+	// unpinned workspace with no explanation.
+	if isCSharpLSCommand(p.command) {
+		before := len(args)
+		args = csharpSolutionArgs(args, workspaceRoot)
+		if p.logger != nil {
+			choice := csharpSolutionResolution(workspaceRoot)
+			for _, entry := range choice.ignored {
+				p.logger.Warn("lsp: csharp solution env entry ignored",
+					zap.String("entry", entry),
+					zap.String("workspace", workspaceRoot))
+			}
+			if len(args) > before {
+				p.logger.Info("lsp: csharp solution pinned",
+					zap.String("solution", choice.solution),
+					zap.String("source", choice.source),
+					zap.String("workspace", workspaceRoot))
+			}
+		}
+	}
 	return NewClient(p.command, args, p.env, workspaceRoot, p.logger)
 }
 
@@ -2100,7 +2123,10 @@ func (p *Provider) maybeCSharpPreRestore(workspaceRoot string) {
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), csharpRestoreTimeout)
 	defer cancel()
-	cmd := exec.CommandContext(ctx, "dotnet", "restore", "-p:NuGetAudit=false")
+	// Target the same solution the server will load (when one resolves) — a
+	// bare restore fails with MSB1011 in a multi-solution root, leaving the
+	// audit-suppressed assets unwritten. See csharpRestoreArgs.
+	cmd := exec.CommandContext(ctx, "dotnet", csharpRestoreArgs(workspaceRoot)...)
 	platform.ConfigureBackgroundCommand(cmd)
 	cmd.Dir = workspaceRoot
 	cmd.Env = append(os.Environ(), p.env...)
@@ -2116,7 +2142,8 @@ func (p *Provider) maybeCSharpPreRestore(workspaceRoot string) {
 	}
 	if p.logger != nil {
 		p.logger.Info("lsp: csharp pre-restore complete (NuGetAudit suppressed)",
-			zap.String("workspace", workspaceRoot))
+			zap.String("workspace", workspaceRoot),
+			zap.String("solution", csharpSolutionFor(workspaceRoot)))
 	}
 }
 

@@ -362,6 +362,31 @@ func (r *Router) WithIdleTimeout(d time.Duration) *Router {
 	return r
 }
 
+// IdleTTLEnv overrides the router's provider idle timeout — a Go duration
+// ("45m", "2h"); zero or negative disables reaping entirely. Exists because
+// one timeout cannot fit every server class: a Roslyn or jdtls workspace can
+// take longer to load than the default idle window, and a server reaped
+// mid-load never becomes useful — every later pass pays the load again.
+const IdleTTLEnv = "GORTEX_LSP_IDLE_TTL"
+
+// IdleTimeoutFromEnv resolves the router idle timeout: the IdleTTLEnv
+// duration when set and parseable (negative clamps to 0 = never reap),
+// else fallback.
+func IdleTimeoutFromEnv(fallback time.Duration) time.Duration {
+	raw := strings.TrimSpace(os.Getenv(IdleTTLEnv))
+	if raw == "" {
+		return fallback
+	}
+	d, err := time.ParseDuration(raw)
+	if err != nil {
+		return fallback
+	}
+	if d < 0 {
+		return 0
+	}
+	return d
+}
+
 // WithAdditionalWorkspaceFolders sets extra directory roots advertised
 // to every LSP server's initialize request alongside the primary
 // workspace root, enabling cross-package resolution. Builder-style.

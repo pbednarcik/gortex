@@ -377,7 +377,7 @@ func NewSharedServer(cfg SharedServerConfig) (*SharedServer, error) {
 		// one that forgets now fails loudly instead of spawning a language
 		// server in the daemon's launch directory.
 		lspRouter := lsp.NewRouter(cfg.Index, logger).
-			WithIdleTimeout(10 * time.Minute).
+			WithIdleTimeout(lsp.IdleTimeoutFromEnv(10 * time.Minute)).
 			WithReaperInterval(time.Minute).
 			WithMaxAlive(6).
 			WithAdditionalWorkspaceFolders(conf.Semantic.AdditionalWorkspaceFolders).

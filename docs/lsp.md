@@ -168,9 +168,12 @@ The router applies these defaults in `cmd/gortex/server.go` and
 | `WithMaxAlive`    | 6 servers    | LRU eviction kicks in when a seventh distinct server would spawn — the least-recently-used one closes. |
 
 These defaults suit a polyglot workspace where most languages are
-touched only intermittently. Override them by editing the
-`lsp.NewRouter(...).With...` chain in your build if you need a longer
-warm pool or a tighter memory bound.
+touched only intermittently. The idle timeout is overridable at runtime:
+`GORTEX_LSP_IDLE_TTL` accepts a Go duration (`45m`, `2h`); `0` or a
+negative value disables reaping entirely. Useful when a long enrichment
+window should keep a warm server around — a big Roslyn workspace is
+expensive to reload. The reaper interval and max-alive bound are still
+compile-time (`lsp.NewRouter(...).With...`).
 
 ### Workspace roots
 
@@ -400,8 +403,10 @@ Gortex applies two complementary, C#-scoped fixes, **both on by default**:
 
 | Env var | Default | Effect |
 | --- | --- | --- |
-| `GORTEX_LSP_CSHARP_RESTORE` | on | Before spawning the C# server, run `dotnet restore -p:NuGetAudit=false` in the workspace so the MSBuild workspace loads every project (root-cause fix). Best-effort: a failure logs and falls through to a normal spawn; skipped on passive IDE attach and when `dotnet` is not on `PATH`. |
+| `GORTEX_LSP_CSHARP_RESTORE` | on | Before spawning the C# server, run `dotnet restore <resolved solution> -p:NuGetAudit=false` in the workspace (falling back to a bare directory restore when no solution resolves) so the MSBuild workspace loads every project (root-cause fix). Best-effort: a failure logs and falls through to a normal spawn; skipped on passive IDE attach and when `dotnet` is not on `PATH`. |
 | `GORTEX_LSP_CSHARP_DIAG_FILTER` | on | Strip diagnostics whose code is the `NU####` NuGet family from `publishDiagnostics` before storing / fanning out (symptom fix). Deliberately narrow — real `CS####` compiler diagnostics always pass through. |
+| `GORTEX_LSP_CSHARP_SOLUTION` | unset | Solution csharp-ls loads and the pre-restore targets — a PATH-style list of `.sln`/`.slnx` paths (relative to a workspace root, or absolute inside one); each tracked root uses the first entry that resolves inside it, so one daemon-global value serves a multi-repo daemon. Unset auto-detects a lone root-level solution; a falsy value (`0` / `off` / `false` / `no` / `none`) disables injection and auto-detect, leaving csharp-ls's own recursive discovery untouched. The resolved pin and any ignored entries are logged at spawn. |
+| `GORTEX_LSP_RESOLVER_CSHARP` | off | Opt-in: add csharp-ls to the resolve-time LSP helper for repos with C# intent (root-level `.sln`/`.slnx`/`.csproj`). Any set, non-falsy value enables (`1` / `true` / `on` / `yes`); off by default because a Roslyn workspace load costs real memory and startup time. |
 
 Set either to a falsey value (`0` / `off` / `false` / `none`) to disable it —
 e.g. `GORTEX_LSP_CSHARP_RESTORE=0` for offline / air-gapped indexing or to
@@ -440,8 +445,8 @@ for repositories you trust.
   the one workspace — the spec stays available for every other tracked
   repo.
 - **Server keeps restarting:** the idle reaper closed it, then the
-  next request re-spawned. Increase `WithIdleTimeout` if this hurts
-  warm-cache benchmarks.
+  next request re-spawned. Raise `GORTEX_LSP_IDLE_TTL` (Go duration;
+  `0` disables reaping) if this hurts warm-cache benchmarks.
 - **High memory under polyglot load:** lower `WithMaxAlive` from 6 to
   3-4. The LRU evicts the least-recent server transparently.
 
