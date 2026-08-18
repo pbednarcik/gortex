@@ -98,6 +98,55 @@ func csharpMethodTypeParamCount(c *graph.Node) int {
 	return n
 }
 
+// csharpNarrowMethodByApplicability filters a same-name ORDINARY C#
+// candidate set (instance/static methods, not extensions) to the members
+// the call site could invoke. Same shape as csharpNarrowByApplicability,
+// with ordinary-arity semantics in the arg-count half — see
+// csharpMethodAcceptsArgCount (#559).
+func csharpNarrowMethodByApplicability(e *graph.Edge, cands []*graph.Node) []*graph.Node {
+	if len(cands) < 2 || e == nil || e.Meta == nil {
+		return cands
+	}
+	out := csharpKeepIf(cands, func(c *graph.Node) bool {
+		return csharpAcceptsTypeArgCount(e, c)
+	})
+	return csharpKeepIf(out, func(c *graph.Node) bool {
+		return csharpMethodAcceptsArgCount(e, c)
+	})
+}
+
+// csharpMethodAcceptsArgCount reports whether an ordinary C# method can
+// accept the call's argument count — the [required, declared] window,
+// widened by a trailing `params` array.
+//
+// Two deliberate differences from csharpExtensionAcceptsArgCount: there
+// is no `this` slot to discount, and param_count == 0 is a REAL arity —
+// an extension method always declares its `this` parameter, so only
+// there does zero mean "no evidence".
+func csharpMethodAcceptsArgCount(e *graph.Edge, c *graph.Node) bool {
+	argc, ok := metaIntValue(e.Meta["arg_count"])
+	if !ok || c == nil || c.Meta == nil {
+		return true
+	}
+	if isCSharpExtension(c) {
+		// Extensions are adjudicated by their own binder with the
+		// `this`-slot discount; the ordinary window would misread them.
+		return true
+	}
+	count, ok := metaIntValue(c.Meta["param_count"])
+	if !ok {
+		return true // no stamp — an older graph or an unexposed parameter list
+	}
+	required := count
+	if r, rok := metaIntValue(c.Meta["param_required"]); rok {
+		required = r
+	}
+	if variadic, _ := c.Meta["param_variadic"].(bool); variadic {
+		return argc >= required
+	}
+	return argc >= required && argc <= count
+}
+
 // csharpExtensionAcceptsArgCount reports whether a candidate extension
 // method can accept the call's argument count.
 //

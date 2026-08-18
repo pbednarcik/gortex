@@ -3653,6 +3653,13 @@ func (r *Resolver) resolveFunctionCall(e *graph.Edge, funcName string, stats *Re
 		}
 	}
 
+	// #559: receiverless C# calls carry arg_count too — narrow the
+	// ordinary-overload set before the same-file pick and the locality
+	// cascade below. Runs after the extension routing above on purpose:
+	// extension candidates are adjudicated by their own binder and are
+	// exempt from the ordinary window.
+	candidates = csharpNarrowMethodByApplicability(e, candidates)
+
 	// File-local candidates outrank everything below: a symbol defined in
 	// the caller's own file is strictly more local than a same-directory
 	// neighbour in every language (in Go both are package scope, so the
@@ -4058,6 +4065,15 @@ func (r *Resolver) resolveMethodCall(e *graph.Edge, methodName string, stats *Re
 	// guess. The filter is conservative — when the index is missing or
 	// would empty the list, the original candidates pass through.
 	candidates := r.filterByReachability(e.FilePath, rawCandidates)
+
+	// #559: consult applicability before any pick. C# call edges carry
+	// arg_count / type_arg_count and candidates carry parameter stamps,
+	// so narrowing here lets every tier below — the exact-type passes
+	// and the fallbacks alike — see only overloads the call site could
+	// invoke. Edges without the stamps (every other language) pass
+	// through untouched, and a filter that would empty a set keeps it.
+	rawCandidates = csharpNarrowMethodByApplicability(e, rawCandidates)
+	candidates = csharpNarrowMethodByApplicability(e, candidates)
 
 	// Per-language scope rule lands binding when its evidence is
 	// strong (C static / C++ namespace + ADL / Java enclosing class /
