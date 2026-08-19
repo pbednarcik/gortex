@@ -21,6 +21,10 @@ type Config struct {
 	// each spawned LSP provider via the router's WithEnrichSweepMode. The
 	// GORTEX_LSP_SWEEP env override wins over it at enrichment time.
 	LSPSweep string `mapstructure:"lsp_sweep" yaml:"lsp_sweep,omitempty"`
+	// LSPMaxParallel mirrors config.SemanticConfig.LSPMaxParallel — the
+	// concurrent-request cap for spawned LSP servers. Zero keeps each
+	// spec's own default; GORTEX_LSP_MAX_PARALLEL wins over both.
+	LSPMaxParallel int `mapstructure:"lsp_max_parallel" yaml:"lsp_max_parallel,omitempty"`
 	// EagerLSP runs the subprocess LSP servers during the synchronous
 	// enrichment pass. Default false: LSP is the slowest part of a cold index
 	// (a full gopls/tsserver/rust-analyzer/pyright sweep can run for minutes to

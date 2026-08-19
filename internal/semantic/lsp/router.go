@@ -119,6 +119,12 @@ type Router struct {
 	// env override wins over it at enrichment time.
 	enrichSweepMode string
 
+	// enrichMaxParallel is the operator-configured concurrent-request cap
+	// (`semantic.lsp_max_parallel`), propagated to every spawned provider.
+	// Zero keeps each spec's own default; the GORTEX_LSP_MAX_PARALLEL env
+	// override wins over both.
+	enrichMaxParallel int
+
 	mu        sync.Mutex
 	providers map[providerKey]*routedProvider // (spec.Name, workspace) → cached provider
 	enabled   map[string]*ServerSpec          // spec.Name → spec marked enabled by config (no spawn until For/ForSpec)
@@ -412,6 +418,15 @@ func (r *Router) WithEnrichSweepMode(mode string) *Router {
 	return r
 }
 
+// WithEnrichMaxParallel sets the operator-configured concurrent-request
+// cap propagated to every spawned provider. Zero keeps each spec's own
+// default; the GORTEX_LSP_MAX_PARALLEL env override still wins over
+// whatever is set here. Builder-style.
+func (r *Router) WithEnrichMaxParallel(n int) *Router {
+	r.enrichMaxParallel = n
+	return r
+}
+
 // WithReaperInterval starts a background reaper that calls Reap() at
 // the given cadence. Idempotent — calling twice replaces the previous
 // reaper. A zero duration disables reaping.
@@ -581,6 +596,7 @@ func (r *Router) forSpecWorkspace(spec *ServerSpec, workspace string, pin bool) 
 	p.workspaceFolders = r.additionalWorkspaceFolders
 	p.excludeGlobs = r.enrichExcludeGlobs
 	p.sweepMode = r.enrichSweepMode
+	p.maxParallel = resolveMaxParallel(r.enrichMaxParallel, spec.MaxParallel)
 	// ruby-lsp (and any spec opting in) runs a `bundle install` for a composed
 	// bundle on spawn unless BUNDLE_GEMFILE is set; point it at the workspace's
 	// own Gemfile when present so enrichment skips that install.
