@@ -47,6 +47,12 @@ type Provider struct {
 	// router from config when the provider is spawned. An empty value means
 	// the demand-gated default; the GORTEX_LSP_SWEEP env override wins over it.
 	sweepMode string
+	// opensDocs reports whether the enrichment pass sends the
+	// textDocument/didOpen / didClose lifecycle before querying a file.
+	// Resolved at construction from OpenDocsEnv and the spec's NoDidOpen;
+	// true for every server that has not opted out. See ServerSpec.NoDidOpen
+	// for why a barrier-scheduling server wants this off.
+	opensDocs bool
 	// spec is the ServerSpec this provider was built from (when the
 	// caller used NewProviderFromSpec). nil for legacy NewProvider
 	// invocations — those fall back to single-language routing.
@@ -207,6 +213,7 @@ func NewProvider(command string, args []string, languages []string, daemon bool,
 		languages:        languages,
 		daemon:           daemon,
 		maxParallel:      maxParallel,
+		opensDocs:        resolveOpensDocs(nil),
 		logger:           logger,
 		docVersions:      map[string]int{},
 		openDocs:         map[string]bool{},
@@ -272,6 +279,7 @@ func NewProviderFromSpec(spec *ServerSpec, logger *zap.Logger) *Provider {
 		languages:          spec.Languages,
 		daemon:             spec.Daemon,
 		maxParallel:        maxParallel,
+		opensDocs:          resolveOpensDocs(spec),
 		logger:             logger,
 		spec:               spec,
 		docVersions:        map[string]int{},

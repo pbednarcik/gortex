@@ -112,3 +112,28 @@ func sweepFile(mode string, demand int, dispatch bool) bool {
 		return demand > 0 || dispatch
 	}
 }
+
+// OpenDocsEnv is the environment variable that overrides whether the
+// enrichment pass sends the textDocument/didOpen / didClose document
+// lifecycle before querying a file. "1" / "true" forces the lifecycle on
+// even for a server whose spec opts out; "0" / "false" skips it for every
+// server. Empty falls through to the spec's NoDidOpen.
+const OpenDocsEnv = "GORTEX_LSP_OPEN_DOCS"
+
+// resolveOpensDocs reports whether the enrichment pass should send the
+// didOpen / didClose lifecycle for this server, by precedence: the
+// GORTEX_LSP_OPEN_DOCS env override wins over the spec's NoDidOpen, which
+// wins over the open-by-default fallback. An unrecognised env value is
+// ignored (falls through) rather than failing the pass.
+func resolveOpensDocs(spec *ServerSpec) bool {
+	switch strings.ToLower(strings.TrimSpace(os.Getenv(OpenDocsEnv))) {
+	case "1", "true":
+		return true
+	case "0", "false":
+		return false
+	}
+	if spec != nil && spec.NoDidOpen {
+		return false
+	}
+	return true
+}

@@ -18,8 +18,8 @@ const (
 	// patterns the gRPC extractor recognises (New<Service>Client), so
 	// the matcher's canonical-name join treats grpc and thrift as one
 	// RPC family when pairing.
-	ContractThrift  ContractType = "thrift"
-	ContractGraphQL ContractType = "graphql"
+	ContractThrift     ContractType = "thrift"
+	ContractGraphQL    ContractType = "graphql"
 	ContractTopic      ContractType = "topic"
 	ContractWS         ContractType = "ws"
 	ContractEnv        ContractType = "env"

@@ -239,6 +239,23 @@ This matters most for `clangd` without a compilation database: every `didOpen`
 triggers a full fallback-preamble + AST rebuild, so reopening the same file
 across phases multiplies that cost.
 
+### Servers that skip the lifecycle entirely
+
+A server whose spec sets `NoDidOpen` answers position requests (hover,
+references, call hierarchy) for files it loaded from its own workspace,
+without any `didOpen` — and for one server family that is worth far more
+than the saved notification. csharp-ls schedules read-only requests
+concurrently but treats every `didOpen` / `didClose` as an exclusive write:
+it waits for all in-flight reads to retire and blocks every read queued
+behind it. A pass that interleaves opens with its queries therefore
+serializes to single-request throughput no matter how many requests it
+keeps in flight — measured on a real C# monorepo as ~8 req/s with the
+lifecycle against ~1,000 req/s without it. With `NoDidOpen` the document
+session degrades to a pure content cache (file bytes still read from disk
+once per file) and the pass sends zero document notifications. The
+`GORTEX_LSP_OPEN_DOCS` env var overrides in both directions: `1` forces
+the lifecycle back on, `0` skips it for every server.
+
 ### Sweep modes
 
 The per-file sweep (phase 5) is gated by a **sweep mode**:

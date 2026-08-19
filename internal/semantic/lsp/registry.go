@@ -102,6 +102,18 @@ type ServerSpec struct {
 	// std-library types the graph never indexes, so its recall lives in
 	// the full sweep rather than in cheaper static confirmation.
 	DefaultSweepMode string
+	// NoDidOpen marks a server that answers position requests (hover,
+	// references, call hierarchy) for files that were never opened with
+	// `textDocument/didOpen`, reading them from its own workspace load
+	// instead. For such a server the enrichment pass skips the didOpen /
+	// didClose document lifecycle entirely. The point is throughput, not
+	// tidiness: a scheduler that runs read-only requests concurrently but
+	// treats document notifications as exclusive writes (csharp-ls) drains
+	// every in-flight read on each didOpen, so a sweep that interleaves
+	// opens with its queries serializes to single-request throughput no
+	// matter how many requests it keeps in flight. The
+	// GORTEX_LSP_OPEN_DOCS env override wins over this flag both ways.
+	NoDidOpen bool
 	// ProjectReady, when non-nil, reports whether a workspace has the
 	// project setup this server needs to resolve anything at all — e.g.
 	// node_modules for tsserver, whose every cross-file / import lookup
@@ -460,6 +472,12 @@ var Servers = []ServerSpec{
 		Priority:    5,
 		Daemon:      true,
 		MaxParallel: 6,
+		// Both Roslyn workspaces answer position requests for files that
+		// were never didOpen'd, and csharp-ls's request scheduler treats
+		// every didOpen / didClose as an exclusive write that drains all
+		// in-flight reads — an enrichment pass that interleaves opens
+		// serializes to single-request throughput. Skip the lifecycle.
+		NoDidOpen: true,
 		// csharp-ls is a Roslyn stdio LSP (`dotnet tool install csharp-ls`)
 		// that speaks plain LSP with no args. Current versions discover
 		// solutions on their own (recursive .sln/.slnx glob, most-projects

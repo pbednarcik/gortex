@@ -63,8 +63,8 @@ func TestStaleLangsDetection(t *testing.T) {
 			t.Errorf("stored pre-params C# version = %v, want [csharp]", got)
 		}
 		for _, path := range []string{"src/Handler.cs", "Views/Page.razor", "Views/Page.cshtml"} {
-			if got := merkleSaltFor(path); got != "csharp@11" {
-				t.Errorf("C# extractor salt for %s = %q, want csharp@11", path, got)
+			if got := merkleSaltFor(path); got != "csharp@12" {
+				t.Errorf("C# extractor salt for %s = %q, want csharp@12", path, got)
 			}
 		}
 		if got := merkleSaltFor("src/Handler.php"); got != "php@2" {

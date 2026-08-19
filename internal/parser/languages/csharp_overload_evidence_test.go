@@ -91,9 +91,14 @@ func TestCSharpExtractor_TypeArgCountAcrossCallShapes(t *testing.T) {
 
 	bare := callEdgesFrom(result.Edges, "App.cs::Runner.Bare", "Helper")
 	require.Len(t, bare, 1, "the receiverless call still emits its edge")
-	assert.NotContains(t, bare[0].Meta, "type_arg_count",
-		"a receiverless call has no extension binder to narrow, so it carries no stamp")
-	assert.NotContains(t, bare[0].Meta, "arg_count")
+	// #559: receiverless calls carry the applicability stamps too — the
+	// resolver's same-file and locality tiers pick among ordinary
+	// overload sets, and without arg_count that pick is declaration
+	// order.
+	assert.Equal(t, 1, bare[0].Meta["type_arg_count"],
+		"a receiverless generic call spells its type argument")
+	assert.Equal(t, 0, bare[0].Meta["arg_count"],
+		"zero arguments is a measured count, not missing evidence")
 }
 
 // The declaration side of the same evidence. `param_required` is stamped

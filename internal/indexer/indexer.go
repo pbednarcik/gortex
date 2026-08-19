@@ -6085,6 +6085,7 @@ func (idx *Indexer) buildPerFileContractExtractors() ([]contracts.Extractor, map
 		&contracts.NestMicroserviceExtractor{},
 		&contracts.EnvVarExtractor{},
 		&contracts.TerraformExtractor{},
+		&contracts.HtmxExtractor{},
 	}
 	// Config-driven event bus: only registered when the user declared
 	// boundaries (index.event_bus / CODEGRAPH_EVENT_CONFIG), so the default
