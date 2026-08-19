@@ -124,6 +124,11 @@ type Router struct {
 	// Zero keeps each spec's own default; the GORTEX_LSP_MAX_PARALLEL env
 	// override wins over both.
 	enrichMaxParallel int
+	// enrichOpenDocs is the configured didOpen-lifecycle override ("on" /
+	// "off"), propagated to every spawned provider. Empty lets each spec's
+	// NoDidOpen decide; the GORTEX_LSP_OPEN_DOCS env override wins over it
+	// at enrichment time.
+	enrichOpenDocs string
 
 	mu        sync.Mutex
 	providers map[providerKey]*routedProvider // (spec.Name, workspace) → cached provider
@@ -427,6 +432,15 @@ func (r *Router) WithEnrichMaxParallel(n int) *Router {
 	return r
 }
 
+// WithEnrichOpenDocs sets the configured didOpen-lifecycle override ("on" /
+// "off") propagated to every spawned provider. An empty value lets each
+// spec's NoDidOpen decide; the GORTEX_LSP_OPEN_DOCS env override still wins
+// over whatever is set here. Builder-style.
+func (r *Router) WithEnrichOpenDocs(v string) *Router {
+	r.enrichOpenDocs = v
+	return r
+}
+
 // WithReaperInterval starts a background reaper that calls Reap() at
 // the given cadence. Idempotent — calling twice replaces the previous
 // reaper. A zero duration disables reaping.
@@ -597,6 +611,7 @@ func (r *Router) forSpecWorkspace(spec *ServerSpec, workspace string, pin bool) 
 	p.excludeGlobs = r.enrichExcludeGlobs
 	p.sweepMode = r.enrichSweepMode
 	p.maxParallel = resolveMaxParallel(r.enrichMaxParallel, spec.MaxParallel)
+	p.opensDocs = resolveOpensDocs(r.enrichOpenDocs, spec)
 	// ruby-lsp (and any spec opting in) runs a `bundle install` for a composed
 	// bundle on spawn unless BUNDLE_GEMFILE is set; point it at the workspace's
 	// own Gemfile when present so enrichment skips that install.

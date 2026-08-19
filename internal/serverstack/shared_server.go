@@ -318,6 +318,7 @@ func NewSharedServer(cfg SharedServerConfig) (*SharedServer, error) {
 			ExcludeGlobs:      conf.Semantic.ExcludeGlobs,
 			LSPSweep:          conf.Semantic.LSPSweep,
 			LSPMaxParallel:    conf.Semantic.LSPMaxParallel,
+			LSPOpenDocs:       conf.Semantic.LSPOpenDocs,
 			EagerLSP:          eagerLSPEnabled(conf.Semantic),
 		}
 		for _, pc := range conf.Semantic.Providers {
@@ -384,7 +385,8 @@ func NewSharedServer(cfg SharedServerConfig) (*SharedServer, error) {
 			WithAdditionalWorkspaceFolders(conf.Semantic.AdditionalWorkspaceFolders).
 			WithEnrichExcludeGlobs(conf.Semantic.ExcludeGlobs).
 			WithEnrichSweepMode(semCfg.LSPSweep).
-			WithEnrichMaxParallel(semCfg.LSPMaxParallel)
+			WithEnrichMaxParallel(semCfg.LSPMaxParallel).
+			WithEnrichOpenDocs(semCfg.LSPOpenDocs)
 		semMgr.SetLSPRouter(lspRouter)
 
 		for _, pc := range semCfg.Providers {

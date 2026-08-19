@@ -241,6 +241,16 @@ type SemanticConfig struct {
 	// machine whose servers multiplex well can raise it without editing
 	// source. The GORTEX_LSP_MAX_PARALLEL env override wins over this.
 	LSPMaxParallel int `mapstructure:"lsp_max_parallel" yaml:"lsp_max_parallel,omitempty"`
+	// LSPOpenDocs overrides whether the LSP enrichment pass sends the
+	// textDocument/didOpen / didClose document lifecycle:
+	//   - "" (DEFAULT): each server spec decides — a Roslyn server that
+	//     answers position requests for never-opened files skips the
+	//     lifecycle (its scheduler treats every didOpen as an exclusive
+	//     write that serializes the pass), everything else keeps it.
+	//   - "on": force the lifecycle for every server (kill switch).
+	//   - "off": skip it for every server (experiment switch).
+	// The GORTEX_LSP_OPEN_DOCS env override wins over this setting.
+	LSPOpenDocs string `mapstructure:"lsp_open_docs" yaml:"lsp_open_docs,omitempty"`
 	// EagerLSP runs the subprocess LSP servers during synchronous enrichment.
 	// Default false: LSP is the slowest part of a cold index and the in-process
 	// tiers (go-types, tree-sitter floor) cover the fast baseline, so LSP is

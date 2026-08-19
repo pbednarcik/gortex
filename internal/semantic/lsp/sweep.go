@@ -120,17 +120,32 @@ func sweepFile(mode string, demand int, dispatch bool) bool {
 // server. Empty falls through to the spec's NoDidOpen.
 const OpenDocsEnv = "GORTEX_LSP_OPEN_DOCS"
 
+// normalizeOpenDocs canonicalises an open-docs override to "on" / "off".
+// An empty or unrecognised value returns "" so the caller falls through to
+// the next precedence source.
+func normalizeOpenDocs(v string) string {
+	switch strings.ToLower(strings.TrimSpace(v)) {
+	case "on", "1", "true":
+		return "on"
+	case "off", "0", "false":
+		return "off"
+	default:
+		return ""
+	}
+}
+
 // resolveOpensDocs reports whether the enrichment pass should send the
 // didOpen / didClose lifecycle for this server, by precedence: the
-// GORTEX_LSP_OPEN_DOCS env override wins over the spec's NoDidOpen, which
-// wins over the open-by-default fallback. An unrecognised env value is
-// ignored (falls through) rather than failing the pass.
-func resolveOpensDocs(spec *ServerSpec) bool {
-	switch strings.ToLower(strings.TrimSpace(os.Getenv(OpenDocsEnv))) {
-	case "1", "true":
-		return true
-	case "0", "false":
-		return false
+// GORTEX_LSP_OPEN_DOCS env override wins over the operator-configured
+// value (`semantic.lsp_open_docs`), which wins over the spec's NoDidOpen,
+// which wins over the open-by-default fallback. An unrecognised value at
+// any level is ignored (falls through) rather than failing the pass.
+func resolveOpensDocs(configured string, spec *ServerSpec) bool {
+	if env := normalizeOpenDocs(os.Getenv(OpenDocsEnv)); env != "" {
+		return env == "on"
+	}
+	if cfg := normalizeOpenDocs(configured); cfg != "" {
+		return cfg == "on"
 	}
 	if spec != nil && spec.NoDidOpen {
 		return false
