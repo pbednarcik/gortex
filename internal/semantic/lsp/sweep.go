@@ -152,3 +152,23 @@ func resolveOpensDocs(configured string, spec *ServerSpec) bool {
 	}
 	return true
 }
+
+// HeavyRequestsEnv is the environment variable that overrides the
+// heavy-request opt-out (ServerSpec.NoHeavyRequests) in both directions:
+// "on" / "1" / "true" restores textDocument/references and
+// callHierarchy/incomingCalls for a server whose spec opts out — the
+// operator runs a build without the FindReferences leak — while "off" /
+// "0" / "false" disables them for every server. Empty falls through to
+// the spec.
+const HeavyRequestsEnv = "GORTEX_LSP_HEAVY"
+
+// resolveNoHeavyRequests reports whether the enrichment pass must skip the
+// heavy request classes for this server: the GORTEX_LSP_HEAVY env override
+// wins over the spec's NoHeavyRequests, which wins over the allow-by-default
+// fallback. Shares the on/off vocabulary of the open-docs override.
+func resolveNoHeavyRequests(spec *ServerSpec) bool {
+	if env := normalizeOpenDocs(os.Getenv(HeavyRequestsEnv)); env != "" {
+		return env == "off"
+	}
+	return spec != nil && spec.NoHeavyRequests
+}

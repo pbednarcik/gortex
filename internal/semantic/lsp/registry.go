@@ -114,6 +114,19 @@ type ServerSpec struct {
 	// matter how many requests it keeps in flight. The
 	// GORTEX_LSP_OPEN_DOCS env override wins over this flag both ways.
 	NoDidOpen bool
+	// NoHeavyRequests marks a server whose FindReferences machinery leaks
+	// memory per request until process exit — csharp-ls holds ~10MB and a
+	// set of OS handles per textDocument/references round trip and ~0.7MB
+	// per callHierarchy/incomingCalls, with nothing released short of a
+	// restart, so a full sweep collapses the server long before it
+	// completes. For such a server the enrichment pass skips both request
+	// classes: ambiguous edges are confirmed through textDocument/definition
+	// at their call sites (a clean position request) and dispatch fan-out
+	// stays with the graph-side interface-dispatch synthesis. The
+	// GORTEX_LSP_HEAVY env override wins over this flag both ways — an
+	// operator running a server build without the leak sets it "on" to
+	// restore the heavy legs.
+	NoHeavyRequests bool
 	// ProjectReady, when non-nil, reports whether a workspace has the
 	// project setup this server needs to resolve anything at all — e.g.
 	// node_modules for tsserver, whose every cross-file / import lookup
@@ -478,6 +491,11 @@ var Servers = []ServerSpec{
 		// in-flight reads — an enrichment pass that interleaves opens
 		// serializes to single-request throughput. Skip the lifecycle.
 		NoDidOpen: true,
+		// csharp-ls leaks per-request on the FindReferences path
+		// (references, incomingCalls) until process exit; confirm through
+		// definition at call sites instead and leave dispatch fan-out to
+		// the interface-dispatch synthesizer.
+		NoHeavyRequests: true,
 		// csharp-ls is a Roslyn stdio LSP (`dotnet tool install csharp-ls`)
 		// that speaks plain LSP with no args. Current versions discover
 		// solutions on their own (recursive .sln/.slnx glob, most-projects
