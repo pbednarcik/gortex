@@ -18,10 +18,12 @@ import (
 // lane, with hooks to observe the drain, block it, and watch its context.
 type mockBackgroundProvider struct {
 	mockProvider
-	hasWork func(repo string) bool // nil = always true
-	drained chan string            // receives repoName when EnrichBackground starts
-	block   chan struct{}          // non-nil: drain blocks until closed or ctx cancelled
-	ctxErr  chan error             // receives ctx.Err() when a blocked drain is cancelled
+	hasWork      func(repo string) bool // nil = always true
+	drained      chan string            // receives repoName when EnrichBackground starts
+	block        chan struct{}          // non-nil: drain blocks until closed or ctx cancelled
+	ctxErr       chan error             // receives ctx.Err() when a blocked drain is cancelled
+	partial      bool                   // drain returns a Partial result
+	panicOnDrain bool
 }
 
 func (m *mockBackgroundProvider) HasBackgroundWork(_ graph.Store, repo string) bool {
@@ -32,6 +34,9 @@ func (m *mockBackgroundProvider) HasBackgroundWork(_ graph.Store, repo string) b
 }
 
 func (m *mockBackgroundProvider) EnrichBackground(ctx context.Context, _ graph.Store, repo, _ string) (*EnrichResult, error) {
+	if m.panicOnDrain {
+		panic("drain exploded")
+	}
 	if m.drained != nil {
 		m.drained <- repo
 	}
@@ -45,7 +50,7 @@ func (m *mockBackgroundProvider) EnrichBackground(ctx context.Context, _ graph.S
 			return nil, ctx.Err()
 		}
 	}
-	return &EnrichResult{Provider: m.name, Language: "go", EdgesConfirmed: 1}, nil
+	return &EnrichResult{Provider: m.name, Language: "go", EdgesConfirmed: 1, Partial: m.partial}, nil
 }
 
 func TestBackgroundScheduler(t *testing.T) {
@@ -202,6 +207,45 @@ func TestBackgroundScheduler(t *testing.T) {
 		assert.Contains(t, fields, "duration_ms")
 		assert.Contains(t, fields, "confirmed")
 		assert.Contains(t, fields, "added")
+	})
+
+	t.Run("PartialDrainLoggedHonestly", func(t *testing.T) {
+		// A cooperatively-cut drain (Partial result, nil error) is progress,
+		// not completion: it must not log "complete", not count as drained,
+		// and not claim lastRepo.
+		core, obs := observer.New(zapcore.InfoLevel)
+		p := newProvider()
+		p.partial = true
+		s := newBackgroundScheduler(zap.New(core))
+		defer s.close()
+		require.True(t, s.enqueue(task(p, "repo-a")))
+		s.start(context.Background(), graph.New())
+		assert.Equal(t, "repo-a", recv(t, p.drained))
+		require.Eventually(t, func() bool {
+			return len(obs.FilterMessage("background enrichment partial").All()) == 1
+		}, 2*time.Second, 5*time.Millisecond)
+		assert.Empty(t, obs.FilterMessage("background enrichment complete").All())
+		st := s.status()
+		assert.Zero(t, st.Drained, "a partial drain is not a completed drain")
+		assert.Empty(t, st.LastRepo)
+	})
+
+	t.Run("PanicInDrainDoesNotKillTheWorker", func(t *testing.T) {
+		core, obs := observer.New(zapcore.InfoLevel)
+		boom := &mockBackgroundProvider{
+			mockProvider: mockProvider{name: "boom", languages: []string{"go"}, available: true},
+			panicOnDrain: true,
+		}
+		p := newProvider()
+		s := newBackgroundScheduler(zap.New(core))
+		defer s.close()
+		require.True(t, s.enqueue(task(boom, "repo-a")))
+		require.True(t, s.enqueue(task(p, "repo-b")))
+		s.start(context.Background(), graph.New())
+		assert.Equal(t, "repo-b", recv(t, p.drained), "the worker survives a panicking drain")
+		require.Eventually(t, func() bool {
+			return len(obs.FilterMessage("background enrichment panicked").All()) == 1
+		}, 2*time.Second, 5*time.Millisecond)
 	})
 
 	t.Run("EnqueueDoesNotRequireOptIn", func(t *testing.T) {

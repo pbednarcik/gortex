@@ -3,8 +3,10 @@ package lsp
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -214,6 +216,115 @@ func TestLSP_Enrich_HeavyDelta_StampsAndSecondPassIdle(t *testing.T) {
 	assert.Zero(t, rig2.prepareCall.Load(), "a drained frontier is not re-prepared")
 	assert.Zero(t, rig2.incoming.Load(), "a drained frontier is not re-drained")
 	assert.Zero(t, rig2.references.Load(), "confirmed edges leave no refs targets")
+}
+
+// A node whose incomingCalls request FAILED is not drained — its incoming
+// edges are still missing — so it must stay unstamped and re-enter the next
+// drain. (Types drain trivially in heavyDelta and stamp immediately.)
+func TestLSP_Enrich_HeavyDelta_FailedIncomingLeavesNodeUnstamped(t *testing.T) {
+	t.Setenv(SweepEnv, "full")
+
+	repoRoot := t.TempDir()
+	require.NoError(t, os.WriteFile(filepath.Join(repoRoot, "a.go"),
+		[]byte("package p\n\nfunc Alpha() {}\n"), 0o644))
+	g := graph.New()
+	g.AddNode(&graph.Node{ID: "a.go::Alpha", Kind: graph.KindFunction, Name: "Alpha",
+		FilePath: "a.go", StartLine: 3, EndLine: 3, Language: "go"})
+
+	server := newInstrumentedServer()
+	var incoming atomic.Int64
+	server.handle("textDocument/hover", func(json.RawMessage) (any, *jsonRPCError) { return nil, nil })
+	server.handle("textDocument/prepareCallHierarchy", func(params json.RawMessage) (any, *jsonRPCError) {
+		var req struct {
+			TextDocument struct {
+				URI string `json:"uri"`
+			} `json:"textDocument"`
+		}
+		_ = json.Unmarshal(params, &req)
+		return []CallHierarchyItem{{
+			Name: "subject", URI: req.TextDocument.URI,
+			SelectionRange: Range{Start: Position{Line: 2, Character: 5}, End: Position{Line: 2, Character: 10}},
+		}}, nil
+	})
+	server.handle("callHierarchy/incomingCalls", func(json.RawMessage) (any, *jsonRPCError) {
+		if incoming.Add(1) == 1 {
+			return nil, &jsonRPCError{Code: -32603, Message: "transient"}
+		}
+		return []CallHierarchyIncomingCall{}, nil
+	})
+
+	p1, cleanup1 := providerWithInstrumentedServer(t, server, []string{"go"}, 1)
+	defer cleanup1()
+	p1.heavyDelta = true
+	p1.caps = ServerCapabilities{CallHierarchyProvider: true, HoverProvider: true}
+	runHeavyDelta(t, p1, g, repoRoot)
+
+	assert.False(t, nodeHeavyStamped(g.GetNode("a.go::Alpha")),
+		"a failed incoming fetch must leave the node undrained")
+
+	p2, cleanup2 := providerWithInstrumentedServer(t, server, []string{"go"}, 1)
+	defer cleanup2()
+	p2.heavyDelta = true
+	p2.caps = ServerCapabilities{CallHierarchyProvider: true, HoverProvider: true}
+	runHeavyDelta(t, p2, g, repoRoot)
+
+	assert.Equal(t, int64(2), incoming.Load(), "the retry drains the node")
+	assert.True(t, nodeHeavyStamped(g.GetNode("a.go::Alpha")), "the successful retry stamps it")
+}
+
+// A drain is confirm-heavy and add-light by nature — the productivity
+// checkpoint's yield floor (tuned for foreground passes with hover/defs
+// yield) must not cut it.
+func TestLSP_Enrich_HeavyDelta_ExemptFromProductivityCheckpoint(t *testing.T) {
+	t.Setenv(SweepEnv, "full")
+	t.Setenv("GORTEX_LSP_PRODUCTIVITY_WINDOW", "50ms")
+
+	repoRoot := t.TempDir()
+	g := graph.New()
+	var src strings.Builder
+	src.WriteString("package p\n\n")
+	const n = 12
+	for i := 0; i < n; i++ {
+		fmt.Fprintf(&src, "func F%d() {}\n", i)
+		g.AddNode(&graph.Node{ID: fmt.Sprintf("a.go::F%d", i), Kind: graph.KindFunction,
+			Name: fmt.Sprintf("F%d", i), FilePath: "a.go", StartLine: 3 + i, EndLine: 3 + i, Language: "go"})
+	}
+	require.NoError(t, os.WriteFile(filepath.Join(repoRoot, "a.go"), []byte(src.String()), 0o644))
+
+	server := newInstrumentedServer()
+	var incoming atomic.Int64
+	server.handle("textDocument/hover", func(json.RawMessage) (any, *jsonRPCError) { return nil, nil })
+	server.handle("textDocument/prepareCallHierarchy", func(params json.RawMessage) (any, *jsonRPCError) {
+		var req struct {
+			TextDocument struct {
+				URI string `json:"uri"`
+			} `json:"textDocument"`
+		}
+		_ = json.Unmarshal(params, &req)
+		return []CallHierarchyItem{{
+			Name: "subject", URI: req.TextDocument.URI,
+			SelectionRange: Range{Start: Position{Line: 2, Character: 5}, End: Position{Line: 2, Character: 6}},
+		}}, nil
+	})
+	server.handle("callHierarchy/incomingCalls", func(json.RawMessage) (any, *jsonRPCError) {
+		// Slow, zero-yield answers spanning several checkpoint windows —
+		// the foreground checkpoint would cut this; the drain must not be.
+		time.Sleep(25 * time.Millisecond)
+		incoming.Add(1)
+		return []CallHierarchyIncomingCall{}, nil
+	})
+
+	p, cleanup := providerWithInstrumentedServer(t, server, []string{"go"}, 1)
+	defer cleanup()
+	p.heavyDelta = true
+	p.caps = ServerCapabilities{CallHierarchyProvider: true, HoverProvider: true}
+	runHeavyDelta(t, p, g, repoRoot)
+
+	assert.Equal(t, int64(n), incoming.Load(),
+		"every node's incoming must be fetched — the checkpoint must not cut the drain")
+	for i := 0; i < n; i++ {
+		assert.True(t, nodeHeavyStamped(g.GetNode(fmt.Sprintf("a.go::F%d", i))), "F%d", i)
+	}
 }
 
 // A cancelled drain keeps per-file progress: completed files' stamps land,

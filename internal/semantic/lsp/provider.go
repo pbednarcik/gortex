@@ -964,7 +964,12 @@ func (p *Provider) EnrichRepoContext(ctx context.Context, g graph.Store, repoPre
 	checkpointCtx, cancelCheckpoint := context.WithCancel(ctx)
 	defer cancelCheckpoint()
 	ctx = checkpointCtx
-	if window := lspProductivityWindow(); window > 0 {
+	// A heavyDelta drain is exempt: it is confirm-heavy and add-light by
+	// nature (incoming hops on an already-confirmed repo can legitimately
+	// yield near zero), its requests are individually bounded, and the
+	// targeted breaker still abandons a genuinely erroring server — the
+	// zombie-pass failure mode the checkpoint exists for.
+	if window := lspProductivityWindow(); window > 0 && !p.heavyDelta {
 		go func() {
 			t := time.NewTicker(window)
 			defer t.Stop()
@@ -1786,6 +1791,9 @@ func (p *Provider) EnrichRepoContext(ctx context.Context, g graph.Store, repoPre
 						continue
 					}
 					col := identifierColumn(content, n.StartLine, n.Name)
+					// drainFailed marks a node whose heavy fetch ERRORED (vs
+					// answered) — heavyDelta must not stamp it as drained.
+					drainFailed := false
 					switch n.Kind {
 					case graph.KindFunction, graph.KindMethod:
 						if !callHierOK {
@@ -1837,12 +1845,20 @@ func (p *Provider) EnrichRepoContext(ctx context.Context, g graph.Store, repoPre
 								for _, ic := range ins {
 									cHops = append(cHops, callHop{n: n, other: ic.From, asOutgoing: false, fromRanges: ic.FromRanges})
 								}
+							} else {
+								// The node's incoming edges are still missing —
+								// a heavyDelta pass must not stamp it drained.
+								drainFailed = true
 							}
 						}
 					case graph.KindType, graph.KindInterface:
-						if !typeHierOK || p.heavyDelta {
-							// heavyDelta: type hierarchy already ran in the
-							// fast tier.
+						if p.heavyDelta {
+							// The drain has no type-hierarchy work (the fast
+							// tier ran it) — fall through to the stamp so
+							// type-only files leave the drain frontier.
+							break
+						}
+						if !typeHierOK {
 							continue
 						}
 						items, err := p.prepareTypeHierarchy(absRoot, ft.rel, line, col)
@@ -1863,13 +1879,14 @@ func (p *Provider) EnrichRepoContext(ctx context.Context, g graph.Store, repoPre
 						}
 					}
 					// A heavyDelta drain stamps the node once its heavy
-					// interrogation completed uncancelled; the stamp rides
-					// this file's flush, so a cut pass keeps exactly the
-					// completed files' progress. Nodes the switch skipped via
-					// continue (mode-skipped incoming, prepare errors) stay
-					// unstamped — they re-enter the frontier at zero request
-					// cost, and the skip decision is re-made from fresh state.
-					if p.heavyDelta && ctx.Err() == nil && !aborted.Load() {
+					// interrogation completed uncancelled AND unerrored; the
+					// stamp rides this file's flush, so a cut pass keeps
+					// exactly the completed files' progress. Nodes the switch
+					// skipped via continue (mode-skipped incoming, prepare
+					// errors) stay unstamped — they re-enter the frontier at
+					// zero request cost, and the skip decision is re-made
+					// from fresh state.
+					if p.heavyDelta && !drainFailed && ctx.Err() == nil && !aborted.Load() {
 						markNodeHeavyStamped(n)
 						fileStamped = append(fileStamped, n)
 					}
