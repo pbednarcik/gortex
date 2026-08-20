@@ -146,6 +146,7 @@ func (s *Server) registerCodingTools() {
 			mcp.WithString("fidelity_globs", mcp.Description(fidelityGlobsParamDescription)),
 			mcp.WithNumber("max_lines", mcp.Description("When the file exceeds this many lines, collapse runs of leaf statements inside function bodies into `… N lines elided …` markers while keeping declarations and the control-flow skeleton. Falls back to a plain head cut for non-code files. Omit or 0 to disable.")),
 			mcp.WithNumber("max_bytes", mcp.Description("Cap the marshaled response at this many bytes; truncation flag rides on the response. Omit for no cap.")),
+			mcp.WithNumber("max_chars", mcp.Description("Cap the returned content at this many encoded bytes, cut at a valid UTF-8 boundary; a truncation note rides on the response. Omit or 0 to disable.")),
 			mcp.WithString("if_none_match", mcp.Description("ETag from a previous response — returns not_modified if content unchanged")),
 		),
 		s.handleReadFile,
