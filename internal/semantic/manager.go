@@ -172,6 +172,16 @@ func (m *Manager) BackgroundLaneStatus() BackgroundLaneStatus {
 	return m.background.status()
 }
 
+// CloseBackgroundLane stops the background lane: it cancels the in-flight
+// drain (if any) and returns only after the drain observed the cancellation
+// — the mandatory-drain rule, so a store teardown can never close SQLite
+// under a lane writer. The daemon's shutdown cleanup chain calls this
+// directly (its teardown never reaches Manager.Close); Manager.Close also
+// runs it for other lifecycles. Idempotent.
+func (m *Manager) CloseBackgroundLane() {
+	m.background.close()
+}
+
 // backgroundPeekRouter is the optional router capability the census needs:
 // a provider VALUE for a spec without pinning or lazily spawning its server.
 // The census only reads markers (HasBackgroundWork) and the drain spawns its
