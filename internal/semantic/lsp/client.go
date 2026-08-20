@@ -102,6 +102,11 @@ type SpawnTransport struct {
 	// stderr silently (no log spam, but also no visibility).
 	Logger *zap.Logger
 
+	// LowPriority starts the server at below-normal OS priority — set by
+	// the background lane's drain instance so its CPU burn never starves
+	// foreground work. No-op on platforms without the treatment.
+	LowPriority bool
+
 	cmd *exec.Cmd
 }
 
@@ -113,6 +118,9 @@ type SpawnTransport struct {
 func (s *SpawnTransport) Start() (io.WriteCloser, io.Reader, error) {
 	cmd := exec.Command(s.Command, s.Args...)
 	platform.ConfigureBackgroundCommand(cmd)
+	if s.LowPriority {
+		platform.ConfigureLowPriorityCommand(cmd)
+	}
 	cmd.Dir = s.WorkspaceRoot
 	if len(s.Env) > 0 {
 		cmd.Env = append(os.Environ(), s.Env...)
