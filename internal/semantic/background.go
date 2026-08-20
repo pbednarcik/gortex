@@ -211,6 +211,20 @@ func (s *backgroundScheduler) next() (backgroundTask, bool) {
 }
 
 func (s *backgroundScheduler) drain(ctx context.Context, g graph.Store, t backgroundTask) {
+	// A panicking drain must not take the daemon down (the worker is a bare
+	// goroutine) nor kill the lane for the remaining queue.
+	defer func() {
+		if r := recover(); r != nil {
+			s.mu.Lock()
+			s.inFlightRepo = ""
+			s.mu.Unlock()
+			s.logger.Error("background enrichment panicked",
+				zap.String("provider", t.provider.Name()),
+				zap.String("repo", t.repoName),
+				zap.Any("panic", r),
+			)
+		}
+	}()
 	be, ok := t.provider.(BackgroundEnricher)
 	if !ok {
 		s.logger.Debug("background lane: provider does not opt in; dropping task",
@@ -232,9 +246,10 @@ func (s *backgroundScheduler) drain(ctx context.Context, g graph.Store, t backgr
 	s.mu.Unlock()
 	startedAt := time.Now()
 	result, err := be.EnrichBackground(ctx, g, t.repoName, t.repoRoot)
+	partial := result != nil && result.Partial
 	s.mu.Lock()
 	s.inFlightRepo = ""
-	if err == nil {
+	if err == nil && !partial {
 		s.lastRepo = t.repoName
 		s.lastDurationMs = time.Since(startedAt).Milliseconds()
 		s.drained++
@@ -261,6 +276,11 @@ func (s *backgroundScheduler) drain(ctx context.Context, g graph.Store, t backgr
 		// No retry loop — the next natural trigger (reindex, restart)
 		// re-enqueues. Worst case is today's steady state: deep edges absent.
 		s.logger.Warn("background enrichment failed", append(fields, zap.Error(err))...)
+	case partial:
+		// Progress landed but the pass was cut — the tier is NOT drained.
+		// No in-process retry loop (a persistently-cut drain would spin);
+		// the next natural trigger resumes from the stamps.
+		s.logger.Warn("background enrichment partial", fields...)
 	default:
 		s.logger.Info("background enrichment complete", fields...)
 	}
