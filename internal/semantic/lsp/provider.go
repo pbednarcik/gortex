@@ -59,6 +59,14 @@ type Provider struct {
 	// leaks per request (csharp-ls); ambiguous edges are confirmed through
 	// the definition pass at their call sites instead.
 	noHeavyRequests bool
+	// heavyDelta inverts the pass: run ONLY the request classes a
+	// defconfirm fast pass skipped — references confirms over the edges
+	// still unconfirmed, and the demand-gated incomingCalls sweep — and
+	// nothing the fast tier already paid for (hover, definitions,
+	// implementations, outgoing calls, type hierarchy). The background
+	// lane sets it on the dedicated drain instance; drained sweep nodes
+	// are stamped semantic_heavy so a later drain resumes, not restarts.
+	heavyDelta bool
 	// spec is the ServerSpec this provider was built from (when the
 	// caller used NewProviderFromSpec). nil for legacy NewProvider
 	// invocations — those fall back to single-language routing.
@@ -494,6 +502,44 @@ func nodeAlreadyStamped(n *graph.Node) bool {
 	return v != nil
 }
 
+// nodeHeavyStamped is nodeAlreadyStamped for the deferred tier's own ledger
+// key: a node the background drain already swept for its heavy request
+// classes. The fast tier's semantic_type stamp deliberately does NOT count —
+// the two ledgers are independent, and an edited file re-parses into fresh
+// nodes that drop both.
+func nodeHeavyStamped(n *graph.Node) bool {
+	if n == nil || n.Meta == nil {
+		return false
+	}
+	s, ok := n.Meta["semantic_heavy"].(string)
+	return ok && s != ""
+}
+
+// markNodeHeavyStamped records a completed heavy drain on the node. Like the
+// semantic_type stamp, it must round-trip through the store (the caller
+// appends the node to its flush batch) or a disk backend discards it.
+func markNodeHeavyStamped(n *graph.Node) {
+	if n == nil {
+		return
+	}
+	if n.Meta == nil {
+		n.Meta = map[string]any{}
+	}
+	n.Meta["semantic_heavy"] = "1"
+}
+
+// tierStamped reports whether THIS pass's tier already covered the node:
+// the fast tier's ledger is the semantic_type stamp, the deferred tier's is
+// semantic_heavy. A heavyDelta pass must not skip nodes merely because the
+// fast pass hovered them — its frontier is exactly the fast-stamped nodes
+// whose heavy legs never ran.
+func (p *Provider) tierStamped(n *graph.Node) bool {
+	if p.heavyDelta {
+		return nodeHeavyStamped(n)
+	}
+	return nodeAlreadyStamped(n)
+}
+
 // scopedPath re-attaches repoPrefix to a repo-relative path the language
 // server handed back: uriToPath returns repo-relative, but graph node
 // FilePaths are prefixed, so node lookups must re-prefix to match in a
@@ -738,10 +784,11 @@ func (p *Provider) EnrichRepoContext(ctx context.Context, g graph.Store, repoPre
 			if n.Kind == graph.KindFile || n.Kind == graph.KindImport {
 				continue
 			}
-			// Skip symbols a prior enrichment pass already stamped — hover would
-			// only re-derive the same type. An edited file re-parses into fresh
+			// Skip symbols this pass's tier already covered — hover would only
+			// re-derive the same type (fast tier), a drained node re-drains
+			// nothing (deferred tier). An edited file re-parses into fresh
 			// nodes with no Meta, so its symbols lose the stamp and re-enter here.
-			if nodeAlreadyStamped(n) {
+			if p.tierStamped(n) {
 				skippedAlreadyStamped++
 				continue
 			}
@@ -1055,7 +1102,9 @@ func (p *Provider) EnrichRepoContext(ctx context.Context, g graph.Store, repoPre
 	interfaceMutations := newLSPMutationBatch()
 	interfacePromotions := make(map[*graph.Edge]struct{})
 	for _, n := range langNodes {
-		if degraded {
+		if degraded || p.heavyDelta {
+			// heavyDelta: the implementations pass already ran in the fast
+			// tier — the drain re-issues none of it.
 			break
 		}
 		if targetedCtx.Err() != nil {
@@ -1240,8 +1289,11 @@ func (p *Provider) EnrichRepoContext(ctx context.Context, g graph.Store, repoPre
 						continue
 					}
 					// Unconfirmed with a recorded site line: defer to the
-					// serial definition-rebind fallback below.
-					if t.edge.Line > 0 {
+					// serial definition-rebind fallback below. A heavyDelta
+					// drain skips the handoff — the fast tier's definition
+					// pass already asked at these sites and could not decide;
+					// re-asking buys nothing.
+					if t.edge.Line > 0 && !p.heavyDelta {
 						confirmMu.Lock()
 						fallback = append(fallback, t)
 						confirmMu.Unlock()
@@ -1734,10 +1786,6 @@ func (p *Provider) EnrichRepoContext(ctx context.Context, g graph.Store, repoPre
 						if !callHierOK {
 							continue
 						}
-						items, err := p.prepareCallHierarchy(absRoot, ft.rel, line, col)
-						if err != nil {
-							continue
-						}
 						// Outgoing always: the file sweep visits every caller,
 						// so a declaration's outgoing hops alone reconstruct
 						// every intra-repo static call edge. Incoming only adds
@@ -1755,10 +1803,25 @@ func (p *Provider) EnrichRepoContext(ctx context.Context, g graph.Store, repoPre
 						wantIncoming := !p.noHeavyRequests &&
 							(sweepMode == sweepModeFull ||
 								nodeDispatch[n.ID] || nodeDemand[n.ID])
+						if p.heavyDelta && !wantIncoming {
+							// The drain fetches ONLY the incoming side — a
+							// mode-skipped incoming leaves no deferred work,
+							// so the prepare round trip is skipped too.
+							p.reqStats.incomingSkipped.Add(1)
+							continue
+						}
+						items, err := p.prepareCallHierarchy(absRoot, ft.rel, line, col)
+						if err != nil {
+							continue
+						}
 						for _, item := range items {
-							if outs, oerr := p.outgoingCalls(item); oerr == nil {
-								for _, oc := range outs {
-									cHops = append(cHops, callHop{n: n, other: oc.To, asOutgoing: true, fromRanges: oc.FromRanges})
+							if !p.heavyDelta {
+								// heavyDelta: outgoing hops already ran in the
+								// fast tier; the drain re-fetches none.
+								if outs, oerr := p.outgoingCalls(item); oerr == nil {
+									for _, oc := range outs {
+										cHops = append(cHops, callHop{n: n, other: oc.To, asOutgoing: true, fromRanges: oc.FromRanges})
+									}
 								}
 							}
 							if !wantIncoming {
@@ -1772,7 +1835,9 @@ func (p *Provider) EnrichRepoContext(ctx context.Context, g graph.Store, repoPre
 							}
 						}
 					case graph.KindType, graph.KindInterface:
-						if !typeHierOK {
+						if !typeHierOK || p.heavyDelta {
+							// heavyDelta: type hierarchy already ran in the
+							// fast tier.
 							continue
 						}
 						items, err := p.prepareTypeHierarchy(absRoot, ft.rel, line, col)
@@ -1792,11 +1857,28 @@ func (p *Provider) EnrichRepoContext(ctx context.Context, g graph.Store, repoPre
 							}
 						}
 					}
+					// A heavyDelta drain stamps the node once its heavy
+					// interrogation completed uncancelled; the stamp rides
+					// this file's flush, so a cut pass keeps exactly the
+					// completed files' progress. Nodes the switch skipped via
+					// continue (mode-skipped incoming, prepare errors) stay
+					// unstamped — they re-enter the frontier at zero request
+					// cost, and the skip decision is re-made from fresh state.
+					if p.heavyDelta && ctx.Err() == nil && !aborted.Load() {
+						markNodeHeavyStamped(n)
+						fileStamped = append(fileStamped, n)
+					}
 				}
 			}
 
 			var nodeWg sync.WaitGroup
 			for _, n := range ft.nodes {
+				if p.heavyDelta {
+					// hover already ran in the fast tier — the drain issues
+					// no hover traffic at all (a node whose fast hover
+					// returned nil would only re-derive the same nothing).
+					break
+				}
 				if aborted.Load() || ctx.Err() != nil {
 					break
 				}
