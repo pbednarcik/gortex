@@ -522,6 +522,50 @@ for repositories you trust.
 - **High memory under polyglot load:** lower `WithMaxAlive` from 6 to
   3-4. The LRU evicts the least-recent server transparently.
 
+## Heavy request classes and the background lane
+
+`textDocument/references` and `callHierarchy/incomingCalls` are the pass's
+*heavy* request classes: they ride the server's FindReferences machinery,
+whose solution-wide walks are expensive on their own and thrash the server's
+caches badly enough to slow every other request class down. A server whose
+spec sets `NoHeavyRequests` (csharp-ls, whose references leg additionally
+leaks per request) skips them by default; ambiguous edges are confirmed
+through the definition pass at their call sites instead.
+
+`GORTEX_LSP_HEAVY` overrides the spec in three directions:
+
+| value | fast pass | deferred drain |
+|---|---|---|
+| `on` / `1` / `true` | heavy legs run inline (old blocking behaviour — the A/B reference) | — |
+| `off` / `0` / `false` | heavy legs skipped for every server | — |
+| `background` | heavy legs skipped, exactly as `off` | drained after warmup by the background lane |
+| unset / other | spec decides (`NoHeavyRequests`) | — |
+
+With `background`, the semantic manager queues one drain task per (repo,
+provider) as fast passes complete; the daemon opens the lane only after the
+`end_batch` warmup phase, so the drain never competes with the resolver or
+the fast passes. The drain is a `heavyDelta` enrichment pass: references
+confirms over the edges still unconfirmed, plus the demand-gated
+incomingCalls sweep — and nothing the fast tier already paid for (no hovers,
+definitions, implementations, outgoing calls, or type hierarchy).
+
+The drain runs on a **dedicated server instance**, spawned per drain at
+below-normal OS priority (Windows) and closed when the repo's tier is
+drained — sharing the foreground instance would re-poison its latency with
+exactly the cache thrash the opt-out exists to avoid. The cost is a second
+workspace load and its memory for the duration of the drain; the lane's
+request width is capped at 4.
+
+Progress is durable at two grains: drained sweep nodes are stamped
+`semantic_heavy` in node Meta (an edited file re-parses into fresh nodes and
+drops the stamp, re-entering both tiers naturally), and a completed drain
+records a `<provider>-background` enrichment marker at the fast tier's sha.
+A cancelled drain (shutdown, reindex) resumes from the stamps; a restart
+census in `StartBackgroundLane` re-enqueues repos whose fast tier is current
+but whose deep tier never finished. Lane progress is surfaced in the daemon
+health snapshot under `background_lane` and in the `background enrichment
+complete` log line.
+
 ## Implementation notes
 
 - The router lives at `internal/semantic/lsp/router.go`. It satisfies
