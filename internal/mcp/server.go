@@ -3126,12 +3126,26 @@ func (s *Server) prepareTool(tool *mcp.Tool, handler server.ToolHandlerFunc) ser
 	// the full semantics live once in the server instructions legend. Runs
 	// before the split so deferred tools carry the compact schema too.
 	compactSharedToolParams(tool)
+	// #597: dispatch reads only the keys it knows, so an unknown option
+	// used to vanish silently — the caller paid the full un-windowed
+	// response with no signal to self-correct. Close any structured schema
+	// that never took a position so the published contract states what the
+	// guard below enforces. Facade names are exempt: their compatibility
+	// wrapper deliberately accepts legacy call shapes the facade schema
+	// does not declare, and their options envelopes are open by design.
+	guarded := !isFacadeToolName(tool.Name)
+	if guarded && tool.RawInputSchema == nil && tool.InputSchema.AdditionalProperties == nil {
+		tool.InputSchema.AdditionalProperties = false
+	}
 	// Capture the finished schema plus the unwrapped legacy implementation
 	// before lazy routing. Reused facade names receive a compatibility wrapper
 	// that keeps their old call shape outside facade-v1 sessions.
 	if s.facades != nil {
 		s.facades.capture(*tool, handler)
 		handler = s.wrapLegacyFacade(tool.Name, handler)
+	}
+	if guarded {
+		handler = wrapToolArgGuard(*tool, handler)
 	}
 	return handler
 }
