@@ -369,6 +369,10 @@ func NewSharedServer(cfg SharedServerConfig) (*SharedServer, error) {
 			semCfg.Providers = append(semCfg.Providers, out)
 		}
 		semMgr = semantic.NewManager(semCfg, logger)
+		// Registered after backendCleanup, so LIFO teardown cancels and
+		// WAITS OUT an in-flight background drain before the store closes
+		// underneath its graph writer.
+		s.cleanup = append(s.cleanup, semMgr.CloseBackgroundLane)
 
 		goMode := goanalysis.ModeTypeCheck
 		if cfg.SemanticMode == "callgraph" {

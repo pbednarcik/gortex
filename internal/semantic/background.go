@@ -179,6 +179,11 @@ func (s *backgroundScheduler) run(ctx context.Context, g graph.Store) {
 				return
 			}
 		}
+		// Close can land between dequeue and drain — never start a drain
+		// (and spawn its server) after cancellation.
+		if ctx.Err() != nil {
+			return
+		}
 		s.drain(ctx, g, t)
 		s.mu.Lock()
 		delete(s.inFlight, t.key())
