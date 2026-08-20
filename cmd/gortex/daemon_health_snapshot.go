@@ -90,6 +90,12 @@ func buildDaemonHealthSnapshot(
 		}
 	}
 	if state != nil && state.multiIndexer != nil {
+		if semMgr := state.multiIndexer.SemanticManager(); semMgr != nil {
+			lane := semMgr.BackgroundLaneStatus()
+			if lane.Started || lane.Pending > 0 || lane.Drained > 0 {
+				out["background_lane"] = lane
+			}
+		}
 		metadata := state.multiIndexer.AllMetadata()
 		nodes, edges := 0, 0
 		for _, meta := range metadata {
