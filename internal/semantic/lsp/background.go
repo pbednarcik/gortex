@@ -1,0 +1,129 @@
+package lsp
+
+import (
+	"context"
+	"errors"
+	"time"
+
+	"github.com/zzet/gortex/internal/graph"
+	"github.com/zzet/gortex/internal/semantic"
+)
+
+// The LSP provider is the background lane's first tenant: under
+// GORTEX_LSP_HEAVY=background the fast pass skips the heavy request classes
+// exactly as "off" does, and the lane drains them afterwards through a
+// heavyDelta pass (see Provider.heavyDelta) on a DEDICATED server instance —
+// deep requests thrash a server's caches badly enough to poison foreground
+// latency (measured: definitions at ~15.5ms/req with the FindReferences
+// machinery in-process vs ~1ms without), so the drain never shares the
+// foreground instance. The instance is spawned per drain and closed when the
+// drain ends; RAM cost is bounded to the drain window.
+var _ semantic.BackgroundEnricher = (*Provider)(nil)
+
+// backgroundMarkerSuffix extends the provider's enrichment-marker key for
+// the lane's own completion marker. The lane marker copies the FAST tier's
+// marker sha at drain time; census compares the two — a fast pass at a new
+// sha refreshes its own marker and thereby marks the lane stale, with no
+// git access from the lane at all.
+const backgroundMarkerSuffix = "-background"
+
+// backgroundLaneMaxParallel caps the drain instance's concurrent requests.
+// The lane optimizes for non-interference, not throughput — the resolved
+// foreground width applies only when it is smaller.
+const backgroundLaneMaxParallel = 4
+
+// HasBackgroundWork reports whether the repo has an undrained deferred
+// tier. Cheap by design (two marker reads): node-level resume lives in the
+// semantic_heavy stamps the drain itself skips by. Known limitation, by
+// choice: a dirty working tree writes no markers, so a drained repo
+// re-enqueues on restart — the stamps make that drain request-free, but it
+// still pays the lane server spawn.
+func (p *Provider) HasBackgroundWork(g graph.Store, repoPrefix string) bool {
+	if !resolveBackgroundHeavy(p.spec) {
+		return false
+	}
+	if p.spec == nil && p.laneProviderFactory == nil {
+		// No spec to spawn a drain instance from (legacy construction).
+		return false
+	}
+	return !p.backgroundMarkerCurrent(g, repoPrefix)
+}
+
+// EnrichBackground drains the deferred heavy tier: it builds the dedicated
+// lane instance, runs an unbounded heavyDelta pass under ctx, closes the
+// instance, and — for a clean uncancelled drain — records the lane marker
+// at the fast tier's sha.
+func (p *Provider) EnrichBackground(ctx context.Context, g graph.Store, repoPrefix, repoRoot string) (*semantic.EnrichResult, error) {
+	lane, err := p.newLaneProvider()
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = lane.Close() }()
+
+	result, err := lane.EnrichRepoContext(ctx, g, repoPrefix, repoRoot, nil)
+	if err == nil && ctx.Err() == nil && result != nil && !result.Partial {
+		p.recordBackgroundMarker(g, repoPrefix)
+	}
+	return result, err
+}
+
+// newLaneProvider builds the drain-pass instance: same spec, heavyDelta
+// mode, heavy legs enabled, width capped. Tests inject laneProviderFactory
+// to wire an instrumented server instead of spawning a process.
+func (p *Provider) newLaneProvider() (*Provider, error) {
+	if p.laneProviderFactory != nil {
+		return p.laneProviderFactory()
+	}
+	if p.spec == nil {
+		return nil, errors.New("lsp: background drain requires a spec-built provider")
+	}
+	lane := NewProviderFromSpec(p.spec, p.logger)
+	lane.heavyDelta = true
+	lane.noHeavyRequests = false
+	if lane.maxParallel > backgroundLaneMaxParallel {
+		lane.maxParallel = backgroundLaneMaxParallel
+	}
+	return lane, nil
+}
+
+// backgroundMarkerCurrent reports whether the lane marker exists and sits at
+// the fast tier's marker sha. Any missing marker, read error, or
+// non-persisting backend means "not provably drained" — the census errs
+// toward draining, and the stamps keep a redundant drain request-free.
+func (p *Provider) backgroundMarkerCurrent(g graph.Store, repoPrefix string) bool {
+	store, ok := g.(graph.EnrichmentStateStore)
+	if !ok {
+		return false
+	}
+	fast, found, err := store.GetEnrichmentState(repoPrefix, p.Name())
+	if err != nil || !found || fast.IndexedSHA == "" {
+		return false
+	}
+	lane, found, err := store.GetEnrichmentState(repoPrefix, p.Name()+backgroundMarkerSuffix)
+	if err != nil || !found {
+		return false
+	}
+	return lane.IndexedSHA == fast.IndexedSHA
+}
+
+// recordBackgroundMarker copies the fast tier's marker sha into the lane's
+// marker key. Skipped silently when the fast marker is absent (dirty tree /
+// no sha) — the same discipline recordEnrichMarker applies.
+func (p *Provider) recordBackgroundMarker(g graph.Store, repoPrefix string) {
+	store, ok := g.(graph.EnrichmentStateStore)
+	if !ok {
+		return
+	}
+	fast, found, err := store.GetEnrichmentState(repoPrefix, p.Name())
+	if err != nil || !found || fast.IndexedSHA == "" {
+		return
+	}
+	if err := store.SetEnrichmentState(graph.EnrichmentState{
+		RepoPrefix:  repoPrefix,
+		Provider:    p.Name() + backgroundMarkerSuffix,
+		IndexedSHA:  fast.IndexedSHA,
+		CompletedAt: time.Now().Unix(),
+	}); err != nil && p.logger != nil {
+		p.logger.Warn("persist background lane marker failed")
+	}
+}

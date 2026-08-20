@@ -67,6 +67,11 @@ type Provider struct {
 	// lane sets it on the dedicated drain instance; drained sweep nodes
 	// are stamped semantic_heavy so a later drain resumes, not restarts.
 	heavyDelta bool
+	// laneProviderFactory overrides how EnrichBackground builds its
+	// dedicated drain instance. Tests inject a factory wired to an
+	// instrumented server; production leaves it nil and spawns from the
+	// spec (see newLaneProvider).
+	laneProviderFactory func() (*Provider, error)
 	// spec is the ServerSpec this provider was built from (when the
 	// caller used NewProviderFromSpec). nil for legacy NewProvider
 	// invocations — those fall back to single-language routing.
