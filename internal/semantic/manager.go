@@ -125,6 +125,12 @@ type Manager struct {
 	closing         bool
 	closeOnce       sync.Once
 	closeErr        error
+
+	// background drains deferred deep-tier work (BackgroundEnricher
+	// providers) one task at a time, strictly after StartBackgroundLane —
+	// tasks queue up as fast passes complete but never run before the
+	// daemon finishes warmup.
+	background *backgroundScheduler
 }
 
 // NewManager creates a Manager from configuration.
@@ -138,8 +144,18 @@ func NewManager(cfg Config, logger *zap.Logger) *Manager {
 		enrichStatus:    make(map[string]*EnrichmentStatus),
 		lifecycleCtx:    lifecycleCtx,
 		lifecycleCancel: lifecycleCancel,
+		background:      newBackgroundScheduler(logger),
 	}
 	return m
+}
+
+// StartBackgroundLane starts draining deferred deep-tier enrichment. The
+// daemon calls it once warmup is fully done (after end_batch) so the lane
+// never competes with the resolver or the fast passes; tasks enqueued by
+// earlier passes wait until then. Idempotent. The lane stops when ctx is
+// cancelled or the Manager closes, whichever comes first.
+func (m *Manager) StartBackgroundLane(ctx context.Context, g graph.Store) {
+	m.background.start(ctx, g)
 }
 
 var errManagerClosed = errors.New("semantic manager is closed")
@@ -1201,6 +1217,19 @@ func (m *Manager) runEnrichOne(g graph.Store, repoName, repoRoot, lang string, p
 			m.recordEnrichMarker(g, repoName, provider.Name(), rs, result.CoveragePercent)
 		}
 
+		// A pass that deliberately skipped its deep tier hands the remainder
+		// to the background lane. Partial passes enqueue too — whatever the
+		// fast tier missed, the deferred tier is still undrained. The lane
+		// holds the task until the daemon's StartBackgroundLane.
+		if be, ok := provider.(BackgroundEnricher); ok && be.HasBackgroundWork(g, repoName) {
+			m.background.enqueue(backgroundTask{
+				repoName: repoName,
+				repoRoot: repoRoot,
+				provider: provider,
+				lang:     lang,
+			})
+		}
+
 		m.logger.Info("semantic enrichment complete",
 			zap.String("provider", provider.Name()),
 			zap.String("language", lang),
@@ -1484,6 +1513,12 @@ func (m *Manager) Close() error {
 		providers := append([]Provider(nil), m.providers...)
 		router := m.lspRouter
 		m.lifecycleMu.Unlock()
+
+		// Stop the background lane BEFORE closing providers — an in-flight
+		// drain runs against a provider-owned server, and close waits for
+		// the drain to observe cancellation (mandatory-drain, same rule as
+		// foreground passes).
+		m.background.close()
 
 		var errs []error
 		for _, p := range providers {
