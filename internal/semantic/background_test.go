@@ -1,0 +1,168 @@
+package semantic
+
+import (
+	"context"
+	"testing"
+	"time"
+
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+	"go.uber.org/zap"
+
+	"github.com/zzet/gortex/internal/graph"
+)
+
+// mockBackgroundProvider is a mockProvider that also opts into the background
+// lane, with hooks to observe the drain, block it, and watch its context.
+type mockBackgroundProvider struct {
+	mockProvider
+	hasWork func(repo string) bool // nil = always true
+	drained chan string           // receives repoName when EnrichBackground starts
+	block   chan struct{}         // non-nil: drain blocks until closed or ctx cancelled
+	ctxErr  chan error            // receives ctx.Err() when a blocked drain is cancelled
+}
+
+func (m *mockBackgroundProvider) HasBackgroundWork(_ graph.Store, repo string) bool {
+	if m.hasWork == nil {
+		return true
+	}
+	return m.hasWork(repo)
+}
+
+func (m *mockBackgroundProvider) EnrichBackground(ctx context.Context, _ graph.Store, repo, _ string) (*EnrichResult, error) {
+	if m.drained != nil {
+		m.drained <- repo
+	}
+	if m.block != nil {
+		select {
+		case <-m.block:
+		case <-ctx.Done():
+			if m.ctxErr != nil {
+				m.ctxErr <- ctx.Err()
+			}
+			return nil, ctx.Err()
+		}
+	}
+	return &EnrichResult{Provider: m.name, Language: "go", EdgesConfirmed: 1}, nil
+}
+
+func TestBackgroundScheduler(t *testing.T) {
+	newProvider := func() *mockBackgroundProvider {
+		return &mockBackgroundProvider{
+			mockProvider: mockProvider{name: "mock-bg", languages: []string{"go"}, available: true},
+			drained:      make(chan string, 8),
+		}
+	}
+	task := func(p Provider, repo string) backgroundTask {
+		return backgroundTask{repoName: repo, repoRoot: "/tmp/" + repo, provider: p, lang: "go"}
+	}
+	recv := func(t *testing.T, ch chan string) string {
+		t.Helper()
+		select {
+		case v := <-ch:
+			return v
+		case <-time.After(2 * time.Second):
+			t.Fatal("timed out waiting for a drain")
+			return ""
+		}
+	}
+	noRecv := func(t *testing.T, ch chan string, window time.Duration) {
+		t.Helper()
+		select {
+		case v := <-ch:
+			t.Fatalf("unexpected drain of %q", v)
+		case <-time.After(window):
+		}
+	}
+
+	t.Run("DrainsFIFO", func(t *testing.T) {
+		p := newProvider()
+		s := newBackgroundScheduler(zap.NewNop())
+		defer s.close()
+		require.True(t, s.enqueue(task(p, "repo-a")))
+		require.True(t, s.enqueue(task(p, "repo-b")))
+		s.start(context.Background(), graph.New())
+		assert.Equal(t, "repo-a", recv(t, p.drained))
+		assert.Equal(t, "repo-b", recv(t, p.drained))
+	})
+
+	t.Run("SingleFlightAndStartIdempotent", func(t *testing.T) {
+		p := newProvider()
+		p.block = make(chan struct{})
+		s := newBackgroundScheduler(zap.NewNop())
+		defer s.close()
+		require.True(t, s.enqueue(task(p, "repo-a")))
+		require.True(t, s.enqueue(task(p, "repo-b")))
+		s.start(context.Background(), graph.New())
+		s.start(context.Background(), graph.New()) // second start must not add a worker
+		assert.Equal(t, "repo-a", recv(t, p.drained))
+		// repo-a is blocked in flight — a second worker (or overlap) would
+		// begin repo-b now; the lane must hold it.
+		noRecv(t, p.drained, 100*time.Millisecond)
+		close(p.block)
+		assert.Equal(t, "repo-b", recv(t, p.drained))
+	})
+
+	t.Run("DedupPendingTask", func(t *testing.T) {
+		p := newProvider()
+		s := newBackgroundScheduler(zap.NewNop())
+		defer s.close()
+		require.True(t, s.enqueue(task(p, "repo-a")))
+		assert.False(t, s.enqueue(task(p, "repo-a")), "same repo+provider pending twice")
+		s.start(context.Background(), graph.New())
+		assert.Equal(t, "repo-a", recv(t, p.drained))
+		noRecv(t, p.drained, 100*time.Millisecond)
+	})
+
+	t.Run("SkipsWhenNoWorkAtDequeue", func(t *testing.T) {
+		p := newProvider()
+		p.hasWork = func(repo string) bool { return repo != "repo-drained" }
+		s := newBackgroundScheduler(zap.NewNop())
+		defer s.close()
+		require.True(t, s.enqueue(task(p, "repo-drained")))
+		require.True(t, s.enqueue(task(p, "repo-live")))
+		s.start(context.Background(), graph.New())
+		// repo-drained re-checks HasBackgroundWork at dequeue and is skipped
+		// without a drain call; repo-live runs.
+		assert.Equal(t, "repo-live", recv(t, p.drained))
+		noRecv(t, p.drained, 100*time.Millisecond)
+	})
+
+	t.Run("CancelOnClose", func(t *testing.T) {
+		p := newProvider()
+		p.block = make(chan struct{}) // never closed — only cancellation frees it
+		p.ctxErr = make(chan error, 1)
+		s := newBackgroundScheduler(zap.NewNop())
+		require.True(t, s.enqueue(task(p, "repo-a")))
+		s.start(context.Background(), graph.New())
+		assert.Equal(t, "repo-a", recv(t, p.drained))
+		closed := make(chan struct{})
+		go func() { s.close(); close(closed) }()
+		select {
+		case err := <-p.ctxErr:
+			assert.ErrorIs(t, err, context.Canceled)
+		case <-time.After(2 * time.Second):
+			t.Fatal("close did not cancel the in-flight drain")
+		}
+		select {
+		case <-closed:
+		case <-time.After(2 * time.Second):
+			t.Fatal("close did not return after the drain stopped")
+		}
+		s.close() // idempotent
+	})
+
+	t.Run("EnqueueDoesNotRequireOptIn", func(t *testing.T) {
+		// A provider without BackgroundEnricher is skipped at dequeue, not a
+		// panic — the manager-side gate is the primary filter, this is the
+		// scheduler-side belt.
+		plain := &mockProvider{name: "plain", languages: []string{"go"}, available: true}
+		p := newProvider()
+		s := newBackgroundScheduler(zap.NewNop())
+		defer s.close()
+		require.True(t, s.enqueue(task(plain, "repo-x")))
+		require.True(t, s.enqueue(task(p, "repo-y")))
+		s.start(context.Background(), graph.New())
+		assert.Equal(t, "repo-y", recv(t, p.drained))
+	})
+}
