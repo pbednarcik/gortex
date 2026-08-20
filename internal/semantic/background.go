@@ -40,8 +40,39 @@ type backgroundScheduler struct {
 	closed  bool
 	wake    chan struct{} // buffered(1) nudge: new work or shutdown
 
+	// lane progress, surfaced through status() into the daemon health
+	// snapshot. Guarded by mu.
+	inFlightRepo   string
+	lastRepo       string
+	lastDurationMs int64
+	drained        int
+
 	cancel context.CancelFunc
 	done   chan struct{} // worker exit
+}
+
+// BackgroundLaneStatus is a point-in-time snapshot of the lane's progress
+// for the health surface.
+type BackgroundLaneStatus struct {
+	Started        bool   `json:"started"`
+	Pending        int    `json:"pending"`
+	InFlightRepo   string `json:"in_flight_repo,omitempty"`
+	LastRepo       string `json:"last_repo,omitempty"`
+	LastDurationMs int64  `json:"last_duration_ms,omitempty"`
+	Drained        int    `json:"drained"`
+}
+
+func (s *backgroundScheduler) status() BackgroundLaneStatus {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return BackgroundLaneStatus{
+		Started:        s.started,
+		Pending:        len(s.pending),
+		InFlightRepo:   s.inFlightRepo,
+		LastRepo:       s.lastRepo,
+		LastDurationMs: s.lastDurationMs,
+		Drained:        s.drained,
+	}
 }
 
 func newBackgroundScheduler(logger *zap.Logger) *backgroundScheduler {
@@ -168,8 +199,19 @@ func (s *backgroundScheduler) drain(ctx context.Context, g graph.Store, t backgr
 		zap.String("language", t.lang),
 		zap.String("repo", t.repoName),
 	)
+	s.mu.Lock()
+	s.inFlightRepo = t.repoName
+	s.mu.Unlock()
 	startedAt := time.Now()
 	result, err := be.EnrichBackground(ctx, g, t.repoName, t.repoRoot)
+	s.mu.Lock()
+	s.inFlightRepo = ""
+	if err == nil {
+		s.lastRepo = t.repoName
+		s.lastDurationMs = time.Since(startedAt).Milliseconds()
+		s.drained++
+	}
+	s.mu.Unlock()
 	fields := []zap.Field{
 		zap.String("provider", t.provider.Name()),
 		zap.String("language", t.lang),
