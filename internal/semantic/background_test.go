@@ -8,6 +8,8 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"go.uber.org/zap"
+	"go.uber.org/zap/zapcore"
+	"go.uber.org/zap/zaptest/observer"
 
 	"github.com/zzet/gortex/internal/graph"
 )
@@ -150,6 +152,37 @@ func TestBackgroundScheduler(t *testing.T) {
 			t.Fatal("close did not return after the drain stopped")
 		}
 		s.close() // idempotent
+	})
+
+	t.Run("StatusAndCompletionLog", func(t *testing.T) {
+		core, obs := observer.New(zapcore.InfoLevel)
+		p := newProvider()
+		s := newBackgroundScheduler(zap.New(core))
+		defer s.close()
+
+		require.True(t, s.enqueue(task(p, "repo-a")))
+		st := s.status()
+		assert.False(t, st.Started)
+		assert.Equal(t, 1, st.Pending)
+
+		s.start(context.Background(), graph.New())
+		assert.Equal(t, "repo-a", recv(t, p.drained))
+		require.Eventually(t, func() bool { return s.status().Drained == 1 }, 2*time.Second, 5*time.Millisecond)
+
+		st = s.status()
+		assert.True(t, st.Started)
+		assert.Zero(t, st.Pending)
+		assert.Empty(t, st.InFlightRepo)
+		assert.Equal(t, "repo-a", st.LastRepo)
+
+		logs := obs.FilterMessage("background enrichment complete").All()
+		require.Len(t, logs, 1)
+		fields := logs[0].ContextMap()
+		assert.Equal(t, "mock-bg", fields["provider"])
+		assert.Equal(t, "repo-a", fields["repo"])
+		assert.Contains(t, fields, "duration_ms")
+		assert.Contains(t, fields, "confirmed")
+		assert.Contains(t, fields, "added")
 	})
 
 	t.Run("EnqueueDoesNotRequireOptIn", func(t *testing.T) {
