@@ -2,6 +2,7 @@ package lsp
 
 import (
 	"context"
+	"encoding/json"
 	"path/filepath"
 	"sync"
 	"testing"
@@ -131,6 +132,125 @@ func TestLSPProvider_EnrichBackground_LaneIsolation(t *testing.T) {
 		rigA.implementations.Load() + rigA.prepareCall.Load() + rigA.outgoing.Load() +
 		rigA.incoming.Load() + rigA.prepareTypeHier.Load()
 	assert.Zero(t, total, "the foreground instance must see zero requests during the drain")
+}
+
+// The lane instance inherits the operator/router configuration the
+// foreground provider carries — and never dials an IDE-attached server.
+func TestLSPProvider_LaneInheritsForegroundConfig(t *testing.T) {
+	spec := SpecByName("omnisharp")
+	require.NotNil(t, spec)
+	specWithConnect := *spec
+	specWithConnect.Connect = &ConnectSpec{Network: "tcp", Address: "127.0.0.1:1"}
+
+	p := NewProvider("fake-lsp", nil, []string{"go"}, false, 2, nil)
+	p.spec = &specWithConnect
+	p.excludeGlobs = []string{"**/generated/**"}
+	p.sweepMode = "off"
+	p.opensDocs = false
+	p.workspaceFolders = []string{"D:/extra/root"}
+	p.maxParallel = 2
+
+	lane, err := p.newLaneProvider()
+	require.NoError(t, err)
+	assert.True(t, lane.heavyDelta)
+	assert.False(t, lane.noHeavyRequests)
+	assert.Equal(t, p.excludeGlobs, lane.excludeGlobs, "operator exclude globs must reach the drain")
+	assert.Equal(t, "off", lane.sweepMode, "configured sweep mode must reach the drain")
+	assert.False(t, lane.opensDocs, "didOpen override must reach the drain")
+	assert.Equal(t, p.workspaceFolders, lane.workspaceFolders)
+	assert.Equal(t, 2, lane.maxParallel, "the foreground width applies when smaller than the lane cap")
+	assert.Nil(t, lane.connect, "the drain must never dial an IDE-attached server")
+
+	p.maxParallel = 16
+	lane, err = p.newLaneProvider()
+	require.NoError(t, err)
+	assert.Equal(t, backgroundLaneMaxParallel, lane.maxParallel, "the lane cap bounds a wide foreground width")
+}
+
+// laneDrainClean is the marker predicate: only a completed, uncancelled,
+// non-partial, breaker-clean drain may claim the tier is drained.
+func TestLaneDrainClean(t *testing.T) {
+	cancelled, cancel := context.WithCancel(context.Background())
+	cancel()
+	ok := context.Background()
+	clean := &semantic.EnrichResult{}
+	assert.True(t, laneDrainClean(ok, clean, nil))
+	assert.False(t, laneDrainClean(ok, clean, assert.AnError), "an errored drain records nothing")
+	assert.False(t, laneDrainClean(cancelled, clean, nil), "a cancelled drain records nothing")
+	assert.False(t, laneDrainClean(ok, nil, nil), "a nil result records nothing")
+	assert.False(t, laneDrainClean(ok, &semantic.EnrichResult{Partial: true}, nil), "a partial drain records nothing")
+	assert.False(t, laneDrainClean(ok, &semantic.EnrichResult{BreakerTripped: true}, nil),
+		"a breaker-tripped drain answered errors, not emptiness — it proves nothing about the tier")
+}
+
+// A server that never finishes loading its workspace must not be drained:
+// it answers every heavy request empty-but-successfully, which would stamp
+// every node and record the marker with zero yield — the exact pathology
+// the foreground readiness gate exists to prevent.
+func TestLSPProvider_EnrichBackground_NotReadyRecordsNothing(t *testing.T) {
+	repoRoot, g, _ := heavyDeltaFixture(t)
+	ms := newMarkerStore(g)
+
+	server := newFakeLSPServer()
+	rig := newHeavyDeltaRig(server.handle, repoRoot)
+	lane, cleanup := providerWithFakeServer(t, server, []string{"go"})
+	defer cleanup()
+	lane.heavyDelta = true
+
+	p := NewProvider("fake-lsp", nil, []string{"go"}, false, 2, nil)
+	p.laneProviderFactory = func() (*Provider, error) { return lane, nil }
+	require.NoError(t, ms.SetEnrichmentState(graph.EnrichmentState{
+		RepoPrefix: "", Provider: p.Name(), IndexedSHA: "sha-fast"}))
+
+	prev := laneWaitReady
+	laneWaitReady = func(context.Context, *Provider, string) error { return semantic.ErrWorkspaceNotReady }
+	defer func() { laneWaitReady = prev }()
+
+	_, err := p.EnrichBackground(context.Background(), ms, "", repoRoot)
+	require.ErrorIs(t, err, semantic.ErrWorkspaceNotReady)
+
+	total := rig.references.Load() + rig.prepareCall.Load() + rig.incoming.Load()
+	assert.Zero(t, total, "a not-ready server must receive no drain requests")
+	_, found, _ := ms.GetEnrichmentState("", p.Name()+backgroundMarkerSuffix)
+	assert.False(t, found, "no marker for a drain that never ran")
+}
+
+// The lane marker records the fast tier's sha AS OF DRAIN START — a fast
+// pass finishing mid-drain moves the fast marker to a sha whose re-parsed
+// state this drain never visited.
+func TestLSPProvider_EnrichBackground_MarkerUsesDrainStartSHA(t *testing.T) {
+	t.Setenv(SweepEnv, "")
+
+	repoRoot, g, _ := heavyDeltaFixture(t)
+	ms := newMarkerStore(g)
+
+	p := NewProvider("fake-lsp", nil, []string{"go"}, false, 2, nil)
+	require.NoError(t, ms.SetEnrichmentState(graph.EnrichmentState{
+		RepoPrefix: "", Provider: p.Name(), IndexedSHA: "sha-1"}))
+
+	server := newFakeLSPServer()
+	rig := newHeavyDeltaRig(server.handle, repoRoot)
+	server.handle("textDocument/references", func(json.RawMessage) (any, *jsonRPCError) {
+		// Mid-drain, a fast pass lands a new sha.
+		_ = ms.SetEnrichmentState(graph.EnrichmentState{
+			RepoPrefix: "", Provider: p.Name(), IndexedSHA: "sha-2"})
+		rig.references.Add(1)
+		return []Location{}, nil
+	})
+	lane, cleanup := providerWithFakeServer(t, server, []string{"go"})
+	defer cleanup()
+	lane.heavyDelta = true
+	p.laneProviderFactory = func() (*Provider, error) { return lane, nil }
+
+	_, err := p.EnrichBackground(context.Background(), ms, "", repoRoot)
+	require.NoError(t, err)
+	require.Positive(t, rig.references.Load(), "fixture sanity: the mid-drain move must have happened")
+
+	laneMarker, found, err := ms.GetEnrichmentState("", p.Name()+backgroundMarkerSuffix)
+	require.NoError(t, err)
+	require.True(t, found)
+	assert.Equal(t, "sha-1", laneMarker.IndexedSHA,
+		"the marker claims only the state the drain actually visited")
 }
 
 // A clean, uncancelled drain records the lane marker at the fast tier's

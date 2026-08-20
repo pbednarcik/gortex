@@ -49,27 +49,67 @@ func (p *Provider) HasBackgroundWork(g graph.Store, repoPrefix string) bool {
 	return !p.backgroundMarkerCurrent(g, repoPrefix)
 }
 
+// backgroundLaneReadinessBudget bounds the lane's wait for a
+// ReadinessProber server (the Roslyn / MSBuild solution load) before the
+// drain begins. Mirrors the manager's foreground gate: a still-loading
+// server answers heavy requests empty-but-successfully, which would stamp
+// every node and record the marker with zero yield. Var so tests shrink it.
+var backgroundLaneReadinessBudget = 3 * time.Minute
+
+// laneWaitReady is the readiness probe seam; tests substitute it.
+var laneWaitReady = func(ctx context.Context, lane *Provider, repoRoot string) error {
+	return lane.WaitReady(ctx, repoRoot)
+}
+
+// laneDrainClean is the marker predicate: only a completed, uncancelled,
+// non-partial, breaker-clean drain may claim the tier is drained. A breaker
+// trip means the server answered errors — its silence about the remaining
+// work is error-shaped, not evidence of emptiness.
+func laneDrainClean(ctx context.Context, result *semantic.EnrichResult, err error) bool {
+	return err == nil && ctx.Err() == nil && result != nil &&
+		!result.Partial && !result.BreakerTripped
+}
+
 // EnrichBackground drains the deferred heavy tier: it builds the dedicated
-// lane instance, runs an unbounded heavyDelta pass under ctx, closes the
-// instance, and — for a clean uncancelled drain — records the lane marker
-// at the fast tier's sha.
+// lane instance, waits for the server's workspace to be ready, runs an
+// unbounded heavyDelta pass under ctx, closes the instance, and — for a
+// clean drain — records the lane marker at the fast tier's sha AS OF DRAIN
+// START (a fast pass finishing mid-drain moves the fast marker to a state
+// this drain never visited; the scheduler's in-flight requeue re-drains it).
 func (p *Provider) EnrichBackground(ctx context.Context, g graph.Store, repoPrefix, repoRoot string) (*semantic.EnrichResult, error) {
+	startSHA := p.fastMarkerSHA(g, repoPrefix)
+
 	lane, err := p.newLaneProvider()
 	if err != nil {
 		return nil, err
 	}
 	defer func() { _ = lane.Close() }()
 
+	if backgroundLaneReadinessBudget > 0 {
+		rctx, rcancel := context.WithTimeout(ctx, backgroundLaneReadinessBudget)
+		err := laneWaitReady(rctx, lane, repoRoot)
+		rcancel()
+		if errors.Is(err, semantic.ErrWorkspaceNotReady) {
+			// Nothing ran and nothing is stamped — the repo stays undrained
+			// and the next trigger retries against a warmer server.
+			return nil, err
+		}
+	}
+
 	result, err := lane.EnrichRepoContext(ctx, g, repoPrefix, repoRoot, nil)
-	if err == nil && ctx.Err() == nil && result != nil && !result.Partial {
-		p.recordBackgroundMarker(g, repoPrefix)
+	if laneDrainClean(ctx, result, err) {
+		p.recordBackgroundMarker(g, repoPrefix, startSHA)
 	}
 	return result, err
 }
 
 // newLaneProvider builds the drain-pass instance: same spec, heavyDelta
-// mode, heavy legs enabled, width capped. Tests inject laneProviderFactory
-// to wire an instrumented server instead of spawning a process.
+// mode, heavy legs enabled, and the operator/router configuration the
+// foreground instance carries — exclude globs, workspace folders, sweep
+// mode, didOpen override — so the drain covers exactly the file set the
+// fast tier deferred. Width is the foreground width capped at the lane
+// maximum. Tests inject laneProviderFactory to wire an instrumented server
+// instead of spawning a process.
 func (p *Provider) newLaneProvider() (*Provider, error) {
 	if p.laneProviderFactory != nil {
 		return p.laneProviderFactory()
@@ -80,6 +120,17 @@ func (p *Provider) newLaneProvider() (*Provider, error) {
 	lane := NewProviderFromSpec(p.spec, p.logger)
 	lane.heavyDelta = true
 	lane.noHeavyRequests = false
+	lane.excludeGlobs = append([]string(nil), p.excludeGlobs...)
+	lane.workspaceFolders = append([]string(nil), p.workspaceFolders...)
+	lane.sweepMode = p.sweepMode
+	lane.opensDocs = p.opensDocs
+	// The drain must never ride an IDE-attached server: a Connect spec
+	// would dial the shared interactive instance and void the
+	// dedicated-instance isolation. Force a spawn.
+	lane.connect = nil
+	if p.maxParallel > 0 {
+		lane.maxParallel = p.maxParallel
+	}
 	if lane.maxParallel > backgroundLaneMaxParallel {
 		lane.maxParallel = backgroundLaneMaxParallel
 	}
@@ -106,22 +157,36 @@ func (p *Provider) backgroundMarkerCurrent(g graph.Store, repoPrefix string) boo
 	return lane.IndexedSHA == fast.IndexedSHA
 }
 
-// recordBackgroundMarker copies the fast tier's marker sha into the lane's
-// marker key. Skipped silently when the fast marker is absent (dirty tree /
-// no sha) — the same discipline recordEnrichMarker applies.
-func (p *Provider) recordBackgroundMarker(g graph.Store, repoPrefix string) {
+// fastMarkerSHA reads the fast tier's marker sha, "" when absent (dirty
+// tree / no sha / non-persisting backend).
+func (p *Provider) fastMarkerSHA(g graph.Store, repoPrefix string) string {
 	store, ok := g.(graph.EnrichmentStateStore)
 	if !ok {
-		return
+		return ""
 	}
 	fast, found, err := store.GetEnrichmentState(repoPrefix, p.Name())
-	if err != nil || !found || fast.IndexedSHA == "" {
+	if err != nil || !found {
+		return ""
+	}
+	return fast.IndexedSHA
+}
+
+// recordBackgroundMarker records the lane's completion at sha — the fast
+// tier's marker AS OF DRAIN START, so the marker claims only the state the
+// drain actually visited. Skipped silently on an empty sha (dirty tree /
+// no fast marker) — the same discipline recordEnrichMarker applies.
+func (p *Provider) recordBackgroundMarker(g graph.Store, repoPrefix, sha string) {
+	if sha == "" {
+		return
+	}
+	store, ok := g.(graph.EnrichmentStateStore)
+	if !ok {
 		return
 	}
 	if err := store.SetEnrichmentState(graph.EnrichmentState{
 		RepoPrefix:  repoPrefix,
 		Provider:    p.Name() + backgroundMarkerSuffix,
-		IndexedSHA:  fast.IndexedSHA,
+		IndexedSHA:  sha,
 		CompletedAt: time.Now().Unix(),
 	}); err != nil && p.logger != nil {
 		p.logger.Warn("persist background lane marker failed")

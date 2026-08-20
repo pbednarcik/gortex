@@ -2050,6 +2050,7 @@ func (p *Provider) EnrichRepoContext(ctx context.Context, g graph.Store, repoPre
 		zap.Bool("hover_breaker_tripped", hoverBreaker.isTripped()),
 	)
 
+	result.BreakerTripped = targetedBreaker.isTripped() || hoverBreaker.isTripped()
 	if targetedBreaker.isTripped() && hoverBreaker.isTripped() &&
 		result.EdgesConfirmed == 0 && result.EdgesRebound == 0 &&
 		result.EdgesAdded == 0 && result.NodesEnriched == 0 {

@@ -172,10 +172,20 @@ func (m *Manager) BackgroundLaneStatus() BackgroundLaneStatus {
 	return m.background.status()
 }
 
+// backgroundPeekRouter is the optional router capability the census needs:
+// a provider VALUE for a spec without pinning or lazily spawning its server.
+// The census only reads markers (HasBackgroundWork) and the drain spawns its
+// own dedicated instance, so no live server is ever required.
+type backgroundPeekRouter interface {
+	PeekProviderForSpec(name string) (Provider, error)
+}
+
 // backgroundCensus enqueues every (repo, provider) pair whose deferred tier
 // is undrained. It mirrors EnrichAll's eligibility gates (availability,
-// disablement, language presence) but not its priority arbitration — the
-// census trusts HasBackgroundWork to say no, and enqueue dedups the rest.
+// disablement, language presence) AND its per-language spec arbitration —
+// an arbitration-loser spec never runs a fast pass, never earns a fast
+// marker, and would therefore drain (spawning a rejected server) on every
+// restart, forever.
 func (m *Manager) backgroundCensus(g graph.Store, roots map[string]string) {
 	if len(roots) == 0 {
 		return
@@ -197,8 +207,8 @@ func (m *Manager) backgroundCensus(g graph.Store, roots map[string]string) {
 		}
 	}
 
-	for _, repoName := range sortedRootNames(roots, nodeCounts) {
-		repoRoot := roots[repoName]
+	repoNames := sortedRootNames(roots, nodeCounts)
+	for _, repoName := range repoNames {
 		for _, p := range m.providers {
 			be, ok := p.(BackgroundEnricher)
 			if !ok || !p.Available() || m.providerDisabled(p.Name()) {
@@ -210,35 +220,83 @@ func (m *Manager) backgroundCensus(g graph.Store, roots map[string]string) {
 			if !be.HasBackgroundWork(g, repoName) {
 				continue
 			}
-			enqueue(repoName, repoRoot, p)
+			enqueue(repoName, repoRoot(roots, repoName), p)
 		}
-		// Router-backed specs, only when the operator eager-enriches: with
-		// EagerLSP off no fast tier runs, so there is no deferred delta to
-		// complement. ProviderForSpecWorkspace constructs without spawning;
-		// the pin is released immediately — the drain never uses the
-		// foreground instance anyway (it spawns its own, see the lsp
-		// package's EnrichBackground).
-		if m.config.EagerLSP && m.lspRouter != nil {
-			for _, name := range m.lspRouter.EnabledSpecNames() {
-				if !m.lspRouter.SpecAvailable(name) {
-					continue
-				}
-				if gateOnPresence && !anyLangPresent(m.lspRouter.SpecLanguages(name), present) {
-					continue
-				}
-				provider, err := m.lspRouter.ProviderForSpecWorkspace(name, repoRoot)
-				if err != nil {
-					continue
-				}
-				be, ok := provider.(BackgroundEnricher)
-				keep := ok && be.HasBackgroundWork(g, repoName)
-				m.lspRouter.ReleaseSpecWorkspace(name, repoRoot)
-				if keep {
-					enqueue(repoName, repoRoot, provider)
-				}
+	}
+
+	// Router-backed specs, only when the operator eager-enriches: with
+	// EagerLSP off no fast tier runs, so there is no deferred delta to
+	// complement. The census goes through the spawn-free peek —
+	// ProviderForSpecWorkspace would pin AND lazily spawn a server per
+	// (spec, repo) just to read two markers.
+	if !m.config.EagerLSP || m.lspRouter == nil {
+		return
+	}
+	peekRouter, canPeek := m.lspRouter.(backgroundPeekRouter)
+	if !canPeek {
+		m.logger.Debug("background lane: router lacks the spawn-free peek; skipping router census")
+		return
+	}
+	for _, name := range m.routerCensusWinners(present, gateOnPresence) {
+		provider, err := peekRouter.PeekProviderForSpec(name)
+		if err != nil {
+			continue
+		}
+		be, ok := provider.(BackgroundEnricher)
+		if !ok {
+			continue
+		}
+		for _, repoName := range repoNames {
+			if !be.HasBackgroundWork(g, repoName) {
+				continue
+			}
+			enqueue(repoName, repoRoot(roots, repoName), provider)
+		}
+	}
+}
+
+func repoRoot(roots map[string]string, name string) string { return roots[name] }
+
+// routerCensusWinners mirrors EnrichAll's pre-spawn spec arbitration: eager
+// providers own their languages, and among router specs the lowest priority
+// number wins each remaining present language (ties by name). Pure metadata
+// reads — no spawn.
+func (m *Manager) routerCensusWinners(present map[string]bool, gateOnPresence bool) []string {
+	langProviders := m.selectProviders()
+	bestSpec := make(map[string]string)
+	bestPrio := make(map[string]int)
+	for _, name := range m.lspRouter.EnabledSpecNames() {
+		if !m.lspRouter.SpecAvailable(name) {
+			continue
+		}
+		prio := m.lspRouter.SpecPriority(name)
+		if cfgPrio, ok := m.configPriorityFor(name); ok {
+			prio = cfgPrio
+		}
+		for _, lang := range m.lspRouter.SpecLanguages(name) {
+			if _, eagerCovered := langProviders[lang]; eagerCovered {
+				continue
+			}
+			if gateOnPresence && !present[lang] {
+				continue
+			}
+			cur, exists := bestSpec[lang]
+			if !exists || prio < bestPrio[lang] || (prio == bestPrio[lang] && name < cur) {
+				bestSpec[lang] = name
+				bestPrio[lang] = prio
 			}
 		}
 	}
+	seen := make(map[string]bool)
+	winners := make([]string, 0, len(bestSpec))
+	for _, name := range bestSpec {
+		if !seen[name] {
+			seen[name] = true
+			winners = append(winners, name)
+		}
+	}
+	sort.Strings(winners)
+	return winners
 }
 
 var errManagerClosed = errors.New("semantic manager is closed")

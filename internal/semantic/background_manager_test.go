@@ -153,6 +153,51 @@ func TestManagerBackgroundLane_RestartCensus(t *testing.T) {
 	}
 }
 
+// The router-backed census must be spawn-free (no ProviderForSpecWorkspace,
+// which pins and lazily SPAWNS a server) and must mirror EnrichAll's spec
+// arbitration — an arbitration-loser spec never ran a fast pass, so draining
+// it would spawn a rejected server on every restart, forever.
+func TestManagerBackgroundLane_CensusRouterPath(t *testing.T) {
+	newBG := func(name string) *mockBackgroundProvider {
+		return &mockBackgroundProvider{
+			mockProvider: mockProvider{name: name, languages: []string{"go"}, available: true},
+			drained:      make(chan string, 2),
+		}
+	}
+	winner, loser := newBG("winner"), newBG("loser")
+	router := &fakeRouter{
+		specs:      []string{"loser", "winner"},
+		languages:  map[string][]string{"winner": {"go"}, "loser": {"go"}},
+		priorities: map[string]int{"winner": 1, "loser": 5},
+		providers:  map[string]Provider{"winner": winner, "loser": loser},
+	}
+	cfg := Config{Enabled: true, EagerLSP: true}
+	mgr := NewManager(cfg, zap.NewNop())
+	mgr.SetLSPRouter(router)
+	defer func() { require.NoError(t, mgr.Close()) }()
+
+	g := graph.New()
+	g.AddNode(&graph.Node{ID: "main.go::main", Kind: graph.KindFunction, Name: "main", FilePath: "main.go", Language: "go"})
+
+	mgr.StartBackgroundLane(context.Background(), g, map[string]string{"default": "/tmp/test"})
+
+	select {
+	case repo := <-winner.drained:
+		assert.Equal(t, "default", repo)
+	case <-time.After(2 * time.Second):
+		t.Fatal("census did not drain the arbitration-winning spec")
+	}
+	select {
+	case <-loser.drained:
+		t.Fatal("census drained the arbitration-LOSER spec")
+	case <-time.After(150 * time.Millisecond):
+	}
+	for _, c := range router.calls {
+		assert.NotContains(t, c, "ProviderForSpecWorkspace",
+			"the census must never take the pin-and-spawn path")
+	}
+}
+
 // The census trusts HasBackgroundWork: a drained repo is not re-enqueued.
 func TestManagerBackgroundLane_CensusSkipsDrained(t *testing.T) {
 	p := &mockBackgroundProvider{
