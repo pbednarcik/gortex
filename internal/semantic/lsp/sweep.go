@@ -159,17 +159,42 @@ func resolveOpensDocs(configured string, spec *ServerSpec) bool {
 // "on" / "1" / "true" restores textDocument/references and
 // callHierarchy/incomingCalls for a server whose spec opts out — the
 // operator runs a build without the FindReferences leak — while "off" /
-// "0" / "false" disables them for every server. Empty falls through to
-// the spec.
+// "0" / "false" disables them for every server. "background" keeps the
+// fast pass exactly as fast as "off" and defers the heavy legs to the
+// background lane, which drains them on a dedicated server instance after
+// the pass completes. Empty falls through to the spec.
 const HeavyRequestsEnv = "GORTEX_LSP_HEAVY"
+
+// normalizeHeavyMode extends the shared on/off vocabulary with the lane
+// keyword: "background" survives normalization; everything else lowers to
+// "on" / "off" / "" exactly as the open-docs override does.
+func normalizeHeavyMode(raw string) string {
+	if strings.ToLower(strings.TrimSpace(raw)) == "background" {
+		return "background"
+	}
+	return normalizeOnOff(raw)
+}
 
 // resolveNoHeavyRequests reports whether the enrichment pass must skip the
 // heavy request classes for this server: the GORTEX_LSP_HEAVY env override
 // wins over the spec's NoHeavyRequests, which wins over the allow-by-default
-// fallback. Shares the on/off vocabulary of the open-docs override.
+// fallback. Shares the on/off vocabulary of the open-docs override;
+// "background" skips inline like "off" — the lane picks the work up later.
 func resolveNoHeavyRequests(spec *ServerSpec) bool {
-	if env := normalizeOnOff(os.Getenv(HeavyRequestsEnv)); env != "" {
-		return env == "off"
+	switch normalizeHeavyMode(os.Getenv(HeavyRequestsEnv)) {
+	case "on":
+		return false
+	case "off", "background":
+		return true
 	}
 	return spec != nil && spec.NoHeavyRequests
+}
+
+// resolveBackgroundHeavy reports whether the deferred heavy tier should be
+// drained by the background lane after the fast pass. Env-only for now —
+// deliberately no spec or config fallback until the lane has production
+// mileage. The spec parameter keeps the resolver family's shape (and the
+// seam a future spec-level default would use).
+func resolveBackgroundHeavy(_ *ServerSpec) bool {
+	return normalizeHeavyMode(os.Getenv(HeavyRequestsEnv)) == "background"
 }
