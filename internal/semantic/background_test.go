@@ -154,6 +154,25 @@ func TestBackgroundScheduler(t *testing.T) {
 		s.close() // idempotent
 	})
 
+	t.Run("ReenqueueDuringInFlightDrain", func(t *testing.T) {
+		// A fast pass finishing WHILE its repo's drain is in flight must not
+		// lose the signal: the in-flight drain read its frontier before the
+		// new work existed, so the repo re-drains after it completes.
+		p := newProvider()
+		p.block = make(chan struct{})
+		s := newBackgroundScheduler(zap.NewNop())
+		defer s.close()
+		require.True(t, s.enqueue(task(p, "repo-a")))
+		s.start(context.Background(), graph.New())
+		assert.Equal(t, "repo-a", recv(t, p.drained)) // drain 1 in flight, blocked
+
+		require.True(t, s.enqueue(task(p, "repo-a")),
+			"an enqueue against an in-flight drain is accepted, not dropped")
+		close(p.block)
+		assert.Equal(t, "repo-a", recv(t, p.drained), "the repo drains a second time")
+		noRecv(t, p.drained, 100*time.Millisecond)
+	})
+
 	t.Run("StatusAndCompletionLog", func(t *testing.T) {
 		core, obs := observer.New(zapcore.InfoLevel)
 		p := newProvider()

@@ -36,9 +36,15 @@ type backgroundScheduler struct {
 	mu      sync.Mutex
 	pending []backgroundTask
 	queued  map[string]bool // dedup: pending or in-flight task keys
-	started bool
-	closed  bool
-	wake    chan struct{} // buffered(1) nudge: new work or shutdown
+	// inFlight holds the task currently draining; requeue holds a task
+	// re-enqueued WHILE its key was in flight — the running drain read its
+	// frontier before the new work existed, so the repo must drain again
+	// once it completes rather than dropping the signal.
+	inFlight map[string]backgroundTask
+	requeue  map[string]backgroundTask
+	started  bool
+	closed   bool
+	wake     chan struct{} // buffered(1) nudge: new work or shutdown
 
 	// lane progress, surfaced through status() into the daemon health
 	// snapshot. Guarded by mu.
@@ -80,22 +86,34 @@ func newBackgroundScheduler(logger *zap.Logger) *backgroundScheduler {
 		logger = zap.NewNop()
 	}
 	return &backgroundScheduler{
-		logger: logger,
-		queued: map[string]bool{},
-		wake:   make(chan struct{}, 1),
-		done:   make(chan struct{}),
+		logger:   logger,
+		queued:   map[string]bool{},
+		inFlight: map[string]backgroundTask{},
+		requeue:  map[string]backgroundTask{},
+		wake:     make(chan struct{}, 1),
+		done:     make(chan struct{}),
 	}
 }
 
 // enqueue adds a task unless an identical (repo, provider) task is already
-// pending or in flight. Returns false for duplicates and after close.
+// pending (that task will see the new state when it runs). A task whose key
+// is IN FLIGHT is accepted into the requeue slot instead: the running drain
+// selected its work before this trigger, so the repo drains again after it.
+// Returns false for pending duplicates and after close.
 func (s *backgroundScheduler) enqueue(t backgroundTask) bool {
 	if t.provider == nil {
 		return false
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if s.closed || s.queued[t.key()] {
+	if s.closed {
+		return false
+	}
+	if _, busy := s.inFlight[t.key()]; busy {
+		s.requeue[t.key()] = t
+		return true
+	}
+	if s.queued[t.key()] {
 		return false
 	}
 	s.queued[t.key()] = true
@@ -163,7 +181,16 @@ func (s *backgroundScheduler) run(ctx context.Context, g graph.Store) {
 		}
 		s.drain(ctx, g, t)
 		s.mu.Lock()
-		delete(s.queued, t.key())
+		delete(s.inFlight, t.key())
+		if rt, again := s.requeue[t.key()]; again {
+			// A trigger landed while this drain ran — its frontier predates
+			// the new work, so the key goes straight back to pending
+			// (queued stays set; the slot is already claimed).
+			delete(s.requeue, t.key())
+			s.pending = append(s.pending, rt)
+		} else {
+			delete(s.queued, t.key())
+		}
 		s.mu.Unlock()
 		if ctx.Err() != nil {
 			return
@@ -179,6 +206,7 @@ func (s *backgroundScheduler) next() (backgroundTask, bool) {
 	}
 	t := s.pending[0]
 	s.pending = s.pending[1:]
+	s.inFlight[t.key()] = t
 	return t, true
 }
 
