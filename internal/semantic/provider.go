@@ -202,6 +202,12 @@ type EnrichResult struct {
 	// hover types and hierarchy edges are absent. DegradedReason carries why.
 	Degraded       bool   `json:"degraded,omitempty"`
 	DegradedReason string `json:"degraded_reason,omitempty"`
+	// BreakerTripped reports that a request-failure breaker abandoned part
+	// of the pass (consecutive server errors on the targeted or hover leg).
+	// The counters reflect what landed, but the pass's silence about the
+	// rest is error-shaped, not evidence of emptiness — completion markers
+	// must not treat such a pass as having drained its tier.
+	BreakerTripped bool `json:"breaker_tripped,omitempty"`
 }
 
 // Bounding reasons for the enrichment add-phase (EnrichResult.BoundReason /
