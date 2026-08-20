@@ -52,7 +52,7 @@ func TestManagerBackgroundLane_EnqueueAfterFastPass(t *testing.T) {
 	case <-time.After(100 * time.Millisecond):
 	}
 
-	mgr.StartBackgroundLane(context.Background(), g)
+	mgr.StartBackgroundLane(context.Background(), g, nil)
 	select {
 	case repo := <-p.drained:
 		assert.Equal(t, "default", repo)
@@ -80,9 +80,9 @@ func TestManagerBackgroundLane_NoEnqueueWithoutWork(t *testing.T) {
 	_, _, err := mgr.EnrichAll(g, roots, EnrichOptions{})
 	require.NoError(t, err)
 	// Even if the tier "appears" later, no task was enqueued at pass end and
-	// Task 3's lane has no census — nothing may drain.
+	// a census was not requested (nil roots) — nothing may drain.
 	work = true
-	mgr.StartBackgroundLane(context.Background(), g)
+	mgr.StartBackgroundLane(context.Background(), g, nil)
 	select {
 	case repo := <-p.drained:
 		t.Fatalf("lane drained %q without an enqueued task", repo)
@@ -109,7 +109,7 @@ func TestManagerBackgroundLane_CloseCancelsInFlightDrain(t *testing.T) {
 
 	_, _, err := mgr.EnrichAll(g, roots, EnrichOptions{})
 	require.NoError(t, err)
-	mgr.StartBackgroundLane(context.Background(), g)
+	mgr.StartBackgroundLane(context.Background(), g, nil)
 	select {
 	case <-p.drained:
 	case <-time.After(2 * time.Second):
@@ -128,5 +128,45 @@ func TestManagerBackgroundLane_CloseCancelsInFlightDrain(t *testing.T) {
 	case <-closed:
 	case <-time.After(2 * time.Second):
 		t.Fatal("Close did not return after the drain stopped")
+	}
+}
+
+// A restart leaves no pass-end enqueues behind — the census walk in
+// StartBackgroundLane re-discovers undrained repos from provider state
+// alone (markers/stamps), with no fast pass this process.
+func TestManagerBackgroundLane_RestartCensus(t *testing.T) {
+	p := &mockBackgroundProvider{
+		mockProvider: mockProvider{name: "go", languages: []string{"go"}, available: true},
+		drained:      make(chan string, 1),
+	}
+	mgr, g, roots := backgroundLaneManager(t, p)
+	defer func() { require.NoError(t, mgr.Close()) }()
+
+	// No EnrichAll — simulates a warm restart on an unchanged repo whose
+	// fast markers are current but whose deep tier never drained.
+	mgr.StartBackgroundLane(context.Background(), g, roots)
+	select {
+	case repo := <-p.drained:
+		assert.Equal(t, "default", repo)
+	case <-time.After(2 * time.Second):
+		t.Fatal("census did not enqueue the undrained repo")
+	}
+}
+
+// The census trusts HasBackgroundWork: a drained repo is not re-enqueued.
+func TestManagerBackgroundLane_CensusSkipsDrained(t *testing.T) {
+	p := &mockBackgroundProvider{
+		mockProvider: mockProvider{name: "go", languages: []string{"go"}, available: true},
+		drained:      make(chan string, 1),
+		hasWork:      func(string) bool { return false },
+	}
+	mgr, g, roots := backgroundLaneManager(t, p)
+	defer func() { require.NoError(t, mgr.Close()) }()
+
+	mgr.StartBackgroundLane(context.Background(), g, roots)
+	select {
+	case repo := <-p.drained:
+		t.Fatalf("census drained %q despite HasBackgroundWork=false", repo)
+	case <-time.After(150 * time.Millisecond):
 	}
 }

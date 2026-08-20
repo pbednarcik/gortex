@@ -154,8 +154,85 @@ func NewManager(cfg Config, logger *zap.Logger) *Manager {
 // never competes with the resolver or the fast passes; tasks enqueued by
 // earlier passes wait until then. Idempotent. The lane stops when ctx is
 // cancelled or the Manager closes, whichever comes first.
-func (m *Manager) StartBackgroundLane(ctx context.Context, g graph.Store) {
+//
+// roots (may be nil) drives the restart census: a warm restart runs no fast
+// passes for unchanged repos, so their pass-end enqueues never happen — the
+// census re-discovers undrained repos from provider state alone
+// (HasBackgroundWork reads markers and stamps, never a live server).
+func (m *Manager) StartBackgroundLane(ctx context.Context, g graph.Store, roots map[string]string) {
+	if m.config.Enabled {
+		m.backgroundCensus(g, roots)
+	}
 	m.background.start(ctx, g)
+}
+
+// backgroundCensus enqueues every (repo, provider) pair whose deferred tier
+// is undrained. It mirrors EnrichAll's eligibility gates (availability,
+// disablement, language presence) but not its priority arbitration — the
+// census trusts HasBackgroundWork to say no, and enqueue dedups the rest.
+func (m *Manager) backgroundCensus(g graph.Store, roots map[string]string) {
+	if len(roots) == 0 {
+		return
+	}
+	present, nodeCounts, langCounts := m.repoLanguages(g, roots)
+	gateOnPresence := len(langCounts) > 0
+
+	enqueue := func(repoName, repoRoot string, provider Provider) {
+		langs := provider.Languages()
+		lang := ""
+		if len(langs) > 0 {
+			lang = langs[0]
+		}
+		if m.background.enqueue(backgroundTask{repoName: repoName, repoRoot: repoRoot, provider: provider, lang: lang}) {
+			m.logger.Info("background lane: census enqueued undrained repo",
+				zap.String("provider", provider.Name()),
+				zap.String("repo", repoName),
+			)
+		}
+	}
+
+	for _, repoName := range sortedRootNames(roots, nodeCounts) {
+		repoRoot := roots[repoName]
+		for _, p := range m.providers {
+			be, ok := p.(BackgroundEnricher)
+			if !ok || !p.Available() || m.providerDisabled(p.Name()) {
+				continue
+			}
+			if gateOnPresence && !anyLangPresent(p.Languages(), present) {
+				continue
+			}
+			if !be.HasBackgroundWork(g, repoName) {
+				continue
+			}
+			enqueue(repoName, repoRoot, p)
+		}
+		// Router-backed specs, only when the operator eager-enriches: with
+		// EagerLSP off no fast tier runs, so there is no deferred delta to
+		// complement. ProviderForSpecWorkspace constructs without spawning;
+		// the pin is released immediately — the drain never uses the
+		// foreground instance anyway (it spawns its own, see the lsp
+		// package's EnrichBackground).
+		if m.config.EagerLSP && m.lspRouter != nil {
+			for _, name := range m.lspRouter.EnabledSpecNames() {
+				if !m.lspRouter.SpecAvailable(name) {
+					continue
+				}
+				if gateOnPresence && !anyLangPresent(m.lspRouter.SpecLanguages(name), present) {
+					continue
+				}
+				provider, err := m.lspRouter.ProviderForSpecWorkspace(name, repoRoot)
+				if err != nil {
+					continue
+				}
+				be, ok := provider.(BackgroundEnricher)
+				keep := ok && be.HasBackgroundWork(g, repoName)
+				m.lspRouter.ReleaseSpecWorkspace(name, repoRoot)
+				if keep {
+					enqueue(repoName, repoRoot, provider)
+				}
+			}
+		}
+	}
 }
 
 var errManagerClosed = errors.New("semantic manager is closed")

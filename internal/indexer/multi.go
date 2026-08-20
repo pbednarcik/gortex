@@ -401,6 +401,14 @@ func (mi *MultiIndexer) SetEmbeddingAPIConcurrency(n int) {
 	}
 }
 
+// SemanticManager returns the manager installed by SetSemanticManager, nil
+// when semantic enrichment is not wired (CLI paths without a daemon).
+func (mi *MultiIndexer) SemanticManager() *semantic.Manager {
+	mi.mu.RLock()
+	defer mi.mu.RUnlock()
+	return mi.semanticMgr
+}
+
 // SetSemanticManager installs the semantic enrichment manager every
 // per-repo Indexer this MultiIndexer constructs should use, and
 // re-applies it to every per-repo Indexer already built. Without
