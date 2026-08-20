@@ -2208,7 +2208,16 @@ func (p *Provider) dialOrSpawn(workspaceRoot string) (*Client, error) {
 			}
 		}
 	}
-	return NewClient(p.command, args, p.env, workspaceRoot, p.logger)
+	return NewClientWithTransport(&SpawnTransport{
+		Command:       p.command,
+		Args:          args,
+		Env:           p.env,
+		WorkspaceRoot: workspaceRoot,
+		Logger:        p.logger,
+		// The lane's drain instance runs below normal priority so its
+		// server never starves foreground work (see background.go).
+		LowPriority: p.heavyDelta,
+	}, p.logger)
 }
 
 // defaultLSPCallTimeout bounds a single post-initialize LSP request.
