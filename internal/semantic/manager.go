@@ -166,6 +166,12 @@ func (m *Manager) StartBackgroundLane(ctx context.Context, g graph.Store, roots 
 	m.background.start(ctx, g)
 }
 
+// BackgroundLaneStatus reports the background lane's progress for the
+// health surface.
+func (m *Manager) BackgroundLaneStatus() BackgroundLaneStatus {
+	return m.background.status()
+}
+
 // backgroundCensus enqueues every (repo, provider) pair whose deferred tier
 // is undrained. It mirrors EnrichAll's eligibility gates (availability,
 // disablement, language presence) but not its priority arbitration — the
