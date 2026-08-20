@@ -359,6 +359,36 @@ func TestResolveNoHeavyRequests_Precedence(t *testing.T) {
 	})
 }
 
+// GORTEX_LSP_HEAVY=background keeps the fast pass exactly as fast as "off" —
+// the heavy legs are skipped inline — while flagging that a background drain
+// should pick them up after the pass completes.
+func TestResolveHeavyBackgroundMode(t *testing.T) {
+	csharp := SpecByName("omnisharp")
+	require.NotNil(t, csharp)
+
+	t.Run("background skips heavy inline for every spec", func(t *testing.T) {
+		t.Setenv(HeavyRequestsEnv, "background")
+		assert.True(t, resolveNoHeavyRequests(csharp))
+		assert.True(t, resolveNoHeavyRequests(nil))
+	})
+	t.Run("background enables the lane", func(t *testing.T) {
+		t.Setenv(HeavyRequestsEnv, "background")
+		assert.True(t, resolveBackgroundHeavy(csharp))
+		assert.True(t, resolveBackgroundHeavy(nil))
+	})
+	t.Run("other values do not enable the lane", func(t *testing.T) {
+		for _, v := range []string{"", "on", "off", "1", "0", "bogus"} {
+			t.Setenv(HeavyRequestsEnv, v)
+			assert.False(t, resolveBackgroundHeavy(csharp), "value %q", v)
+		}
+	})
+	t.Run("case and whitespace tolerant", func(t *testing.T) {
+		t.Setenv(HeavyRequestsEnv, " Background ")
+		assert.True(t, resolveBackgroundHeavy(nil))
+		assert.True(t, resolveNoHeavyRequests(nil))
+	})
+}
+
 // The definition pass fans out across site files. The serial loop predates
 // the NoDidOpen lifecycle — it existed to keep document opens from
 // overlapping — but with no didOpen to serialize, a heavy-opt-out server
