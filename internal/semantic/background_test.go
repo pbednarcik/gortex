@@ -19,9 +19,9 @@ import (
 type mockBackgroundProvider struct {
 	mockProvider
 	hasWork func(repo string) bool // nil = always true
-	drained chan string           // receives repoName when EnrichBackground starts
-	block   chan struct{}         // non-nil: drain blocks until closed or ctx cancelled
-	ctxErr  chan error            // receives ctx.Err() when a blocked drain is cancelled
+	drained chan string            // receives repoName when EnrichBackground starts
+	block   chan struct{}          // non-nil: drain blocks until closed or ctx cancelled
+	ctxErr  chan error             // receives ctx.Err() when a blocked drain is cancelled
 }
 
 func (m *mockBackgroundProvider) HasBackgroundWork(_ graph.Store, repo string) bool {
