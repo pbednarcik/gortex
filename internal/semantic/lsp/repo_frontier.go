@@ -83,7 +83,7 @@ func (p *Provider) readLSPRepoProjection(g graph.Store, repoPrefix string) (*lsp
 
 		candidateIDs := make([]string, 0, unstampedCount(frontier, unstampedByFile))
 		for _, node := range locations {
-			if node == nil || nodeAlreadyStamped(node) {
+			if node == nil || p.tierStamped(node) {
 				continue
 			}
 			if _, seen := candidateSeen[node.ID]; seen {
