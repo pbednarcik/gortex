@@ -92,6 +92,23 @@ type ContextEnricher interface {
 	EnrichRepoContext(ctx context.Context, g graph.Store, repoPrefix, repoRoot string, deadline EnrichDeadlinePolicy) (*EnrichResult, error)
 }
 
+// BackgroundEnricher is an optional interface a Provider MAY implement to
+// declare deferred deep-tier work — enrichment deliberately skipped by the
+// fast pass (heavy request classes, expensive sweeps) that should drain
+// after the workspace is queryable, without blocking it. The background
+// lane runs one drain at a time, after warmup, on the provider's own
+// terms: EnrichBackground must honor ctx cancellation and persist progress
+// incrementally so a cancelled drain resumes where it stopped rather than
+// restarting.
+type BackgroundEnricher interface {
+	// HasBackgroundWork reports whether the repo has an undrained deep
+	// tier. Called at enqueue AND again at dequeue — the state may have
+	// drained (or the mode may have changed) between the two.
+	HasBackgroundWork(g graph.Store, repoPrefix string) bool
+	// EnrichBackground drains the deferred tier for the repo.
+	EnrichBackground(ctx context.Context, g graph.Store, repoPrefix, repoRoot string) (*EnrichResult, error)
+}
+
 // PreselectionDeadlineEnricher marks a ContextEnricher whose expensive work
 // begins before it can count a post-filter candidate frontier (for example a
 // SCIP provider must first run its external indexer). The Manager gives these
