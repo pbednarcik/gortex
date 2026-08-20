@@ -131,6 +131,50 @@ func TestManagerBackgroundLane_CloseCancelsInFlightDrain(t *testing.T) {
 	}
 }
 
+// CloseBackgroundLane is the daemon-shutdown hook: it cancels an in-flight
+// drain and returns only after the drain observed the cancellation, so the
+// store is never closed under a lane writer. (Manager.Close also stops the
+// lane, but the daemon's teardown never calls Manager.Close — the cleanup
+// chain calls this instead.)
+func TestManagerBackgroundLane_CloseBackgroundLaneStopsInFlightDrain(t *testing.T) {
+	p := &mockBackgroundProvider{
+		mockProvider: mockProvider{
+			name: "go", languages: []string{"go"}, available: true,
+			enrichFunc: func(g graph.Store, root string) (*EnrichResult, error) {
+				return &EnrichResult{Provider: "go", Language: "go"}, nil
+			},
+		},
+		drained: make(chan string, 1),
+		block:   make(chan struct{}),
+		ctxErr:  make(chan error, 1),
+	}
+	mgr, g, roots := backgroundLaneManager(t, p)
+
+	_, _, err := mgr.EnrichAll(g, roots, EnrichOptions{})
+	require.NoError(t, err)
+	mgr.StartBackgroundLane(context.Background(), g, nil)
+	select {
+	case <-p.drained:
+	case <-time.After(2 * time.Second):
+		t.Fatal("drain did not start")
+	}
+
+	closed := make(chan struct{})
+	go func() { mgr.CloseBackgroundLane(); close(closed) }()
+	select {
+	case err := <-p.ctxErr:
+		assert.ErrorIs(t, err, context.Canceled)
+	case <-time.After(2 * time.Second):
+		t.Fatal("CloseBackgroundLane did not cancel the in-flight drain")
+	}
+	select {
+	case <-closed:
+	case <-time.After(2 * time.Second):
+		t.Fatal("CloseBackgroundLane did not wait for the drain to stop")
+	}
+	require.NoError(t, mgr.Close())
+}
+
 // A restart leaves no pass-end enqueues behind — the census walk in
 // StartBackgroundLane re-discovers undrained repos from provider state
 // alone (markers/stamps), with no fast pass this process.
