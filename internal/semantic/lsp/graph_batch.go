@@ -313,6 +313,50 @@ func (v *lspGraphView) hasUnresolvedDemand(n *graph.Node) bool {
 	return len(v.inByID[graph.UnresolvedMarker+"*."+n.Name]) > 0
 }
 
+// typeIsDispatchRelevant reports whether a type declaration's super/subtype
+// hierarchy is worth interrogating. An interface always is: it is the
+// dispatch surface by definition, and its implementers' AST edges may be
+// exactly what failed to resolve — the case where it looks adjacency-less is
+// the case where the sweep is most needed. A class qualifies only through
+// hierarchy involvement: an implements / extends edge in either direction.
+// Edge KINDS survive even when the AST could not resolve the target, so a
+// class with an unresolvable base list still qualifies — recovering those
+// cross-file / dynamic hierarchy edges is the sweep's whole value for types.
+// A bare data type with neither buys nothing from hover or hierarchy
+// interrogation, and no longer keeps its file in the demand-gated sweep.
+//
+// That strict check presumes SOME lane other than the sweep can mint the
+// qualifying edge. hierarchyEvidence says whether one has (see
+// enrichLanguageHasHierarchyEvidence); when it has not, every class is
+// treated as hierarchy-involved — the pre-gate permissive behaviour — because
+// in such a language the sweep is the only producer of the very edge the
+// strict check would require.
+func (v *lspGraphView) typeIsDispatchRelevant(n *graph.Node, hierarchyEvidence bool) bool {
+	if n == nil {
+		return false
+	}
+	if n.Kind == graph.KindInterface {
+		return true
+	}
+	if n.Kind != graph.KindType {
+		return false
+	}
+	if !hierarchyEvidence {
+		return true
+	}
+	for _, e := range v.outByID[n.ID] {
+		if e.Kind == graph.EdgeImplements || e.Kind == graph.EdgeExtends {
+			return true
+		}
+	}
+	for _, e := range v.inByID[n.ID] {
+		if e.Kind == graph.EdgeImplements || e.Kind == graph.EdgeExtends {
+			return true
+		}
+	}
+	return false
+}
+
 func (v *lspGraphView) callableIsDispatchRelevant(n *graph.Node) bool {
 	if n == nil || (n.Kind != graph.KindFunction && n.Kind != graph.KindMethod) {
 		return false

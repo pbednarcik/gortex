@@ -23,13 +23,16 @@ const SweepEnv = "GORTEX_LSP_SWEEP"
 //
 //   - sweepModeDemand (DEFAULT): sweep a file when its declarations still
 //     carry unresolved same-name call candidates (enrichment demand) OR it
-//     declares a type / interface whose super/subtype hierarchy the sweep
-//     interrogates (dispatch-relevant). The dispatch disjunct is load-bearing:
-//     a type / interface never contributes call demand, yet the sweep is the
-//     only path that recovers its cross-file / dynamic extends / supertype
-//     edges, so gating on demand alone would silently drop them. A file with
-//     neither signal is skipped, so a warm restart pays no sweep for it while
-//     the already-enriched declarations that are swept skip their redundant
+//     carries a dispatch-relevant declaration — a callable taking part in
+//     dynamic dispatch, or an interface / hierarchy-involved type (see
+//     lspGraphView.typeIsDispatchRelevant). The dispatch disjunct is
+//     load-bearing: a type never contributes call demand, yet the sweep is
+//     the only path that recovers its cross-file / dynamic extends /
+//     supertype edges, so gating on demand alone would silently drop them.
+//     A bare data type with no hierarchy involvement carries none of those
+//     edges, so it no longer admits its file. A file with neither signal is
+//     skipped, so a warm restart pays no sweep for it while the
+//     already-enriched declarations that are swept skip their redundant
 //     hover.
 //   - sweepModeFull: sweep every file of the language — the pre-knob
 //     behaviour, kept for a cold index that wants maximal hover coverage.
@@ -94,11 +97,11 @@ func (p *Provider) effectiveSweepMode() string {
 // run for a file under mode, given its unresolved-demand count and whether it
 // carries a dispatch-relevant declaration. Under the demand default a file is
 // swept when at least one of its declarations still has unresolved same-name
-// call candidates (demand > 0) OR it declares a type / interface whose
-// super/subtype hierarchy the sweep interrogates (dispatch) — the latter never
-// surfaces as demand, so without this disjunct a type-only file would drop the
-// extends / supertype edges only this sweep recovers. "full" always sweeps,
-// "off" never does.
+// call candidates (demand > 0) OR it carries a dispatch-relevant declaration
+// (dispatch): a callable taking part in dynamic dispatch, or an interface /
+// hierarchy-involved type. The latter never surfaces as demand, so without
+// this disjunct a hierarchy-carrying file would drop the extends / supertype
+// edges only this sweep recovers. "full" always sweeps, "off" never does.
 func sweepFile(mode string, demand int, dispatch bool) bool {
 	switch mode {
 	case sweepModeOff:
