@@ -56,9 +56,16 @@ type backgroundScheduler struct {
 	// so a waiter observes the fully-settled scheduler state.
 	inFlightCancel map[string]context.CancelFunc
 	inFlightDone   map[string]chan struct{}
-	started        bool
-	closed         bool
-	wake           chan struct{} // buffered(1) nudge: new work or shutdown
+	// holds parks a repo's tasks at the DEQUEUE gate (refcounted): a
+	// mutation establishes its hold BEFORE cancelling, so triggers born
+	// inside its own tail — the pass-end enqueue above all — coalesce in
+	// pending but cannot start a drain until the mutation releases.
+	// Cancellation alone cannot give this guarantee: it only clears tasks
+	// that already exist.
+	holds   map[string]int
+	started bool
+	closed  bool
+	wake    chan struct{} // buffered(1) nudge: new work, a released hold, or shutdown
 
 	// lane progress, surfaced through status() into the daemon health
 	// snapshot. Guarded by mu. Failure telemetry covers errored and
@@ -119,8 +126,33 @@ func newBackgroundScheduler(logger *zap.Logger) *backgroundScheduler {
 		requeue:        map[string]backgroundTask{},
 		inFlightCancel: map[string]context.CancelFunc{},
 		inFlightDone:   map[string]chan struct{}{},
+		holds:          map[string]int{},
 		wake:           make(chan struct{}, 1),
 		done:           make(chan struct{}),
+	}
+}
+
+// hold parks repoName's pending tasks until the returned release runs.
+// Refcounted (nested holds stack) and the release is idempotent. hold does
+// not touch an in-flight drain — that is cancelRepo's job, called after the
+// hold so nothing can slip between the wait-out and the dequeue gate.
+func (s *backgroundScheduler) hold(repoName string) (release func()) {
+	s.mu.Lock()
+	s.holds[repoName]++
+	s.mu.Unlock()
+	var once sync.Once
+	return func() {
+		once.Do(func() {
+			s.mu.Lock()
+			if s.holds[repoName]--; s.holds[repoName] <= 0 {
+				delete(s.holds, repoName)
+			}
+			s.mu.Unlock()
+			select {
+			case s.wake <- struct{}{}:
+			default:
+			}
+		})
 	}
 }
 
@@ -262,6 +294,11 @@ func (s *backgroundScheduler) next(ctx context.Context) (t backgroundTask, dctx 
 	idx := -1
 	var earliest time.Time
 	for i, cand := range s.pending {
+		if s.holds[cand.repoName] > 0 {
+			// A held task has no time bound — the release nudges wake, so
+			// it contributes nothing to the cooldown timer either.
+			continue
+		}
 		if cand.notBefore.After(now) {
 			if earliest.IsZero() || cand.notBefore.Before(earliest) {
 				earliest = cand.notBefore
