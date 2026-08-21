@@ -127,6 +127,9 @@ func (p *Provider) newLaneProvider() (*Provider, error) {
 	lane.workspaceFolders = append([]string(nil), p.workspaceFolders...)
 	lane.sweepMode = p.sweepMode
 	lane.opensDocs = p.opensDocs
+	// env carries router augmentations on top of spec.Env (BUNDLE_GEMFILE
+	// for a Gemfile workspace) — the spec rebuild alone would lose them.
+	lane.env = append([]string(nil), p.env...)
 	// The drain must never ride an IDE-attached server: a Connect spec
 	// would dial the shared interactive instance and void the
 	// dedicated-instance isolation. Force a spawn.
