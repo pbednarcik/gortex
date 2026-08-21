@@ -323,17 +323,38 @@ type backgroundPeekRouter interface {
 // spec arbitration — a spec the fast tier rejects (arbitration loser,
 // below-floor language) never runs a fast pass, never earns a fast marker,
 // and would therefore drain (spawning a rejected server) on every restart,
-// forever.
+// forever. Admission is PER REPOSITORY, matching production foreground
+// enrichment (each indexer enriches its own root): two sub-floor repos must
+// not vouch for each other's language, and a Go repo must not make the
+// census queue the Go provider for its Python neighbor. One grouped
+// projection still covers all repos — see repoLanguagesPerRepo.
 func (m *Manager) backgroundCensus(g graph.Store, roots map[string]string) {
 	if len(roots) == 0 {
 		return
 	}
-	present, nodeCounts, langCounts := m.repoLanguages(g, roots)
-	if below := applyAdmissionFloor(present, langCounts, EnrichmentAdmissionFloor()); len(below) > 0 {
-		m.logger.Info("background lane: census skipping languages below admission floor",
-			zap.Any("skipped", below))
+	perRepo, nodeCounts := m.repoLanguagesPerRepo(g, roots)
+	floor := EnrichmentAdmissionFloor()
+	// admitted resolves each repo's floored presence set once; gate reports
+	// whether that repo yielded any evidence at all (an evidence-free store
+	// gates nothing, mirroring EnrichAll).
+	type repoAdmission struct {
+		present map[string]bool
+		gate    bool
 	}
-	gateOnPresence := len(langCounts) > 0
+	admitted := make(map[string]*repoAdmission, len(roots))
+	for repoName := range roots {
+		rc := perRepo[repoName]
+		if rc == nil {
+			admitted[repoName] = &repoAdmission{present: map[string]bool{}}
+			continue
+		}
+		if below := applyAdmissionFloor(rc.present, rc.langCounts, floor); len(below) > 0 {
+			m.logger.Info("background lane: census skipping languages below admission floor",
+				zap.String("repo", repoName),
+				zap.Any("skipped", below))
+		}
+		admitted[repoName] = &repoAdmission{present: rc.present, gate: len(rc.langCounts) > 0}
+	}
 
 	enqueue := func(repoName, repoRoot string, provider Provider) {
 		langs := provider.Languages()
@@ -351,12 +372,13 @@ func (m *Manager) backgroundCensus(g graph.Store, roots map[string]string) {
 
 	repoNames := sortedRootNames(roots, nodeCounts)
 	for _, repoName := range repoNames {
+		adm := admitted[repoName]
 		for _, p := range m.providers {
 			be, ok := p.(BackgroundEnricher)
 			if !ok || !p.Available() || m.providerDisabled(p.Name()) {
 				continue
 			}
-			if gateOnPresence && !anyLangPresent(p.Languages(), present) {
+			if adm.gate && !anyLangPresent(p.Languages(), adm.present) {
 				continue
 			}
 			if !be.HasBackgroundWork(g, repoName) {
@@ -370,7 +392,9 @@ func (m *Manager) backgroundCensus(g graph.Store, roots map[string]string) {
 	// EagerLSP off no fast tier runs, so there is no deferred delta to
 	// complement. The census goes through the spawn-free peek —
 	// ProviderForSpecWorkspace would pin AND lazily spawn a server per
-	// (spec, repo) just to read two markers.
+	// (spec, repo) just to read two markers. Winners are arbitrated per
+	// repo (pure metadata, no scan): the winning spec for a language can
+	// only drain the repos that contain that language.
 	if !m.config.EagerLSP || m.lspRouter == nil {
 		return
 	}
@@ -379,16 +403,17 @@ func (m *Manager) backgroundCensus(g graph.Store, roots map[string]string) {
 		m.logger.Debug("background lane: router lacks the spawn-free peek; skipping router census")
 		return
 	}
-	for _, name := range m.routerCensusWinners(present, gateOnPresence) {
-		provider, err := peekRouter.PeekProviderForSpec(name)
-		if err != nil {
-			continue
-		}
-		be, ok := provider.(BackgroundEnricher)
-		if !ok {
-			continue
-		}
-		for _, repoName := range repoNames {
+	for _, repoName := range repoNames {
+		adm := admitted[repoName]
+		for _, name := range m.routerCensusWinners(adm.present, adm.gate) {
+			provider, err := peekRouter.PeekProviderForSpec(name)
+			if err != nil {
+				continue
+			}
+			be, ok := provider.(BackgroundEnricher)
+			if !ok {
+				continue
+			}
 			if !be.HasBackgroundWork(g, repoName) {
 				continue
 			}
@@ -793,11 +818,39 @@ func (m *Manager) EnrichAll(g graph.Store, roots map[string]string, opts EnrichO
 // composition signal EnrichAll orders providers by (primary language first).
 func (m *Manager) repoLanguages(g graph.Store, roots map[string]string) (map[string]bool, map[string]int, map[string]int) {
 	present := make(map[string]bool)
-	counts := make(map[string]int, len(roots))
 	// langCounts is the enrichable-node count per language across all repos —
 	// the composition signal EnrichAll ranks providers by so the dominant
 	// language enriches first.
 	langCounts := make(map[string]int)
+	perRepo, counts := m.repoLanguagesPerRepo(g, roots)
+	for _, rc := range perRepo {
+		for lang := range rc.present {
+			present[lang] = true
+		}
+		for lang, count := range rc.langCounts {
+			langCounts[lang] += count
+		}
+	}
+	return present, counts, langCounts
+}
+
+// repoLangCensus is one repository's language evidence for admission
+// decisions: which languages its own rows make present and how many
+// enrichable nodes each holds.
+type repoLangCensus struct {
+	present    map[string]bool
+	langCounts map[string]int
+}
+
+// repoLanguagesPerRepo groups the repo-language projection PER REPOSITORY
+// (plus enrichable-node totals per repo, for deadline scaling and ordering).
+// The background census keys admission off this rather than the aggregate
+// view above: presence and the admission floor are each repo's own facts —
+// aggregation would let two sub-floor repos vouch for each other, or a Go
+// repo make its neighbor's Python tree "contain" Go.
+func (m *Manager) repoLanguagesPerRepo(g graph.Store, roots map[string]string) (map[string]*repoLangCensus, map[string]int) {
+	perRepo := make(map[string]*repoLangCensus, len(roots))
+	counts := make(map[string]int, len(roots))
 	repoPrefixes := make([]string, 0, len(roots))
 	for repoPrefix := range roots {
 		repoPrefixes = append(repoPrefixes, repoPrefix)
@@ -823,11 +876,16 @@ func (m *Manager) repoLanguages(g graph.Store, roots map[string]string) (map[str
 		if IsFixtureCensusPath(row.FilePath) {
 			continue
 		}
-		present[row.Language] = true
+		rc := perRepo[row.RepoPrefix]
+		if rc == nil {
+			rc = &repoLangCensus{present: map[string]bool{}, langCounts: map[string]int{}}
+			perRepo[row.RepoPrefix] = rc
+		}
+		rc.present[row.Language] = true
+		rc.langCounts[row.Language] += row.Count
 		counts[row.RepoPrefix] += row.Count
-		langCounts[row.Language] += row.Count
 	}
-	return present, counts, langCounts
+	return perRepo, counts
 }
 
 // applyAdmissionFloor removes from present every language whose enrichable
