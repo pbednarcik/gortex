@@ -323,6 +323,66 @@ func TestLSP_Enrich_HeavyDelta_ErroredNodesMakeThePassPartial(t *testing.T) {
 	assert.False(t, nodeHeavyStamped(g.GetNode("a.go::Alpha")))
 }
 
+// The references confirm phase is half the drain's mandate — a failed
+// findReferences leaves its edges unconfirmed exactly the way a failed
+// incomingCalls leaves a node unstamped, and the marker must stay away for
+// the same reason. (The incoming sweep's error already flips Partial; this
+// pins the confirm phase's.)
+func TestLSP_Enrich_HeavyDelta_FailedReferencesMakeThePassPartial(t *testing.T) {
+	t.Setenv(SweepEnv, "")
+	t.Setenv(HeavyRequestsEnv, "")
+
+	repoRoot, g, edge := heavyDeltaFixture(t)
+	server := newFakeLSPServer()
+	rig := newHeavyDeltaRig(server.handle, repoRoot)
+	rig.incomingResult = []CallHierarchyIncomingCall{}
+	// Overrides the rig's answering handler: every confirm round-trip fails
+	// while the rest of the drain (prepare/incoming) stays healthy.
+	server.handle("textDocument/references", func(json.RawMessage) (any, *jsonRPCError) {
+		return nil, &jsonRPCError{Code: -32603, Message: "transient"}
+	})
+
+	p, cleanup := providerWithFakeServer(t, server, []string{"go"})
+	defer cleanup()
+	p.heavyDelta = true
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	result, err := p.EnrichRepoContext(ctx, g, "", repoRoot, nil)
+	require.NoError(t, err)
+	require.NotNil(t, result)
+	assert.True(t, result.Partial,
+		"a failed references confirm leaves the edge undrained — the pass must not present as complete")
+	assert.Equal(t, 0.7, edge.Confidence, "the errored confirm must not move the edge")
+}
+
+// A file the drain cannot read (deleted from disk after the frontier was
+// computed, before any watcher bracket could cancel) skips every node and
+// confirm target it holds. The skipped work is invisible to the breaker and
+// to per-node stamps alike — only Partial keeps the marker honest.
+func TestLSP_Enrich_HeavyDelta_UnreadableFileMakesThePassPartial(t *testing.T) {
+	t.Setenv(SweepEnv, "")
+	t.Setenv(HeavyRequestsEnv, "")
+
+	repoRoot, g, _ := heavyDeltaFixture(t)
+	server := newFakeLSPServer()
+	newHeavyDeltaRig(server.handle, repoRoot)
+
+	p, cleanup := providerWithFakeServer(t, server, []string{"go"})
+	defer cleanup()
+	p.heavyDelta = true
+
+	require.NoError(t, os.Remove(filepath.Join(repoRoot, "svc.go")))
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	result, err := p.EnrichRepoContext(ctx, g, "", repoRoot, nil)
+	require.NoError(t, err)
+	require.NotNil(t, result)
+	assert.True(t, result.Partial,
+		"an unreadable frontier file's work was skipped, not drained")
+}
+
 // A drain is confirm-heavy and add-light by nature — the productivity
 // checkpoint's yield floor (tuned for foreground passes with hover/defs
 // yield) must not cut it.

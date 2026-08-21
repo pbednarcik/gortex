@@ -1099,11 +1099,13 @@ func (p *Provider) EnrichRepoContext(ctx context.Context, g graph.Store, repoPre
 	// the phase's breaker permanently.
 	targetedBreaker := newPhaseBreaker(lspPhaseFailureStreakLimit(), p.logger, "targeted", repoPrefix)
 	hoverBreaker := newPhaseBreaker(lspPhaseFailureStreakLimit(), p.logger, "hover", repoPrefix)
-	// drainErrored counts heavyDelta nodes whose heavy fetch ERRORED (and
-	// so stayed unstamped). Any non-zero count marks the pass Partial: the
-	// completion marker must never claim a tier whose drain failed
-	// anywhere, and the breaker cannot catch a server dying mid-sweep —
-	// any early success permanently disarms it.
+	// drainErrored counts heavyDelta work items whose heavy fetch ERRORED
+	// (a node's incoming, a target's references confirm, or a whole file /
+	// confirm group behind a failed acquire) and so stayed undrained. Any
+	// non-zero count marks the pass Partial: the completion marker must
+	// never claim a tier whose drain skipped anything on an error, and the
+	// breaker cannot catch a server dying mid-sweep — any early success
+	// permanently disarms it.
 	var drainErrored atomic.Int64
 
 	// Phase boundary timestamps: the completion log breaks the pass wall time
@@ -1254,6 +1256,11 @@ func (p *Provider) EnrichRepoContext(ctx context.Context, g graph.Store, repoPre
 				// a later phase that shares the file.
 				content, release, err := session.acquire(p.client, absPath)
 				if err != nil {
+					if p.heavyDelta {
+						// The whole group's confirms are skipped — the
+						// drain did not cover them.
+						drainErrored.Add(1)
+					}
 					return
 				}
 				defer release()
@@ -1291,6 +1298,11 @@ func (p *Provider) EnrichRepoContext(ctx context.Context, g graph.Store, repoPre
 						col := identifierColumn(content, toNode.StartLine, toNode.Name)
 						refs, err := p.findReferences(absRoot, grp.rel, line, col)
 						targetedBreaker.observe(err == nil)
+						if err != nil && p.heavyDelta {
+							// This target's edges stay unconfirmed — counted
+							// once here; repeats skip through the cache.
+							drainErrored.Add(1)
+						}
 						cr = cachedRefs{refs: refs, ok: err == nil}
 						refsByTarget[t.edge.To] = cr
 					}
@@ -1766,6 +1778,10 @@ func (p *Provider) EnrichRepoContext(ctx context.Context, g graph.Store, repoPre
 			if err != nil {
 				p.logger.Debug("LSP enrich: didOpen failed",
 					zap.String("file", ft.rel), zap.Error(err))
+				if p.heavyDelta {
+					// Every frontier node in this file is skipped unstamped.
+					drainErrored.Add(1)
+				}
 				return
 			}
 			defer release()
