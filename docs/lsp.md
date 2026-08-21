@@ -346,6 +346,16 @@ must not be recorded as a drained tier. Lane progress is surfaced in the
 daemon health snapshot under `background_lane` and in the `background
 enrichment complete` / `partial` / `failed` log lines.
 
+A repository mutation — a watcher batch, a branch switch, a full re-index —
+never overlaps a drain of the languages it touches: the mutation cancels
+that drain and waits it out before its first store write, revokes the
+lane's completion claim for the mutated languages, and re-enqueues the repo
+once the batch and its incremental enrichment settle. The fast path always
+wins; the lane drains the delta afterwards, resuming from the per-file
+stamps so untouched files cost no requests. Drains of unrelated languages
+keep running — they write disjoint rows, and cancelling them would only
+re-pay their server spawn on every edit.
+
 On-demand confirmation stays disabled under `background`, exactly as under
 `off`: `find_usages` / `get_callers` answer from the stored graph tiers,
 which the drain deepens as it lands rather than a live round trip.
