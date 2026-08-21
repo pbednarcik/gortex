@@ -171,13 +171,14 @@ func TestLifecycleUntrackCancelsBackgroundLane(t *testing.T) {
 	t.Cleanup(func() { require.NoError(t, mgr.Close()) })
 	mi.SetSemanticManager(mgr)
 
-	mgr.StartBackgroundLane(context.Background(), mi.Graph(), nil)
-	mgr.RequeueBackgroundForRepo(mi.Graph(), "repo", repo, []string{"go"})
+	// The census enqueue is cooldown-free — it starts the drain the test
+	// then holds in flight across the untrack.
+	mgr.StartBackgroundLane(context.Background(), mi.Graph(), map[string]string{"repo": repo})
 	select {
 	case r := <-bg.drained:
 		require.Equal(t, "repo", r)
 	case <-time.After(2 * time.Second):
-		t.Fatal("requeue did not start the drain")
+		t.Fatal("census did not start the drain")
 	}
 
 	done := make(chan struct{})

@@ -193,14 +193,23 @@ func (m *Manager) CancelBackgroundDrains(repoName string, langs []string) {
 	m.background.cancelRepo(repoName, langKeySet(langs))
 }
 
+// laneMutationCooldown is the quiet period a mutation-requeued drain waits
+// before becoming eligible; every further mutation of the repo slides the
+// window. Without it an editing session would start (and cancel) a drain —
+// a server spawn, and for C# a solution load — per save batch; with it the
+// session coalesces into one drain after its last save. Census and
+// pass-end enqueues carry no cooldown: a completed fast pass is the
+// designed trigger, not a competing writer.
+var laneMutationCooldown = 60 * time.Second
+
 // RequeueBackgroundForRepo revokes the drained claims the mutation
 // invalidated and re-enqueues the repo for the background lane. Called
 // after a repository mutation batch — its incremental enrichment included —
 // with the languages of the re-parsed / evicted files: providers whose
 // languages intersect get InvalidateBackground (the re-parse discarded
 // those files' progress stamps, so the completion marker no longer
-// describes the store) and re-enter the queue. The re-drain is
-// request-free for untouched files, whose stamps survive.
+// describes the store) and re-enter the queue after laneMutationCooldown.
+// The re-drain is request-free for untouched files, whose stamps survive.
 func (m *Manager) RequeueBackgroundForRepo(g graph.Store, repoName, repoRoot string, langs []string) {
 	if !m.config.Enabled || repoName == "" || repoRoot == "" {
 		return
@@ -225,7 +234,10 @@ func (m *Manager) RequeueBackgroundForRepo(g graph.Store, repoName, repoRoot str
 		if ls := provider.Languages(); len(ls) > 0 {
 			lang = ls[0]
 		}
-		if m.background.enqueue(backgroundTask{repoName: repoName, repoRoot: repoRoot, provider: provider, lang: lang}) {
+		if m.background.enqueue(backgroundTask{
+			repoName: repoName, repoRoot: repoRoot, provider: provider, lang: lang,
+			notBefore: time.Now().Add(laneMutationCooldown),
+		}) {
 			m.logger.Info("background lane: repository mutation requeued repo",
 				zap.String("provider", provider.Name()),
 				zap.String("repo", repoName),

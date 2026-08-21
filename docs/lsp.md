@@ -354,7 +354,11 @@ once the batch and its incremental enrichment settle. The fast path always
 wins; the lane drains the delta afterwards, resuming from the per-file
 stamps so untouched files cost no requests. Drains of unrelated languages
 keep running — they write disjoint rows, and cancelling them would only
-re-pay their server spawn on every edit.
+re-pay their server spawn on every edit. A mutation-requeued drain waits
+out a quiet period first (60s, slid forward by every further mutation), so
+an editing session coalesces into one drain after its last save instead of
+spawning and cancelling a server per batch. Untracking a repository
+cancels and discards its lane work outright.
 
 On-demand confirmation stays disabled under `background`, exactly as under
 `off`: `find_usages` / `get_callers` answer from the stored graph tiers,
