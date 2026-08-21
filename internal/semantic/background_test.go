@@ -667,3 +667,44 @@ func TestBackgroundScheduler_RetryBackoff(t *testing.T) {
 		assert.Equal(t, 0, st.Pending)
 	})
 }
+
+// A retry streak must not outlive its task: when the retried attempt is
+// terminally dropped (no work at dequeue, cancellation between dequeue and
+// drain, a panic), finishInFlight clears the streak — otherwise every
+// (repo, provider) pair that ever failed leaks a map entry for the daemon's
+// lifetime.
+func TestBackgroundScheduler_TerminalDropClearsFailStreak(t *testing.T) {
+	prevBase, prevCap := backgroundRetryBase, backgroundRetryCap
+	backgroundRetryBase, backgroundRetryCap = 150*time.Millisecond, time.Second
+	t.Cleanup(func() { backgroundRetryBase, backgroundRetryCap = prevBase, prevCap })
+
+	var work atomic.Bool
+	work.Store(true)
+	p := &mockBackgroundProvider{
+		mockProvider: mockProvider{name: "mock-bg", languages: []string{"go"}, available: true},
+		drained:      make(chan string, 8),
+		hasWork:      func(string) bool { return work.Load() },
+		drainFunc: func(int) (*EnrichResult, error) {
+			return nil, errors.New("server still warming")
+		},
+	}
+	s := newBackgroundScheduler(zap.NewNop())
+	defer s.close()
+	s.start(context.Background(), graph.New())
+
+	require.True(t, s.enqueue(backgroundTask{repoName: "repo-a", repoRoot: "/tmp/repo-a", provider: p, lang: "go"}))
+	select {
+	case <-p.drained:
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for the first attempt")
+	}
+	// The tier drains out from under the parked retry (a foreground pass
+	// finished the work): the retried attempt finds nothing to do and is
+	// dropped — its streak must go with it.
+	work.Store(false)
+	require.Eventually(t, func() bool {
+		s.mu.Lock()
+		defer s.mu.Unlock()
+		return len(s.pending) == 0 && len(s.failStreaks) == 0
+	}, 2*time.Second, 20*time.Millisecond, "the dropped retry's fail streak must be cleared")
+}
