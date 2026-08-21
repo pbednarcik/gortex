@@ -18,6 +18,12 @@ type backgroundTask struct {
 	repoRoot string
 	provider Provider // drained only if it also implements BackgroundEnricher
 	lang     string
+	// notBefore holds the task out of dequeue until the instant passes
+	// (zero = immediately eligible). Mutation requeues set it to a quiet
+	// period after the mutation, and every further mutation slides it, so
+	// an editing session coalesces into ONE drain after its last save —
+	// not a server spawn per batch, each cancelled by the next.
+	notBefore time.Time
 }
 
 func (t backgroundTask) key() string { return t.repoName + "\x00" + t.provider.Name() }
@@ -137,6 +143,14 @@ func (s *backgroundScheduler) enqueue(t backgroundTask) bool {
 		return true
 	}
 	if s.queued[t.key()] {
+		// Already pending — slide its eligibility window forward when the
+		// new trigger cools longer (the drain runs after the session's
+		// LAST mutation), but add no second task.
+		for i := range s.pending {
+			if s.pending[i].key() == t.key() && t.notBefore.After(s.pending[i].notBefore) {
+				s.pending[i].notBefore = t.notBefore
+			}
+		}
 		return false
 	}
 	s.queued[t.key()] = true
@@ -193,14 +207,30 @@ func (s *backgroundScheduler) close() {
 func (s *backgroundScheduler) run(ctx context.Context, g graph.Store) {
 	defer close(s.done)
 	for {
-		t, dctx, ok := s.next(ctx)
+		t, dctx, ok, wait := s.next(ctx)
 		if !ok {
+			// wait > 0 means every pending task is still cooling — sleep
+			// until the earliest becomes eligible (or new work / shutdown
+			// arrives first).
+			var timerC <-chan time.Time
+			var timer *time.Timer
+			if wait > 0 {
+				timer = time.NewTimer(wait)
+				timerC = timer.C
+			}
 			select {
 			case <-s.wake:
-				continue
+			case <-timerC:
 			case <-ctx.Done():
+				if timer != nil {
+					timer.Stop()
+				}
 				return
 			}
+			if timer != nil {
+				timer.Stop()
+			}
+			continue
 		}
 		// Close can land between dequeue and drain — never start a drain
 		// (and spawn its server) after cancellation. The registration is
@@ -217,22 +247,40 @@ func (s *backgroundScheduler) run(ctx context.Context, g graph.Store) {
 	}
 }
 
-// next dequeues the oldest pending task and registers its per-drain
-// cancellation handles, so cancelRepo can target exactly one drain without
-// touching the worker or the lane context.
-func (s *backgroundScheduler) next(ctx context.Context) (backgroundTask, context.Context, bool) {
+// next dequeues the oldest ELIGIBLE pending task (its notBefore has
+// passed) and registers its per-drain cancellation handles, so cancelRepo
+// can target exactly one drain without touching the worker or the lane
+// context. When only cooling tasks remain, ok is false and wait says how
+// long until the earliest becomes eligible (0 = nothing pending at all).
+func (s *backgroundScheduler) next(ctx context.Context) (t backgroundTask, dctx context.Context, ok bool, wait time.Duration) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if len(s.pending) == 0 || s.closed {
-		return backgroundTask{}, nil, false
+		return backgroundTask{}, nil, false, 0
 	}
-	t := s.pending[0]
-	s.pending = s.pending[1:]
+	now := time.Now()
+	idx := -1
+	var earliest time.Time
+	for i, cand := range s.pending {
+		if cand.notBefore.After(now) {
+			if earliest.IsZero() || cand.notBefore.Before(earliest) {
+				earliest = cand.notBefore
+			}
+			continue
+		}
+		idx = i
+		break
+	}
+	if idx == -1 {
+		return backgroundTask{}, nil, false, time.Until(earliest)
+	}
+	t = s.pending[idx]
+	s.pending = append(s.pending[:idx], s.pending[idx+1:]...)
 	s.inFlight[t.key()] = t
 	dctx, dcancel := context.WithCancel(ctx)
 	s.inFlightCancel[t.key()] = dcancel
 	s.inFlightDone[t.key()] = make(chan struct{})
-	return t, dctx, true
+	return t, dctx, true, 0
 }
 
 // finishInFlight settles a dequeued task: the requeue-or-clear bookkeeping,
