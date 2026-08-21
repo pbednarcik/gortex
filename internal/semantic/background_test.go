@@ -26,6 +26,11 @@ type mockBackgroundProvider struct {
 	partial      bool                   // drain returns a Partial result
 	drainErr     error                  // non-nil: drain returns this error
 	panicOnDrain bool
+	invalidated  []string // repos whose drained claim was revoked
+}
+
+func (m *mockBackgroundProvider) InvalidateBackground(_ graph.Store, repo string) {
+	m.invalidated = append(m.invalidated, repo)
 }
 
 func (m *mockBackgroundProvider) HasBackgroundWork(_ graph.Store, repo string) bool {
