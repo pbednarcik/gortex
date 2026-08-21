@@ -329,12 +329,10 @@ func TestManagerBackgroundLane_MutationCancelAndRequeue(t *testing.T) {
 	}
 }
 
-// nil langs is the unscoped requeue: a mutation whose file scope was
-// unknown (a full-root incremental walk) revokes every provider's claim,
-// mirroring CancelBackgroundDrains' nil-is-unscoped contract. An empty
-// scoped slice, by contrast, proves no lane-relevant rows were touched and
-// requeues nothing.
-func TestManagerBackgroundLane_UnscopedRequeue(t *testing.T) {
+// A mutation hold pairs with the requeue on the manager surface: while the
+// hold stands, even an immediately-eligible enqueue (the pass-end shape)
+// stays parked; the release lets it through.
+func TestManagerBackgroundLane_MutationHold(t *testing.T) {
 	p := &mockBackgroundProvider{
 		mockProvider: mockProvider{name: "go", languages: []string{"go"}, available: true},
 		drained:      make(chan string, 2),
@@ -343,20 +341,20 @@ func TestManagerBackgroundLane_UnscopedRequeue(t *testing.T) {
 	defer func() { require.NoError(t, mgr.Close()) }()
 	mgr.StartBackgroundLane(context.Background(), g, nil) // worker up, queue empty
 
-	prevCooldown := laneMutationCooldown
-	laneMutationCooldown = 50 * time.Millisecond
-	defer func() { laneMutationCooldown = prevCooldown }()
-
-	mgr.RequeueBackgroundForRepo(g, "default", roots["default"], []string{})
-	assert.Empty(t, p.invalidated, "an empty scoped requeue must not revoke claims")
-
-	mgr.RequeueBackgroundForRepo(g, "default", roots["default"], nil)
-	assert.Equal(t, []string{"default"}, p.invalidated,
-		"the unscoped requeue must revoke every provider's claim")
+	release := mgr.HoldBackgroundMutations("default")
+	// The fast pass's own enqueue, landing mid-mutation.
+	_, _, err := mgr.EnrichAll(g, roots, EnrichOptions{})
+	require.NoError(t, err)
+	select {
+	case repo := <-p.drained:
+		t.Fatalf("held repo drained %q before the mutation released", repo)
+	case <-time.After(150 * time.Millisecond):
+	}
+	release()
 	select {
 	case repo := <-p.drained:
 		assert.Equal(t, "default", repo)
 	case <-time.After(2 * time.Second):
-		t.Fatal("unscoped requeue did not re-drain the repo")
+		t.Fatal("released hold did not let the parked task drain")
 	}
 }
