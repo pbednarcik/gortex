@@ -272,6 +272,57 @@ func TestLSP_Enrich_HeavyDelta_FailedIncomingLeavesNodeUnstamped(t *testing.T) {
 	assert.True(t, nodeHeavyStamped(g.GetNode("a.go::Alpha")), "the successful retry stamps it")
 }
 
+// A drain that ERRORED on part of its frontier must report Partial: the
+// per-node honesty (failed nodes stay unstamped) is not enough on its own,
+// because a clean-looking result lets the lane record its completion
+// marker — and a marker over an error-riddled drain claims a drained tier
+// that never drained, parking the failed nodes until some unrelated
+// mutation happens to revoke the claim. The breaker cannot catch this: any
+// early success permanently disarms it, which is exactly the shape of a
+// server dying mid-sweep.
+func TestLSP_Enrich_HeavyDelta_ErroredNodesMakeThePassPartial(t *testing.T) {
+	t.Setenv(SweepEnv, "full")
+
+	repoRoot := t.TempDir()
+	require.NoError(t, os.WriteFile(filepath.Join(repoRoot, "a.go"),
+		[]byte("package p\n\nfunc Alpha() {}\n"), 0o644))
+	g := graph.New()
+	g.AddNode(&graph.Node{ID: "a.go::Alpha", Kind: graph.KindFunction, Name: "Alpha",
+		FilePath: "a.go", StartLine: 3, EndLine: 3, Language: "go"})
+
+	server := newInstrumentedServer()
+	server.handle("textDocument/hover", func(json.RawMessage) (any, *jsonRPCError) { return nil, nil })
+	server.handle("textDocument/prepareCallHierarchy", func(params json.RawMessage) (any, *jsonRPCError) {
+		var req struct {
+			TextDocument struct {
+				URI string `json:"uri"`
+			} `json:"textDocument"`
+		}
+		_ = json.Unmarshal(params, &req)
+		return []CallHierarchyItem{{
+			Name: "subject", URI: req.TextDocument.URI,
+			SelectionRange: Range{Start: Position{Line: 2, Character: 5}, End: Position{Line: 2, Character: 10}},
+		}}, nil
+	})
+	server.handle("callHierarchy/incomingCalls", func(json.RawMessage) (any, *jsonRPCError) {
+		return nil, &jsonRPCError{Code: -32603, Message: "server dying"}
+	})
+
+	p, cleanup := providerWithInstrumentedServer(t, server, []string{"go"}, 1)
+	defer cleanup()
+	p.heavyDelta = true
+	p.caps = ServerCapabilities{CallHierarchyProvider: true, HoverProvider: true}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	result, err := p.EnrichRepoContext(ctx, g, "", repoRoot, nil)
+	require.NoError(t, err)
+	require.NotNil(t, result)
+	assert.True(t, result.Partial,
+		"a drain that errored on its frontier must not present as complete")
+	assert.False(t, nodeHeavyStamped(g.GetNode("a.go::Alpha")))
+}
+
 // A drain is confirm-heavy and add-light by nature — the productivity
 // checkpoint's yield floor (tuned for foreground passes with hover/defs
 // yield) must not cut it.
