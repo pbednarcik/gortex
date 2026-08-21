@@ -2,6 +2,7 @@ package semantic
 
 import (
 	"context"
+	"fmt"
 	"testing"
 	"time"
 
@@ -406,4 +407,75 @@ func TestManagerBackgroundLane_RequeueAppliesAdmissionFloor(t *testing.T) {
 	mgr.RequeueBackgroundForRepo(g, "default", roots["default"], []string{"go"})
 	assert.Zero(t, mgr.BackgroundLaneStatus().Pending, "a below-floor language must not re-enter the lane")
 	assert.Empty(t, p.invalidated, "the floor gates the whole lane pipeline, invalidation included")
+}
+
+// Census admission is PER REPO, matching production foreground enrichment
+// (each indexer enriches its own root): languages, floor, and winners come
+// from each repo's own rows. Aggregating across roots would let two
+// sub-floor repos vouch for each other — and each drain would be
+// unmarkable, re-spawning a server per repo on every restart.
+func TestManagerBackgroundLane_CensusFloorIsPerRepo(t *testing.T) {
+	t.Setenv("GORTEX_ENRICH_MIN_NODES", "16")
+	p := &mockBackgroundProvider{
+		mockProvider: mockProvider{name: "go", languages: []string{"go"}, available: true},
+		drained:      make(chan string, 4),
+	}
+	mgr := NewManager(Config{Enabled: true}, zap.NewNop())
+	mgr.RegisterProvider(p)
+	defer func() { require.NoError(t, mgr.Close()) }()
+
+	// Two repos of 10 go nodes each: below the floor individually, above it
+	// in aggregate. Neither may drain.
+	g := graph.New()
+	for _, repo := range []string{"repo-a", "repo-b"} {
+		for i := 0; i < 10; i++ {
+			g.AddNode(&graph.Node{
+				ID:   fmt.Sprintf("%s/main.go::fn%d", repo, i),
+				Kind: graph.KindFunction, Name: fmt.Sprintf("fn%d", i),
+				FilePath: repo + "/main.go", Language: "go", RepoPrefix: repo,
+			})
+		}
+	}
+	mgr.StartBackgroundLane(context.Background(), g,
+		map[string]string{"repo-a": "/tmp/repo-a", "repo-b": "/tmp/repo-b"})
+	select {
+	case repo := <-p.drained:
+		t.Fatalf("census enqueued %q: two sub-floor repos must not vouch for each other", repo)
+	case <-time.After(300 * time.Millisecond):
+	}
+	assert.Zero(t, mgr.BackgroundLaneStatus().Pending)
+}
+
+// Language presence is per repo too: a go repo tracked next to a python
+// repo must not make the census queue the go provider for the python repo
+// (its drain would spawn a server against a repo with none of its
+// languages — and could never mark itself done).
+func TestManagerBackgroundLane_CensusPresenceIsPerRepo(t *testing.T) {
+	t.Setenv("GORTEX_ENRICH_MIN_NODES", "0")
+	p := &mockBackgroundProvider{
+		mockProvider: mockProvider{name: "go", languages: []string{"go"}, available: true},
+		drained:      make(chan string, 4),
+	}
+	mgr := NewManager(Config{Enabled: true}, zap.NewNop())
+	mgr.RegisterProvider(p)
+	defer func() { require.NoError(t, mgr.Close()) }()
+
+	g := graph.New()
+	g.AddNode(&graph.Node{ID: "repo-go/main.go::main", Kind: graph.KindFunction, Name: "main",
+		FilePath: "repo-go/main.go", Language: "go", RepoPrefix: "repo-go"})
+	g.AddNode(&graph.Node{ID: "repo-py/main.py::main", Kind: graph.KindFunction, Name: "main",
+		FilePath: "repo-py/main.py", Language: "python", RepoPrefix: "repo-py"})
+	mgr.StartBackgroundLane(context.Background(), g,
+		map[string]string{"repo-go": "/tmp/repo-go", "repo-py": "/tmp/repo-py"})
+	select {
+	case repo := <-p.drained:
+		assert.Equal(t, "repo-go", repo)
+	case <-time.After(2 * time.Second):
+		t.Fatal("census did not enqueue the go repo")
+	}
+	select {
+	case repo := <-p.drained:
+		t.Fatalf("census enqueued %q for a provider none of whose languages it contains", repo)
+	case <-time.After(300 * time.Millisecond):
+	}
 }
