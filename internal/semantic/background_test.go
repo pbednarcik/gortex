@@ -2,6 +2,7 @@ package semantic
 
 import (
 	"context"
+	"errors"
 	"testing"
 	"time"
 
@@ -23,6 +24,7 @@ type mockBackgroundProvider struct {
 	block        chan struct{}          // non-nil: drain blocks until closed or ctx cancelled
 	ctxErr       chan error             // receives ctx.Err() when a blocked drain is cancelled
 	partial      bool                   // drain returns a Partial result
+	drainErr     error                  // non-nil: drain returns this error
 	panicOnDrain bool
 }
 
@@ -49,6 +51,9 @@ func (m *mockBackgroundProvider) EnrichBackground(ctx context.Context, _ graph.S
 			}
 			return nil, ctx.Err()
 		}
+	}
+	if m.drainErr != nil {
+		return nil, m.drainErr
 	}
 	return &EnrichResult{Provider: m.name, Language: "go", EdgesConfirmed: 1, Partial: m.partial}, nil
 }
@@ -230,6 +235,40 @@ func TestBackgroundScheduler(t *testing.T) {
 		assert.Empty(t, st.LastRepo)
 	})
 
+	t.Run("FailedDrainVisibleInStatus", func(t *testing.T) {
+		// A repeatedly failing repo must be visible on the health surface,
+		// not only in the logs — the lane has no retry loop, so a repo whose
+		// drain keeps erroring otherwise just silently never deepens.
+		p := newProvider()
+		p.drainErr = errors.New("lane server exploded")
+		s := newBackgroundScheduler(zap.NewNop())
+		defer s.close()
+		require.True(t, s.enqueue(task(p, "repo-a")))
+		s.start(context.Background(), graph.New())
+		assert.Equal(t, "repo-a", recv(t, p.drained))
+		require.Eventually(t, func() bool { return s.status().Failed == 1 }, 2*time.Second, 5*time.Millisecond)
+		st := s.status()
+		assert.Equal(t, "repo-a", st.LastFailedRepo)
+		assert.Contains(t, st.LastFailure, "lane server exploded")
+		assert.Zero(t, st.Drained, "a failed drain is not a completed drain")
+		assert.Empty(t, st.LastRepo)
+	})
+
+	t.Run("CancelledDrainIsNotAFailure", func(t *testing.T) {
+		// Shutdown cancellation is lifecycle, not pathology — it must not
+		// pollute the failure telemetry.
+		p := newProvider()
+		p.block = make(chan struct{}) // never closed — only cancellation frees it
+		s := newBackgroundScheduler(zap.NewNop())
+		require.True(t, s.enqueue(task(p, "repo-a")))
+		s.start(context.Background(), graph.New())
+		assert.Equal(t, "repo-a", recv(t, p.drained))
+		s.close()
+		st := s.status()
+		assert.Zero(t, st.Failed)
+		assert.Empty(t, st.LastFailedRepo)
+	})
+
 	t.Run("PanicInDrainDoesNotKillTheWorker", func(t *testing.T) {
 		core, obs := observer.New(zapcore.InfoLevel)
 		boom := &mockBackgroundProvider{
@@ -246,6 +285,9 @@ func TestBackgroundScheduler(t *testing.T) {
 		require.Eventually(t, func() bool {
 			return len(obs.FilterMessage("background enrichment panicked").All()) == 1
 		}, 2*time.Second, 5*time.Millisecond)
+		st := s.status()
+		assert.Equal(t, 1, st.Failed, "a panicking drain is a failed drain")
+		assert.Equal(t, "repo-a", st.LastFailedRepo)
 	})
 
 	t.Run("EnqueueDoesNotRequireOptIn", func(t *testing.T) {

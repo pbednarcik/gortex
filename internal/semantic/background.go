@@ -2,6 +2,7 @@ package semantic
 
 import (
 	"context"
+	"fmt"
 	"sync"
 	"time"
 
@@ -47,11 +48,18 @@ type backgroundScheduler struct {
 	wake     chan struct{} // buffered(1) nudge: new work or shutdown
 
 	// lane progress, surfaced through status() into the daemon health
-	// snapshot. Guarded by mu.
+	// snapshot. Guarded by mu. Failure telemetry covers errored and
+	// panicking drains but NOT shutdown cancellation (lifecycle, not
+	// pathology) and NOT partial drains (progress, re-triggered later) —
+	// the lane has no retry loop, so without this surface a repo whose
+	// drain keeps erroring silently never deepens.
 	inFlightRepo   string
 	lastRepo       string
 	lastDurationMs int64
 	drained        int
+	failed         int
+	lastFailedRepo string
+	lastFailure    string
 
 	cancel context.CancelFunc
 	done   chan struct{} // worker exit
@@ -66,6 +74,9 @@ type BackgroundLaneStatus struct {
 	LastRepo       string `json:"last_repo,omitempty"`
 	LastDurationMs int64  `json:"last_duration_ms,omitempty"`
 	Drained        int    `json:"drained"`
+	Failed         int    `json:"failed,omitempty"`
+	LastFailedRepo string `json:"last_failed_repo,omitempty"`
+	LastFailure    string `json:"last_failure,omitempty"`
 }
 
 func (s *backgroundScheduler) status() BackgroundLaneStatus {
@@ -78,6 +89,9 @@ func (s *backgroundScheduler) status() BackgroundLaneStatus {
 		LastRepo:       s.lastRepo,
 		LastDurationMs: s.lastDurationMs,
 		Drained:        s.drained,
+		Failed:         s.failed,
+		LastFailedRepo: s.lastFailedRepo,
+		LastFailure:    s.lastFailure,
 	}
 }
 
@@ -222,6 +236,9 @@ func (s *backgroundScheduler) drain(ctx context.Context, g graph.Store, t backgr
 		if r := recover(); r != nil {
 			s.mu.Lock()
 			s.inFlightRepo = ""
+			s.failed++
+			s.lastFailedRepo = t.repoName
+			s.lastFailure = fmt.Sprintf("panic: %v", r)
 			s.mu.Unlock()
 			s.logger.Error("background enrichment panicked",
 				zap.String("provider", t.provider.Name()),
@@ -254,10 +271,15 @@ func (s *backgroundScheduler) drain(ctx context.Context, g graph.Store, t backgr
 	partial := result != nil && result.Partial
 	s.mu.Lock()
 	s.inFlightRepo = ""
-	if err == nil && !partial {
+	switch {
+	case err == nil && !partial:
 		s.lastRepo = t.repoName
 		s.lastDurationMs = time.Since(startedAt).Milliseconds()
 		s.drained++
+	case err != nil && ctx.Err() == nil:
+		s.failed++
+		s.lastFailedRepo = t.repoName
+		s.lastFailure = err.Error()
 	}
 	s.mu.Unlock()
 	fields := []zap.Field{
