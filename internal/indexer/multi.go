@@ -2228,6 +2228,15 @@ func (mi *MultiIndexer) indexRepoRaw(repoPrefix string) (*IndexResult, error) {
 		return nil, fmt.Errorf("repository not found: %s", repoPrefix)
 	}
 
+	// A full re-index rewrites every row — no background drain of this
+	// repository may overlap it, whatever its language (the same rule
+	// IndexCtx applies on the single-indexer path). No requeue: the rebuilt
+	// index's own enrichment re-enqueues once the fast markers move, and
+	// the restart census covers an interrupted run.
+	if semMgr := mi.SemanticManager(); semMgr != nil {
+		semMgr.CancelBackgroundDrains(repoPrefix, nil)
+	}
+
 	// Evict existing data for this repo before re-indexing. Always — a lone
 	// repo is now stored prefixed (see SetRepoPrefix below), so the eviction
 	// must clear the prefixed slice regardless of repo count.
@@ -2441,6 +2450,11 @@ func (mi *MultiIndexer) incrementalEvictRepoRaw(repoPrefix, path string) (nodesR
 		return 0, 0, fmt.Errorf("repository mutation executor has no live indexer: %s", repoPrefix)
 	}
 
+	// Deferred first so LIFO runs the requeue after the complete forced-delete
+	// resolver/derived tail below — and after the topology gate closes.
+	requeueBackgroundLane := idx.backgroundMutationBracket([]string{path})
+	defer requeueBackgroundLane()
+
 	finishTopologyMutation := reach.BeginTopologyMutation(mi.graph)
 	topologyChanged := true
 	defer func() { finishTopologyMutation(topologyChanged) }()
@@ -2495,9 +2509,15 @@ func (mi *MultiIndexer) incrementalReindexRepoRawMode(repoPrefix string, paths [
 		return nil, fmt.Errorf("repository mutation executor has no live indexer: %s", repoPrefix)
 	}
 
-	// The stable per-repository lane is held before this executor runs. Take
-	// the global reachability topology gate second and keep it through the
-	// resolver, metadata, and derived tails to avoid lane/gate inversion.
+	// The stable per-repository lane is held before this executor runs. Wait
+	// out any background drain of the touched languages before the gate and
+	// the first store write; LIFO runs the requeue after the complete
+	// resolver/metadata/derived tail below.
+	requeueBackgroundLane := idx.backgroundMutationBracket(paths)
+	defer requeueBackgroundLane()
+
+	// Take the global reachability topology gate second and keep it through
+	// the resolver, metadata, and derived tails to avoid lane/gate inversion.
 	finishTopologyMutation := reach.BeginTopologyMutation(mi.graph)
 	topologyChanged := true
 	defer func() { finishTopologyMutation(topologyChanged) }()

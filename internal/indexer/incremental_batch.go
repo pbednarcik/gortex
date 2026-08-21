@@ -88,20 +88,6 @@ func (idx *Indexer) reindexIncrementalFilesBatched(
 	markerBatch *reparsePendingEnrichmentBatch,
 	surfaceFirstVersionChange bool,
 ) (DerivedInvalidationPlan, []string, []string, []string) {
-	// A background drain of the mutated languages must not overlap this
-	// batch: the store's node upsert is whole-row last-writer-wins, so a
-	// drain flushing its stale node copies behind the re-parse would
-	// clobber fresh rows (or resurrect an evicted file's) and stamp state
-	// it never visited. The cancel WAITS the drain out before the first
-	// store write — the eviction below — and the deferred requeue revokes
-	// the drained claim and re-enters the repo once the batch, its
-	// incremental enrichment included, has settled: fast path first, then
-	// the lane drains the delta.
-	if langs := idx.mutationBackgroundLanguages(staleFiles, deletedFiles); len(langs) > 0 {
-		idx.semanticMgr.CancelBackgroundDrains(idx.repoPrefix, langs)
-		defer idx.semanticMgr.RequeueBackgroundForRepo(idx.graph, idx.repoPrefix, idx.rootPath, langs)
-	}
-
 	var invalidation DerivedInvalidationPlan
 	idx.evictDeletedFilesBatched(deletedFiles, &invalidation)
 
@@ -145,30 +131,19 @@ func (idx *Indexer) reindexIncrementalFilesBatched(
 	return invalidation, reparsed, retryFailed, versionChanged
 }
 
-// mutationBackgroundLanguages collects the languages of the graph nodes a
-// mutation batch is about to rewrite or evict — exactly the languages whose
-// background drains conflict with it. Graph-derived on purpose: a brand-new
-// file has no rows a drain could clobber, and a deleted file's rows (which
-// an in-flight drain could resurrect after the eviction) are still readable
-// here, before the eviction runs. Empty when the lane cannot be running at
-// all (no semantic manager, or enrichment disabled).
-func (idx *Indexer) mutationBackgroundLanguages(staleFiles, deletedFiles []string) []string {
-	if idx.semanticMgr == nil || !idx.semanticMgr.Enabled() {
-		return nil
-	}
-	paths := make([]string, 0, len(staleFiles)+len(deletedFiles))
-	for _, rel := range staleFiles {
-		paths = append(paths, idx.prefixPath(filepath.FromSlash(rel)))
-	}
-	for _, rel := range deletedFiles {
-		paths = append(paths, idx.prefixPath(filepath.FromSlash(rel)))
-	}
-	if len(paths) == 0 {
+// mutationBackgroundLanguages collects the languages of the graph nodes the
+// given canonical graph paths currently hold — exactly the languages whose
+// background drains conflict with a mutation of those files. Graph-derived
+// on purpose: a brand-new file has no rows a drain could clobber, and a
+// deleted file's rows (which an in-flight drain could resurrect after the
+// eviction) are still readable before the eviction runs.
+func (idx *Indexer) mutationBackgroundLanguages(graphPaths []string) []string {
+	if len(graphPaths) == 0 {
 		return nil
 	}
 	seen := map[string]bool{}
 	var langs []string
-	for _, nodes := range idx.graph.GetFileNodesByPaths(paths) {
+	for _, nodes := range idx.graph.GetFileNodesByPaths(graphPaths) {
 		for _, n := range nodes {
 			if n == nil || n.Language == "" || seen[n.Language] {
 				continue
@@ -179,6 +154,43 @@ func (idx *Indexer) mutationBackgroundLanguages(staleFiles, deletedFiles []strin
 	}
 	sort.Strings(langs)
 	return langs
+}
+
+// backgroundMutationBracket is the repository mutation executors' guard
+// against the background lane. It cancels — and WAITS out — this repo's
+// drains for the languages the mutation is about to touch, and returns the
+// matching requeue for the caller to defer. The store's node upsert is
+// whole-row last-writer-wins, so a drain flushing its stale node copies
+// behind the mutation would clobber fresh rows (or resurrect an evicted
+// file's) and stamp state it never visited.
+//
+// Call it BEFORE the executor takes the topology gate and before its first
+// store write: the languages are read from the graph rows the mutation
+// will replace, and cancellation must not wait on an in-flight LSP call
+// while holding the gate. Defer the returned requeue FIRST (LIFO runs it
+// after the executor's other defers) so the lane is re-admitted only once
+// the complete tail — resolver, semantic, and derived passes included —
+// has finished writing: fast path first, then the lane drains the delta.
+//
+// files are reindex-shaped paths (absolute or root-relative); an empty
+// slice means the mutation's scope is unknown (a full-root incremental
+// walk), which cancels and requeues every language. The returned func is
+// never nil.
+func (idx *Indexer) backgroundMutationBracket(files []string) func() {
+	if idx.semanticMgr == nil || !idx.semanticMgr.Enabled() {
+		return func() {}
+	}
+	var langs []string
+	if len(files) > 0 {
+		langs = idx.mutationBackgroundLanguages(idx.graphFilePaths(files))
+		if len(langs) == 0 {
+			return func() {}
+		}
+	}
+	idx.semanticMgr.CancelBackgroundDrains(idx.repoPrefix, langs)
+	return func() {
+		idx.semanticMgr.RequeueBackgroundForRepo(idx.graph, idx.repoPrefix, idx.rootPath, langs)
+	}
 }
 
 func (idx *Indexer) reindexIncrementalStalePass(

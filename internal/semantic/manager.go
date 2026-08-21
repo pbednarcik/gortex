@@ -210,12 +210,17 @@ var laneMutationCooldown = 60 * time.Second
 // those files' progress stamps, so the completion marker no longer
 // describes the store) and re-enter the queue after laneMutationCooldown.
 // The re-drain is request-free for untouched files, whose stamps survive.
+// nil langs means the mutation's file scope was unknown (a full-root
+// incremental walk) — every provider's claim is suspect, mirroring
+// CancelBackgroundDrains' nil-is-unscoped contract. A scoped call whose
+// languages all filtered to empty has nothing to requeue.
 func (m *Manager) RequeueBackgroundForRepo(g graph.Store, repoName, repoRoot string, langs []string) {
 	if !m.config.Enabled || repoName == "" || repoRoot == "" {
 		return
 	}
 	set := langKeySet(langs)
-	if len(set) == 0 {
+	scoped := langs != nil
+	if scoped && len(set) == 0 {
 		return
 	}
 	invalidateAndEnqueue := func(provider Provider) {
@@ -223,7 +228,7 @@ func (m *Manager) RequeueBackgroundForRepo(g graph.Store, repoName, repoRoot str
 		if !ok || !provider.Available() || m.providerDisabled(provider.Name()) {
 			return
 		}
-		if !anyLangPresent(provider.Languages(), set) {
+		if scoped && !anyLangPresent(provider.Languages(), set) {
 			return
 		}
 		be.InvalidateBackground(g, repoName)
@@ -254,7 +259,7 @@ func (m *Manager) RequeueBackgroundForRepo(g graph.Store, repoName, repoRoot str
 	if !canPeek {
 		return
 	}
-	for _, name := range m.routerCensusWinners(set, true) {
+	for _, name := range m.routerCensusWinners(set, scoped) {
 		provider, err := peekRouter.PeekProviderForSpec(name)
 		if err != nil {
 			continue

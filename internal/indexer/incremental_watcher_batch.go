@@ -239,6 +239,11 @@ func (idx *Indexer) incrementalDiscoverWatcherPaths(root string, paths []string)
 // deletion executor. Unlike incrementalPointWatcherPath it never consults disk
 // presence to decide between reparse and deletion.
 func (idx *Indexer) incrementalEvictWatcherPath(path string) (nodesRemoved, edgesRemoved int, err error) {
+	// Deferred first so LIFO runs the requeue after the complete forced-delete
+	// resolver/semantic tail below — and after the topology gate closes.
+	requeueBackgroundLane := idx.backgroundMutationBracket([]string{path})
+	defer requeueBackgroundLane()
+
 	finishTopologyMutation := reach.BeginTopologyMutation(idx.graph)
 	topologyChanged := true
 	defer func() { finishTopologyMutation(topologyChanged) }()
@@ -291,6 +296,12 @@ func (idx *Indexer) incrementalPointWatcherPath(root, path string) (*IndexResult
 
 func (idx *Indexer) incrementalWatcherPaths(root string, paths []string, mode incrementalPathMode) (*IndexResult, error) {
 	// The coordinator owns the repository lane before invoking this executor.
+	// Wait out any background drain of the touched languages before the gate
+	// and the first store write; LIFO runs the requeue after the complete
+	// resolver/semantic/derived tail below.
+	requeueBackgroundLane := idx.backgroundMutationBracket(paths)
+	defer requeueBackgroundLane()
+
 	// Take the reachability topology gate second and retain it through resolver
 	// and derived catch-up so readers observe the complete old or new graph.
 	finishTopologyMutation := reach.BeginTopologyMutation(idx.graph)
