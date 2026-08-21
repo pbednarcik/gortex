@@ -407,7 +407,13 @@ func (s *backgroundScheduler) finishInFlight(t backgroundTask, retryDelay time.D
 		s.pending = append(s.pending, rt)
 		s.retries++
 	} else {
+		// Terminal drop — the key leaves the scheduler, and any streak a
+		// prior failure left goes with it (a cancelled, no-work, or
+		// panicking attempt earns no retry but must not strand a map entry
+		// for the daemon's lifetime; a later external enqueue starts fresh
+		// anyway).
 		delete(s.queued, t.key())
+		delete(s.failStreaks, t.key())
 	}
 	cancel := s.inFlightCancel[t.key()]
 	done := s.inFlightDone[t.key()]
