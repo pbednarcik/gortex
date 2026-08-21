@@ -1099,6 +1099,12 @@ func (p *Provider) EnrichRepoContext(ctx context.Context, g graph.Store, repoPre
 	// the phase's breaker permanently.
 	targetedBreaker := newPhaseBreaker(lspPhaseFailureStreakLimit(), p.logger, "targeted", repoPrefix)
 	hoverBreaker := newPhaseBreaker(lspPhaseFailureStreakLimit(), p.logger, "hover", repoPrefix)
+	// drainErrored counts heavyDelta nodes whose heavy fetch ERRORED (and
+	// so stayed unstamped). Any non-zero count marks the pass Partial: the
+	// completion marker must never claim a tier whose drain failed
+	// anywhere, and the breaker cannot catch a server dying mid-sweep —
+	// any early success permanently disarms it.
+	var drainErrored atomic.Int64
 
 	// Phase boundary timestamps: the completion log breaks the pass wall time
 	// out per phase (phase_*_ms) — an aggregate duration cannot say which pass
@@ -1825,6 +1831,12 @@ func (p *Provider) EnrichRepoContext(ctx context.Context, g graph.Store, repoPre
 						}
 						items, err := p.prepareCallHierarchy(absRoot, ft.rel, line, col)
 						if err != nil {
+							if p.heavyDelta {
+								// Reaching here under heavyDelta means the
+								// incoming side was wanted — an errored
+								// prepare leaves it unfetched.
+								drainErrored.Add(1)
+							}
 							continue
 						}
 						for _, item := range items {
@@ -1849,6 +1861,9 @@ func (p *Provider) EnrichRepoContext(ctx context.Context, g graph.Store, repoPre
 								// The node's incoming edges are still missing —
 								// a heavyDelta pass must not stamp it drained.
 								drainFailed = true
+								if p.heavyDelta {
+									drainErrored.Add(1)
+								}
 							}
 						}
 					case graph.KindType, graph.KindInterface:
@@ -2065,9 +2080,17 @@ func (p *Provider) EnrichRepoContext(ctx context.Context, g graph.Store, repoPre
 		zap.String("first_node_file", diagFirstNodeFile),
 		zap.Bool("targeted_breaker_tripped", targetedBreaker.isTripped()),
 		zap.Bool("hover_breaker_tripped", hoverBreaker.isTripped()),
+		zap.Int64("drain_errored", drainErrored.Load()),
 	)
 
 	result.BreakerTripped = targetedBreaker.isTripped() || hoverBreaker.isTripped()
+	if p.heavyDelta && drainErrored.Load() > 0 {
+		// Per-node honesty left the errored nodes unstamped; pass-level
+		// honesty keeps the completion marker away too. Partial, not an
+		// error: everything that succeeded is flushed and stamped, and the
+		// next trigger resumes from exactly the failed remainder.
+		result.Partial = true
+	}
 	if targetedBreaker.isTripped() && hoverBreaker.isTripped() &&
 		result.EdgesConfirmed == 0 && result.EdgesRebound == 0 &&
 		result.EdgesAdded == 0 && result.NodesEnriched == 0 {
