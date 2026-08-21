@@ -353,6 +353,59 @@ func TestLSPProvider_EnrichBackground_ReadinessErrorAbortsDrain(t *testing.T) {
 	assert.False(t, found, "no marker for a drain that never ran")
 }
 
+// The readiness leg can wedge inside a non-cancellable call — WaitReady's
+// spawn / initialize / package-restore legs take no context. The budget
+// must bound the WHOLE phase, not just the poll: on expiry the lane
+// instance is closed (which unblocks a stuck LSP Call via the client's
+// done channel and reaps the server), and if even that cannot free the
+// prober it is abandoned — the drain, and the cancelRepo waiter behind
+// it, must return rather than block a repository mutation.
+func TestLSPProvider_EnrichBackground_WedgedReadinessDoesNotBlock(t *testing.T) {
+	repoRoot, g, _ := heavyDeltaFixture(t)
+	ms := newMarkerStore(g)
+
+	server := newFakeLSPServer()
+	rig := newHeavyDeltaRig(server.handle, repoRoot)
+	lane, cleanup := providerWithFakeServer(t, server, []string{"go"})
+	defer cleanup()
+	lane.heavyDelta = true
+
+	p := NewProvider("fake-lsp", nil, []string{"go"}, false, 2, nil)
+	p.laneProviderFactory = func() (*Provider, error) { return lane, nil }
+	require.NoError(t, ms.SetEnrichmentState(graph.EnrichmentState{
+		RepoPrefix: "", Provider: p.Name(), IndexedSHA: "sha-fast"}))
+
+	prevBudget, prevGrace := backgroundLaneReadinessBudget, laneReadinessTeardownGrace
+	backgroundLaneReadinessBudget = 50 * time.Millisecond
+	laneReadinessTeardownGrace = 50 * time.Millisecond
+	defer func() {
+		backgroundLaneReadinessBudget, laneReadinessTeardownGrace = prevBudget, prevGrace
+	}()
+
+	block := make(chan struct{})
+	defer close(block) // free the abandoned prober goroutine at test end
+	prev := laneWaitReady
+	laneWaitReady = func(context.Context, *Provider, string) error { <-block; return nil }
+	defer func() { laneWaitReady = prev }()
+
+	done := make(chan error, 1)
+	go func() {
+		_, err := p.EnrichBackground(context.Background(), ms, "", repoRoot)
+		done <- err
+	}()
+	select {
+	case err := <-done:
+		require.Error(t, err, "a wedged readiness phase must surface an error")
+	case <-time.After(2 * time.Second):
+		t.Fatal("EnrichBackground blocked behind a wedged readiness probe")
+	}
+
+	total := rig.references.Load() + rig.prepareCall.Load() + rig.incoming.Load()
+	assert.Zero(t, total, "no drain runs behind a failed readiness gate")
+	_, found, _ := ms.GetEnrichmentState("", p.Name()+backgroundMarkerSuffix)
+	assert.False(t, found, "no marker for a drain that never ran")
+}
+
 // The lane marker records the fast tier's sha AS OF DRAIN START — a fast
 // pass finishing mid-drain moves the fast marker to a sha whose re-parsed
 // state this drain never visited.
