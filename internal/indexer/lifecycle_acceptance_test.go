@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/require"
 	"go.uber.org/zap"
@@ -12,6 +13,7 @@ import (
 	"github.com/zzet/gortex/internal/graph"
 	"github.com/zzet/gortex/internal/parser"
 	"github.com/zzet/gortex/internal/search"
+	"github.com/zzet/gortex/internal/semantic"
 )
 
 type lifecycleFailingBulkStore struct {
@@ -113,4 +115,87 @@ func TestLifecycleUntrackClosesIndexerAndCrashPool(t *testing.T) {
 	require.Nil(t, owned.parsePool, "untrack must release the repository crashpool")
 	_, err = owned.ExtractBuffer("go", "after.go", []byte("package after\n"))
 	require.ErrorIs(t, err, ErrIndexerClosed)
+}
+
+// laneUntrackProvider is a minimal semantic.Provider + BackgroundEnricher
+// whose drain blocks until cancelled, so the test can hold a lane drain in
+// flight across an UntrackRepo call.
+type laneUntrackProvider struct {
+	drained chan string
+	block   chan struct{}
+	ctxErr  chan error
+}
+
+func (p *laneUntrackProvider) Name() string        { return "lane-untrack" }
+func (p *laneUntrackProvider) Languages() []string { return []string{"go"} }
+func (p *laneUntrackProvider) Available() bool     { return true }
+func (p *laneUntrackProvider) Close() error        { return nil }
+func (p *laneUntrackProvider) Enrich(graph.Store, string) (*semantic.EnrichResult, error) {
+	return &semantic.EnrichResult{}, nil
+}
+func (p *laneUntrackProvider) EnrichFile(graph.Store, string, string) (*semantic.EnrichResult, error) {
+	return nil, nil
+}
+func (p *laneUntrackProvider) HasBackgroundWork(graph.Store, string) bool { return true }
+func (p *laneUntrackProvider) InvalidateBackground(graph.Store, string)   {}
+func (p *laneUntrackProvider) EnrichBackground(ctx context.Context, _ graph.Store, repo, _ string) (*semantic.EnrichResult, error) {
+	p.drained <- repo
+	select {
+	case <-p.block:
+		return &semantic.EnrichResult{}, nil
+	case <-ctx.Done():
+		p.ctxErr <- ctx.Err()
+		return nil, ctx.Err()
+	}
+}
+
+// Untracking a repository must also cancel and purge its background lane
+// work: a pending or in-flight drain otherwise outlives the graph purge,
+// spawns a server at the abandoned root, and writes the removed repo's
+// nodes back into the store.
+func TestLifecycleUntrackCancelsBackgroundLane(t *testing.T) {
+	repo := setupRepoDir(t, "repo")
+	mi := newLifecycleTestMultiIndexer(t)
+	t.Cleanup(func() { closeLifecycleTestMultiIndexer(t, mi) })
+
+	_, err := mi.TrackRepo(config.RepoEntry{Path: repo, Name: "repo"})
+	require.NoError(t, err)
+
+	bg := &laneUntrackProvider{
+		drained: make(chan string, 2),
+		block:   make(chan struct{}),
+		ctxErr:  make(chan error, 1),
+	}
+	mgr := semantic.NewManager(semantic.Config{Enabled: true}, zap.NewNop())
+	mgr.RegisterProvider(bg)
+	t.Cleanup(func() { require.NoError(t, mgr.Close()) })
+	mi.SetSemanticManager(mgr)
+
+	mgr.StartBackgroundLane(context.Background(), mi.Graph(), nil)
+	mgr.RequeueBackgroundForRepo(mi.Graph(), "repo", repo, []string{"go"})
+	select {
+	case r := <-bg.drained:
+		require.Equal(t, "repo", r)
+	case <-time.After(2 * time.Second):
+		t.Fatal("requeue did not start the drain")
+	}
+
+	done := make(chan struct{})
+	go func() { mi.UntrackRepo("repo"); close(done) }()
+	select {
+	case err := <-bg.ctxErr:
+		require.ErrorIs(t, err, context.Canceled)
+	case <-time.After(2 * time.Second):
+		t.Fatal("untrack did not cancel the in-flight background drain")
+	}
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("UntrackRepo did not return")
+	}
+	select {
+	case r := <-bg.drained:
+		t.Fatalf("untracked repo drained again: %q", r)
+	case <-time.After(150 * time.Millisecond):
+	}
 }

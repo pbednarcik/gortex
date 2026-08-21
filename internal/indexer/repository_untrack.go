@@ -88,6 +88,16 @@ func (mi *MultiIndexer) untrackRepoChecked(
 		return 0, 0, fmt.Errorf("indexer: drain repository %s before teardown: %w", repoPrefix, err)
 	}
 
+	// The background lane must not outlive the repository: a pending or
+	// in-flight drain would spawn a server at the abandoned root and write
+	// the purged repo's nodes back into the store. Cancel waits the drain
+	// out (all languages — the whole repo is going away) and purges its
+	// queued work; the restart census cannot resurrect it, since the repo
+	// leaves AllMetadata with this teardown.
+	if semMgr := mi.SemanticManager(); semMgr != nil {
+		semMgr.CancelBackgroundDrains(repoPrefix, nil)
+	}
+
 	mi.batchMutationGate.RLock()
 	defer mi.batchMutationGate.RUnlock()
 	finishTopologyMutation := reach.BeginTopologyMutation(mi.graph)
