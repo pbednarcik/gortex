@@ -182,6 +182,87 @@ func (m *Manager) CloseBackgroundLane() {
 	m.background.close()
 }
 
+// CancelBackgroundDrains cancels any background drain of repoName whose
+// provider languages intersect langs (empty = every provider) and RETURNS
+// ONLY AFTER the drain exited, purging matching queued drains as well. A
+// repository mutation calls it before its first store write: the store's
+// node upsert is whole-row last-writer-wins, so a drain flushing stale node
+// copies behind a re-parse would clobber fresh rows and stamp state it
+// never visited. Pair with RequeueBackgroundForRepo after the mutation.
+func (m *Manager) CancelBackgroundDrains(repoName string, langs []string) {
+	m.background.cancelRepo(repoName, langKeySet(langs))
+}
+
+// RequeueBackgroundForRepo revokes the drained claims the mutation
+// invalidated and re-enqueues the repo for the background lane. Called
+// after a repository mutation batch — its incremental enrichment included —
+// with the languages of the re-parsed / evicted files: providers whose
+// languages intersect get InvalidateBackground (the re-parse discarded
+// those files' progress stamps, so the completion marker no longer
+// describes the store) and re-enter the queue. The re-drain is
+// request-free for untouched files, whose stamps survive.
+func (m *Manager) RequeueBackgroundForRepo(g graph.Store, repoName, repoRoot string, langs []string) {
+	if !m.config.Enabled || repoName == "" || repoRoot == "" {
+		return
+	}
+	set := langKeySet(langs)
+	if len(set) == 0 {
+		return
+	}
+	invalidateAndEnqueue := func(provider Provider) {
+		be, ok := provider.(BackgroundEnricher)
+		if !ok || !provider.Available() || m.providerDisabled(provider.Name()) {
+			return
+		}
+		if !anyLangPresent(provider.Languages(), set) {
+			return
+		}
+		be.InvalidateBackground(g, repoName)
+		if !be.HasBackgroundWork(g, repoName) {
+			return
+		}
+		lang := ""
+		if ls := provider.Languages(); len(ls) > 0 {
+			lang = ls[0]
+		}
+		if m.background.enqueue(backgroundTask{repoName: repoName, repoRoot: repoRoot, provider: provider, lang: lang}) {
+			m.logger.Info("background lane: repository mutation requeued repo",
+				zap.String("provider", provider.Name()),
+				zap.String("repo", repoName),
+			)
+		}
+	}
+	for _, p := range m.providers {
+		invalidateAndEnqueue(p)
+	}
+	if !m.config.EagerLSP || m.lspRouter == nil {
+		return
+	}
+	peekRouter, canPeek := m.lspRouter.(backgroundPeekRouter)
+	if !canPeek {
+		return
+	}
+	for _, name := range m.routerCensusWinners(set, true) {
+		provider, err := peekRouter.PeekProviderForSpec(name)
+		if err != nil {
+			continue
+		}
+		invalidateAndEnqueue(provider)
+	}
+}
+
+// langKeySet lifts a language slice into the set form the scheduler and the
+// census gates share, dropping empties.
+func langKeySet(langs []string) map[string]bool {
+	set := make(map[string]bool, len(langs))
+	for _, l := range langs {
+		if l != "" {
+			set[l] = true
+		}
+	}
+	return set
+}
+
 // backgroundPeekRouter is the optional router capability the census needs:
 // a provider VALUE for a spec without pinning or lazily spawning its server.
 // The census only reads markers (HasBackgroundWork) and the drain spawns its
