@@ -3,6 +3,7 @@ package lsp
 import (
 	"context"
 	"errors"
+	"fmt"
 	"time"
 
 	"github.com/zzet/gortex/internal/graph"
@@ -56,6 +57,14 @@ func (p *Provider) HasBackgroundWork(g graph.Store, repoPrefix string) bool {
 // every node and record the marker with zero yield. Var so tests shrink it.
 var backgroundLaneReadinessBudget = 3 * time.Minute
 
+// laneReadinessTeardownGrace bounds how long the drain waits, after
+// closing a lane whose readiness budget expired, for the prober goroutine
+// to observe the teardown. A prober stuck in a leg the close cannot reach
+// is abandoned once the grace elapses — it can only leak until that leg
+// returns, and the alternative is blocking a repository mutation behind
+// cancelRepo. Var so tests shrink it.
+var laneReadinessTeardownGrace = 10 * time.Second
+
 // laneWaitReady is the readiness probe seam; tests substitute it.
 var laneWaitReady = func(ctx context.Context, lane *Provider, repoRoot string) error {
 	return lane.WaitReady(ctx, repoRoot)
@@ -87,14 +96,41 @@ func (p *Provider) EnrichBackground(ctx context.Context, g graph.Store, repoPref
 
 	if backgroundLaneReadinessBudget > 0 {
 		rctx, rcancel := context.WithTimeout(ctx, backgroundLaneReadinessBudget)
-		err := laneWaitReady(rctx, lane, repoRoot)
+		readyErr := make(chan error, 1)
+		wait := laneWaitReady // captured before the goroutine — the seam is swappable
+		go func() { readyErr <- wait(rctx, lane, repoRoot) }()
+		var err error
+		select {
+		case err = <-readyErr:
+		case <-rctx.Done():
+			// The prober can be wedged in a leg that takes no context —
+			// WaitReady's spawn, initialize, or package-restore. Closing
+			// the lane unblocks a stuck LSP Call (the client's done
+			// channel) and reaps the server; a prober even that cannot
+			// free is abandoned after the grace — the drain, and the
+			// cancelRepo waiter behind it, must return rather than block
+			// a repository mutation.
+			_ = lane.Close()
+			select {
+			case err = <-readyErr:
+			case <-time.After(laneReadinessTeardownGrace):
+				err = fmt.Errorf("lsp: background lane readiness prober abandoned: %w", rctx.Err())
+			}
+			if err == nil {
+				// The probe won its race with the budget after the close —
+				// but the lane is already torn down, so the drain cannot
+				// run against it. Undrained, retried at the next trigger.
+				err = rctx.Err()
+			}
+		}
 		rcancel()
 		if err != nil {
 			// Any gate failure aborts — ErrWorkspaceNotReady, a spawn
-			// failure inside WaitReady, or cancellation. Nothing ran and
-			// nothing is stamped, so the repo stays undrained and the next
-			// trigger retries; draining anyway would issue requests against
-			// a dead or unready server and mask this error with a later one.
+			// failure inside WaitReady, cancellation, or the wedged-prober
+			// teardown above. Nothing ran and nothing is stamped, so the
+			// repo stays undrained and the next trigger retries; draining
+			// anyway would issue requests against a dead or unready server
+			// and mask this error with a later one.
 			return nil, err
 		}
 	}
