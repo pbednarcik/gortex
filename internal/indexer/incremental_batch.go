@@ -88,6 +88,20 @@ func (idx *Indexer) reindexIncrementalFilesBatched(
 	markerBatch *reparsePendingEnrichmentBatch,
 	surfaceFirstVersionChange bool,
 ) (DerivedInvalidationPlan, []string, []string, []string) {
+	// A background drain of the mutated languages must not overlap this
+	// batch: the store's node upsert is whole-row last-writer-wins, so a
+	// drain flushing its stale node copies behind the re-parse would
+	// clobber fresh rows (or resurrect an evicted file's) and stamp state
+	// it never visited. The cancel WAITS the drain out before the first
+	// store write — the eviction below — and the deferred requeue revokes
+	// the drained claim and re-enters the repo once the batch, its
+	// incremental enrichment included, has settled: fast path first, then
+	// the lane drains the delta.
+	if langs := idx.mutationBackgroundLanguages(staleFiles, deletedFiles); len(langs) > 0 {
+		idx.semanticMgr.CancelBackgroundDrains(idx.repoPrefix, langs)
+		defer idx.semanticMgr.RequeueBackgroundForRepo(idx.graph, idx.repoPrefix, idx.rootPath, langs)
+	}
+
 	var invalidation DerivedInvalidationPlan
 	idx.evictDeletedFilesBatched(deletedFiles, &invalidation)
 
@@ -129,6 +143,42 @@ func (idx *Indexer) reindexIncrementalFilesBatched(
 		idx.reparsedThisRun.Store(true)
 	}
 	return invalidation, reparsed, retryFailed, versionChanged
+}
+
+// mutationBackgroundLanguages collects the languages of the graph nodes a
+// mutation batch is about to rewrite or evict — exactly the languages whose
+// background drains conflict with it. Graph-derived on purpose: a brand-new
+// file has no rows a drain could clobber, and a deleted file's rows (which
+// an in-flight drain could resurrect after the eviction) are still readable
+// here, before the eviction runs. Empty when the lane cannot be running at
+// all (no semantic manager, or enrichment disabled).
+func (idx *Indexer) mutationBackgroundLanguages(staleFiles, deletedFiles []string) []string {
+	if idx.semanticMgr == nil || !idx.semanticMgr.Enabled() {
+		return nil
+	}
+	paths := make([]string, 0, len(staleFiles)+len(deletedFiles))
+	for _, rel := range staleFiles {
+		paths = append(paths, idx.prefixPath(filepath.FromSlash(rel)))
+	}
+	for _, rel := range deletedFiles {
+		paths = append(paths, idx.prefixPath(filepath.FromSlash(rel)))
+	}
+	if len(paths) == 0 {
+		return nil
+	}
+	seen := map[string]bool{}
+	var langs []string
+	for _, nodes := range idx.graph.GetFileNodesByPaths(paths) {
+		for _, n := range nodes {
+			if n == nil || n.Language == "" || seen[n.Language] {
+				continue
+			}
+			seen[n.Language] = true
+			langs = append(langs, n.Language)
+		}
+	}
+	sort.Strings(langs)
+	return langs
 }
 
 func (idx *Indexer) reindexIncrementalStalePass(

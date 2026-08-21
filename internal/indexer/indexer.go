@@ -2286,6 +2286,14 @@ func (idx *Indexer) IndexCtx(ctx context.Context, root string) (*IndexResult, er
 			return rootErr
 		}
 
+		// A full re-index rewrites every row — no background drain of this
+		// repository may overlap it, whatever its language. No requeue
+		// needed here: the pass's own enrichment re-enqueues once the fast
+		// markers move (and the restart census covers an interrupted run).
+		if current.semanticMgr != nil {
+			current.semanticMgr.CancelBackgroundDrains(current.repoPrefix, nil)
+		}
+
 		finishTopologyMutation := reach.BeginTopologyMutation(current.graph)
 		defer finishTopologyMutation(true)
 
