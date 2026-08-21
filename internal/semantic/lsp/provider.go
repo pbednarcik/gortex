@@ -545,6 +545,47 @@ func (p *Provider) tierStamped(n *graph.Node) bool {
 	return nodeAlreadyStamped(n)
 }
 
+// drainErrorLedger classifies heavyDelta error-shaped skips per failure
+// site and retains a bounded sample of the failing targets. An aggregate
+// count is honesty without diagnosis: a pass reporting 20 errors must also
+// say WHICH request class failed and, for the first few, on WHAT —
+// otherwise the only way to identify a deterministic failure is a
+// debug-level rerun of a multi-minute drain.
+type drainErrorLedger struct {
+	confirmAcquire atomic.Int64 // a confirm group's file acquire failed — the whole group skipped
+	references     atomic.Int64 // a target's references confirm errored (counted once per target)
+	sweepAcquire   atomic.Int64 // a sweep file's acquire failed — its frontier nodes skipped
+	prepare        atomic.Int64 // prepareCallHierarchy errored where the incoming side was wanted
+	incoming       atomic.Int64 // incomingCalls errored — the node stays unstamped
+
+	mu      sync.Mutex
+	samples []string
+}
+
+// drainErrorSampleLimit bounds the per-pass sample so a server refusing
+// every request logs a screenful, not the corpus.
+const drainErrorSampleLimit = 25
+
+func (l *drainErrorLedger) record(counter *atomic.Int64, class, target string, err error) {
+	counter.Add(1)
+	l.mu.Lock()
+	if len(l.samples) < drainErrorSampleLimit {
+		l.samples = append(l.samples, fmt.Sprintf("%s %s: %v", class, target, err))
+	}
+	l.mu.Unlock()
+}
+
+func (l *drainErrorLedger) total() int64 {
+	return l.confirmAcquire.Load() + l.references.Load() + l.sweepAcquire.Load() +
+		l.prepare.Load() + l.incoming.Load()
+}
+
+func (l *drainErrorLedger) sampleList() []string {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return append([]string(nil), l.samples...)
+}
+
 // scopedPath re-attaches repoPrefix to a repo-relative path the language
 // server handed back: uriToPath returns repo-relative, but graph node
 // FilePaths are prefixed, so node lookups must re-prefix to match in a
@@ -1099,14 +1140,14 @@ func (p *Provider) EnrichRepoContext(ctx context.Context, g graph.Store, repoPre
 	// the phase's breaker permanently.
 	targetedBreaker := newPhaseBreaker(lspPhaseFailureStreakLimit(), p.logger, "targeted", repoPrefix)
 	hoverBreaker := newPhaseBreaker(lspPhaseFailureStreakLimit(), p.logger, "hover", repoPrefix)
-	// drainErrored counts heavyDelta work items whose heavy fetch ERRORED
+	// drainErrs counts heavyDelta work items whose heavy fetch ERRORED
 	// (a node's incoming, a target's references confirm, or a whole file /
-	// confirm group behind a failed acquire) and so stayed undrained. Any
-	// non-zero count marks the pass Partial: the completion marker must
-	// never claim a tier whose drain skipped anything on an error, and the
-	// breaker cannot catch a server dying mid-sweep — any early success
-	// permanently disarms it.
-	var drainErrored atomic.Int64
+	// confirm group behind a failed acquire) and so stayed undrained — per
+	// failure class, with a bounded target sample. Any non-zero total marks
+	// the pass Partial: the completion marker must never claim a tier whose
+	// drain skipped anything on an error, and the breaker cannot catch a
+	// server dying mid-sweep — any early success permanently disarms it.
+	drainErrs := &drainErrorLedger{}
 
 	// Phase boundary timestamps: the completion log breaks the pass wall time
 	// out per phase (phase_*_ms) — an aggregate duration cannot say which pass
@@ -1259,7 +1300,7 @@ func (p *Provider) EnrichRepoContext(ctx context.Context, g graph.Store, repoPre
 					if p.heavyDelta {
 						// The whole group's confirms are skipped — the
 						// drain did not cover them.
-						drainErrored.Add(1)
+						drainErrs.record(&drainErrs.confirmAcquire, "confirm-acquire", grp.rel, err)
 					}
 					return
 				}
@@ -1301,7 +1342,7 @@ func (p *Provider) EnrichRepoContext(ctx context.Context, g graph.Store, repoPre
 						if err != nil && p.heavyDelta {
 							// This target's edges stay unconfirmed — counted
 							// once here; repeats skip through the cache.
-							drainErrored.Add(1)
+							drainErrs.record(&drainErrs.references, "references", t.edge.To+" @ "+grp.rel, err)
 						}
 						cr = cachedRefs{refs: refs, ok: err == nil}
 						refsByTarget[t.edge.To] = cr
@@ -1780,7 +1821,7 @@ func (p *Provider) EnrichRepoContext(ctx context.Context, g graph.Store, repoPre
 					zap.String("file", ft.rel), zap.Error(err))
 				if p.heavyDelta {
 					// Every frontier node in this file is skipped unstamped.
-					drainErrored.Add(1)
+					drainErrs.record(&drainErrs.sweepAcquire, "sweep-acquire", ft.rel, err)
 				}
 				return
 			}
@@ -1851,7 +1892,7 @@ func (p *Provider) EnrichRepoContext(ctx context.Context, g graph.Store, repoPre
 								// Reaching here under heavyDelta means the
 								// incoming side was wanted — an errored
 								// prepare leaves it unfetched.
-								drainErrored.Add(1)
+								drainErrs.record(&drainErrs.prepare, "prepare", n.ID, err)
 							}
 							continue
 						}
@@ -1878,7 +1919,7 @@ func (p *Provider) EnrichRepoContext(ctx context.Context, g graph.Store, repoPre
 								// a heavyDelta pass must not stamp it drained.
 								drainFailed = true
 								if p.heavyDelta {
-									drainErrored.Add(1)
+									drainErrs.record(&drainErrs.incoming, "incoming", n.ID, ierr)
 								}
 							}
 						}
@@ -2096,16 +2137,28 @@ func (p *Provider) EnrichRepoContext(ctx context.Context, g graph.Store, repoPre
 		zap.String("first_node_file", diagFirstNodeFile),
 		zap.Bool("targeted_breaker_tripped", targetedBreaker.isTripped()),
 		zap.Bool("hover_breaker_tripped", hoverBreaker.isTripped()),
-		zap.Int64("drain_errored", drainErrored.Load()),
+		zap.Int64("drain_errored", drainErrs.total()),
+		zap.Int64("drain_errored_confirm_acquire", drainErrs.confirmAcquire.Load()),
+		zap.Int64("drain_errored_references", drainErrs.references.Load()),
+		zap.Int64("drain_errored_sweep_acquire", drainErrs.sweepAcquire.Load()),
+		zap.Int64("drain_errored_prepare", drainErrs.prepare.Load()),
+		zap.Int64("drain_errored_incoming", drainErrs.incoming.Load()),
 	)
 
 	result.BreakerTripped = targetedBreaker.isTripped() || hoverBreaker.isTripped()
-	if p.heavyDelta && drainErrored.Load() > 0 {
+	if p.heavyDelta && drainErrs.total() > 0 {
 		// Per-node honesty left the errored nodes unstamped; pass-level
 		// honesty keeps the completion marker away too. Partial, not an
 		// error: everything that succeeded is flushed and stamped, and the
 		// next trigger resumes from exactly the failed remainder.
 		result.Partial = true
+		// The sample is the diagnosis: without it, identifying a
+		// deterministic failure means re-running a multi-minute drain at
+		// debug level.
+		p.logger.Warn("LSP enrich: drain errors sampled",
+			zap.String("repo", repoPrefix),
+			zap.Int64("total", drainErrs.total()),
+			zap.Strings("samples", drainErrs.sampleList()))
 	}
 	if targetedBreaker.isTripped() && hoverBreaker.isTripped() &&
 		result.EdgesConfirmed == 0 && result.EdgesRebound == 0 &&

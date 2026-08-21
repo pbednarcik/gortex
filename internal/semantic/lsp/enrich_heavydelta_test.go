@@ -13,6 +13,9 @@ import (
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"go.uber.org/zap"
+	"go.uber.org/zap/zapcore"
+	"go.uber.org/zap/zaptest/observer"
 
 	"github.com/zzet/gortex/internal/graph"
 )
@@ -551,4 +554,65 @@ func TestLSP_Enrich_HeavyDelta_CancelResumes(t *testing.T) {
 	for _, id := range []string{"a.go::Alpha", "b.go::Beta"} {
 		assert.True(t, nodeHeavyStamped(g.GetNode(id)), "both nodes drained after the resume: %s", id)
 	}
+}
+
+// drain_errored alone is honesty without diagnosis: an operator staring at
+// "drain_errored: 20" cannot name the failing request class, let alone the
+// targets, without a debug-level rerun. The completion line must break the
+// count out per failure site, and a bounded sample of the failing targets
+// must land at warn.
+func TestLSP_Enrich_HeavyDelta_ErrorsAreClassifiedAndSampled(t *testing.T) {
+	t.Setenv(SweepEnv, "")
+	t.Setenv(HeavyRequestsEnv, "")
+
+	repoRoot, g, _ := heavyDeltaFixture(t)
+	server := newFakeLSPServer()
+	rig := newHeavyDeltaRig(server.handle, repoRoot)
+	rig.incomingResult = []CallHierarchyIncomingCall{}
+	// Every references confirm fails; the rest of the drain stays healthy,
+	// so exactly one class carries the errors.
+	server.handle("textDocument/references", func(json.RawMessage) (any, *jsonRPCError) {
+		return nil, &jsonRPCError{Code: -32603, Message: "transient"}
+	})
+
+	p, cleanup := providerWithFakeServer(t, server, []string{"go"})
+	defer cleanup()
+	p.heavyDelta = true
+	core, obs := observer.New(zapcore.InfoLevel)
+	p.logger = zap.New(core)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	result, err := p.EnrichRepoContext(ctx, g, "", repoRoot, nil)
+	require.NoError(t, err)
+	require.NotNil(t, result)
+	require.True(t, result.Partial)
+
+	logs := obs.FilterMessage("LSP enrich: hover phase complete").All()
+	require.Len(t, logs, 1)
+	fields := logs[0].ContextMap()
+	assert.Equal(t, int64(1), fields["drain_errored"])
+	assert.Equal(t, int64(1), fields["drain_errored_references"],
+		"the errored class must be named in the completion line")
+	assert.Equal(t, int64(0), fields["drain_errored_prepare"])
+	assert.Equal(t, int64(0), fields["drain_errored_incoming"])
+	assert.Equal(t, int64(0), fields["drain_errored_confirm_acquire"])
+	assert.Equal(t, int64(0), fields["drain_errored_sweep_acquire"])
+
+	sampled := obs.FilterMessage("LSP enrich: drain errors sampled").All()
+	require.Len(t, sampled, 1, "the failing targets must be sampled at warn")
+	var samples []string
+	switch v := sampled[0].ContextMap()["samples"].(type) {
+	case []string:
+		samples = v
+	case []interface{}:
+		for _, s := range v {
+			samples = append(samples, fmt.Sprint(s))
+		}
+	}
+	require.NotEmpty(t, samples, "samples must be a non-empty string list")
+	assert.Contains(t, samples[0], "references",
+		"a sample entry names its class")
+	assert.Contains(t, samples[0], "transient",
+		"a sample entry carries the underlying error")
 }
