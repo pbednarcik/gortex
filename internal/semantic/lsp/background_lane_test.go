@@ -93,6 +93,30 @@ func TestLSPProvider_HasBackgroundWork(t *testing.T) {
 			RepoPrefix: "repo", Provider: p.Name() + backgroundMarkerSuffix, IndexedSHA: "sha-1"}))
 		assert.False(t, p.HasBackgroundWork(ms, "repo"), "lane marker at the fast tier's sha → drained")
 	})
+
+	t.Run("mutation invalidates the drained claim", func(t *testing.T) {
+		// A repository mutation re-parses files, and the re-parse drops
+		// their progress stamps — the drained-completion marker no longer
+		// describes the store. InvalidateBackground must flip
+		// HasBackgroundWork back to true so the post-mutation requeue works;
+		// the fast marker is left alone (it is the fast tier's claim, not
+		// the lane's to revoke).
+		t.Setenv(HeavyRequestsEnv, "background")
+		p := newP()
+		ms := newMarkerStore(graph.New())
+		require.NoError(t, ms.SetEnrichmentState(graph.EnrichmentState{
+			RepoPrefix: "repo", Provider: p.Name(), IndexedSHA: "sha-1"}))
+		require.NoError(t, ms.SetEnrichmentState(graph.EnrichmentState{
+			RepoPrefix: "repo", Provider: p.Name() + backgroundMarkerSuffix, IndexedSHA: "sha-1"}))
+		require.False(t, p.HasBackgroundWork(ms, "repo"), "fixture sanity: drained before the mutation")
+
+		p.InvalidateBackground(ms, "repo")
+		assert.True(t, p.HasBackgroundWork(ms, "repo"), "the mutation revoked the drained claim")
+		fast, found, err := ms.GetEnrichmentState("repo", p.Name())
+		require.NoError(t, err)
+		require.True(t, found)
+		assert.Equal(t, "sha-1", fast.IndexedSHA, "the fast tier's marker is untouched")
+	})
 }
 
 // EnrichBackground runs the drain on a DEDICATED lane instance: the
