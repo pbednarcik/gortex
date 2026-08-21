@@ -259,3 +259,62 @@ func TestManagerBackgroundLane_CensusSkipsDrained(t *testing.T) {
 	case <-time.After(150 * time.Millisecond):
 	}
 }
+
+// A repository mutation pairs CancelBackgroundDrains (before the first
+// store write) with RequeueBackgroundForRepo (after the batch, incremental
+// enrichment included): the in-flight drain is cancelled and WAITED OUT so
+// no stale lane flush can land behind the mutation, the drained claim for
+// the mutated languages is revoked, and the repo re-enters the queue — the
+// lane drains the delta after the fast path settles, never alongside it.
+func TestManagerBackgroundLane_MutationCancelAndRequeue(t *testing.T) {
+	p := &mockBackgroundProvider{
+		mockProvider: mockProvider{name: "go", languages: []string{"go"}, available: true},
+		drained:      make(chan string, 4),
+		block:        make(chan struct{}), // never closed — only cancellation frees a drain
+		ctxErr:       make(chan error, 2),
+	}
+	mgr, g, roots := backgroundLaneManager(t, p)
+	defer func() { require.NoError(t, mgr.Close()) }()
+
+	mgr.StartBackgroundLane(context.Background(), g, roots)
+	select {
+	case repo := <-p.drained:
+		require.Equal(t, "default", repo)
+	case <-time.After(2 * time.Second):
+		t.Fatal("census did not start the drain")
+	}
+
+	// The mutation begins: cancel waits out the in-flight drain.
+	waited := make(chan struct{})
+	go func() { mgr.CancelBackgroundDrains("default", []string{"go"}); close(waited) }()
+	select {
+	case err := <-p.ctxErr:
+		assert.ErrorIs(t, err, context.Canceled)
+	case <-time.After(2 * time.Second):
+		t.Fatal("CancelBackgroundDrains did not cancel the drain")
+	}
+	select {
+	case <-waited:
+	case <-time.After(2 * time.Second):
+		t.Fatal("CancelBackgroundDrains did not wait for the drain to exit")
+	}
+
+	// An unrelated language's mutation leaves the claim and queue alone.
+	mgr.RequeueBackgroundForRepo(g, "default", roots["default"], []string{"python"})
+	assert.Empty(t, p.invalidated, "a python mutation must not revoke a go claim")
+	select {
+	case repo := <-p.drained:
+		t.Fatalf("unrelated-language requeue drained %q", repo)
+	case <-time.After(150 * time.Millisecond):
+	}
+
+	// The matching mutation revokes the claim and re-drains.
+	mgr.RequeueBackgroundForRepo(g, "default", roots["default"], []string{"go"})
+	assert.Equal(t, []string{"default"}, p.invalidated)
+	select {
+	case repo := <-p.drained:
+		assert.Equal(t, "default", repo)
+	case <-time.After(2 * time.Second):
+		t.Fatal("mutation requeue did not re-drain the repo")
+	}
+}
