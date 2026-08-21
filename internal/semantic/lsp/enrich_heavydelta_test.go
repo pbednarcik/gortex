@@ -132,6 +132,7 @@ func runHeavyDelta(t *testing.T, p *Provider, g graph.Store, repoRoot string) {
 // implementations, outgoing calls, or type-hierarchy traffic.
 func TestLSP_Enrich_HeavyDelta_RequestClasses(t *testing.T) {
 	t.Setenv(SweepEnv, "") // demand default — the gating heavyDelta must honor
+	t.Setenv(HeavyRequestsEnv, "")
 
 	repoRoot, g, edge := heavyDeltaFixture(t)
 	server := newFakeLSPServer()
@@ -188,6 +189,7 @@ func TestLSP_Enrich_HeavyDelta_RequestClasses(t *testing.T) {
 // the resume ledger.
 func TestLSP_Enrich_HeavyDelta_StampsAndSecondPassIdle(t *testing.T) {
 	t.Setenv(SweepEnv, "")
+	t.Setenv(HeavyRequestsEnv, "")
 
 	repoRoot, g, _ := heavyDeltaFixture(t)
 	server1 := newFakeLSPServer()
@@ -223,6 +225,7 @@ func TestLSP_Enrich_HeavyDelta_StampsAndSecondPassIdle(t *testing.T) {
 // drain. (Types drain trivially in heavyDelta and stamp immediately.)
 func TestLSP_Enrich_HeavyDelta_FailedIncomingLeavesNodeUnstamped(t *testing.T) {
 	t.Setenv(SweepEnv, "full")
+	t.Setenv(HeavyRequestsEnv, "")
 
 	repoRoot := t.TempDir()
 	require.NoError(t, os.WriteFile(filepath.Join(repoRoot, "a.go"),
@@ -282,6 +285,7 @@ func TestLSP_Enrich_HeavyDelta_FailedIncomingLeavesNodeUnstamped(t *testing.T) {
 // server dying mid-sweep.
 func TestLSP_Enrich_HeavyDelta_ErroredNodesMakeThePassPartial(t *testing.T) {
 	t.Setenv(SweepEnv, "full")
+	t.Setenv(HeavyRequestsEnv, "")
 
 	repoRoot := t.TempDir()
 	require.NoError(t, os.WriteFile(filepath.Join(repoRoot, "a.go"),
@@ -388,6 +392,7 @@ func TestLSP_Enrich_HeavyDelta_UnreadableFileMakesThePassPartial(t *testing.T) {
 // yield) must not cut it.
 func TestLSP_Enrich_HeavyDelta_ExemptFromProductivityCheckpoint(t *testing.T) {
 	t.Setenv(SweepEnv, "full")
+	t.Setenv(HeavyRequestsEnv, "")
 	t.Setenv("GORTEX_LSP_PRODUCTIVITY_WINDOW", "50ms")
 
 	repoRoot := t.TempDir()
@@ -442,6 +447,7 @@ func TestLSP_Enrich_HeavyDelta_ExemptFromProductivityCheckpoint(t *testing.T) {
 // the interrupted file's don't, and a rerun drains ONLY the remainder.
 func TestLSP_Enrich_HeavyDelta_CancelResumes(t *testing.T) {
 	t.Setenv(SweepEnv, "full") // every function gets incoming — simplest fixture
+	t.Setenv(HeavyRequestsEnv, "")
 
 	repoRoot := t.TempDir()
 	require.NoError(t, os.WriteFile(filepath.Join(repoRoot, "a.go"),

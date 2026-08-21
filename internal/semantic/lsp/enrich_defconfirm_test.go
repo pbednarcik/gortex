@@ -21,6 +21,7 @@ import (
 // Edge confirmation goes through textDocument/definition at the call site
 // instead — same verdicts, position-request cost.
 func TestCSharpSpecOptsOutOfHeavyRequests(t *testing.T) {
+	t.Setenv(HeavyRequestsEnv, "")
 	spec := SpecByName("omnisharp")
 	require.NotNil(t, spec)
 	assert.True(t, spec.NoHeavyRequests, "csharp spec must skip references/incomingCalls")
@@ -99,6 +100,7 @@ func TestLSP_Enrich_NoHeavy_DefinitionConfirmsWithoutReferences(t *testing.T) {
 // Without the opt-out nothing changes: the references confirm sweep still runs
 // first — this pins that gopls-shaped providers are untouched.
 func TestLSP_Enrich_HeavyDefault_StillIssuesReferences(t *testing.T) {
+	t.Setenv(HeavyRequestsEnv, "")
 	t.Setenv(SweepEnv, "full")
 	repoRoot := t.TempDir()
 	g := graph.New()
@@ -285,6 +287,7 @@ func TestLSP_Enrich_DefConfirm_DispatchedCallAddsDeclaredMemberEdge(t *testing.T
 // this path REBOUND the impl edge to the declared member, so a gopls/tsserver/
 // pyright repo now keeps the devirtualization guess AND gains the declared edge.
 func TestLSP_Enrich_HeavyDefault_DispatchedCallAddsDeclaredMemberEdge(t *testing.T) {
+	t.Setenv(HeavyRequestsEnv, "")
 	t.Setenv(SweepEnv, "full")
 	repoRoot := t.TempDir()
 	g := graph.New()

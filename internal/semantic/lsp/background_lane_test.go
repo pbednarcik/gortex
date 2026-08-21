@@ -124,6 +124,7 @@ func TestLSPProvider_HasBackgroundWork(t *testing.T) {
 // does the heavyDelta work.
 func TestLSPProvider_EnrichBackground_LaneIsolation(t *testing.T) {
 	t.Setenv(SweepEnv, "")
+	t.Setenv(HeavyRequestsEnv, "")
 
 	repoRoot, g, edge := heavyDeltaFixture(t)
 
@@ -411,6 +412,7 @@ func TestLSPProvider_EnrichBackground_WedgedReadinessDoesNotBlock(t *testing.T) 
 // state this drain never visited.
 func TestLSPProvider_EnrichBackground_MarkerUsesDrainStartSHA(t *testing.T) {
 	t.Setenv(SweepEnv, "")
+	t.Setenv(HeavyRequestsEnv, "")
 
 	repoRoot, g, _ := heavyDeltaFixture(t)
 	ms := newMarkerStore(g)
@@ -448,6 +450,7 @@ func TestLSPProvider_EnrichBackground_MarkerUsesDrainStartSHA(t *testing.T) {
 // sha; a factory failure records nothing.
 func TestLSPProvider_EnrichBackground_Marker(t *testing.T) {
 	t.Setenv(SweepEnv, "")
+	t.Setenv(HeavyRequestsEnv, "")
 
 	repoRoot, g, _ := heavyDeltaFixture(t)
 	ms := newMarkerStore(g)

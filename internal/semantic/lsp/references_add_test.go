@@ -20,6 +20,7 @@ import (
 // is the load-bearing fix: without it such a server confirms existing edges
 // but never adds the dispatch call sites it can enumerate (edges_added 0).
 func TestLSP_Provider_ReferencesAddPass_AddsCallEdges(t *testing.T) {
+	t.Setenv(HeavyRequestsEnv, "")
 	repoRoot := t.TempDir()
 	require.NoError(t, os.WriteFile(
 		filepath.Join(repoRoot, "handler.php"),
@@ -103,6 +104,7 @@ func TestLSP_Provider_ReferencesAddPass_AddsCallEdges(t *testing.T) {
 // Two reference sites from one caller collapse to a single minted edge whose
 // extra site is recorded in call_sites (so find_usages still renders both).
 func TestLSP_Provider_ReferencesAddPass_RecordsMultipleSites(t *testing.T) {
+	t.Setenv(HeavyRequestsEnv, "")
 	repoRoot := t.TempDir()
 	require.NoError(t, os.WriteFile(
 		filepath.Join(repoRoot, "handler.php"),
