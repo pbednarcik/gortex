@@ -102,6 +102,7 @@ func clangdLikeSpec() *ServerSpec {
 // the hover / hierarchy sweep and interface pass are skipped, header referents
 // are never opened, and the result is flagged Degraded with a reason.
 func TestLSP_Enrich_DegradesWithoutCompileDB(t *testing.T) {
+	t.Setenv(HeavyRequestsEnv, "")
 	repoRoot, g := degradedFixture(t)
 	// No compile_commands.json — the degraded gate must trip.
 
