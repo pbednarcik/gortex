@@ -308,13 +308,23 @@ func TestManagerBackgroundLane_MutationCancelAndRequeue(t *testing.T) {
 	case <-time.After(150 * time.Millisecond):
 	}
 
-	// The matching mutation revokes the claim and re-drains.
+	// The matching mutation revokes the claim and re-drains — after the
+	// mutation cooldown, not immediately: an editing session must coalesce
+	// into one drain after its last save, not pay a server spawn per batch.
+	prevCooldown := laneMutationCooldown
+	laneMutationCooldown = 300 * time.Millisecond
+	defer func() { laneMutationCooldown = prevCooldown }()
 	mgr.RequeueBackgroundForRepo(g, "default", roots["default"], []string{"go"})
 	assert.Equal(t, []string{"default"}, p.invalidated)
 	select {
 	case repo := <-p.drained:
+		t.Fatalf("mutation requeue drained %q inside the cooldown", repo)
+	case <-time.After(150 * time.Millisecond):
+	}
+	select {
+	case repo := <-p.drained:
 		assert.Equal(t, "default", repo)
 	case <-time.After(2 * time.Second):
-		t.Fatal("mutation requeue did not re-drain the repo")
+		t.Fatal("mutation requeue did not re-drain the repo after the cooldown")
 	}
 }

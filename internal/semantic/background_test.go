@@ -329,6 +329,43 @@ func TestBackgroundScheduler(t *testing.T) {
 		assert.Equal(t, "repo-a", recv(t, p.drained))
 	})
 
+	t.Run("CooldownHoldsATaskUntilEligible", func(t *testing.T) {
+		// A mutation-requeued task carries a notBefore: the drain must not
+		// start until the quiet period elapses, so an editing session does
+		// not pay a server spawn per save. Immediate tasks are unaffected.
+		p := newProvider()
+		s := newBackgroundScheduler(zap.NewNop())
+		defer s.close()
+		cooled := task(p, "repo-cooled")
+		cooled.notBefore = time.Now().Add(300 * time.Millisecond)
+		require.True(t, s.enqueue(cooled))
+		require.True(t, s.enqueue(task(p, "repo-now")))
+		s.start(context.Background(), graph.New())
+
+		assert.Equal(t, "repo-now", recv(t, p.drained), "an immediate task is not held behind a cooling one")
+		noRecv(t, p.drained, 150*time.Millisecond)
+		assert.Equal(t, "repo-cooled", recv(t, p.drained), "the cooled task drains once eligible")
+	})
+
+	t.Run("CooldownSlidesOnRepeatMutation", func(t *testing.T) {
+		// Each new mutation slides the pending task's window forward — the
+		// drain starts after the LAST save of the session, not the first.
+		p := newProvider()
+		s := newBackgroundScheduler(zap.NewNop())
+		defer s.close()
+		first := task(p, "repo-a")
+		first.notBefore = time.Now().Add(250 * time.Millisecond)
+		require.True(t, s.enqueue(first))
+		slid := task(p, "repo-a")
+		slid.notBefore = time.Now().Add(700 * time.Millisecond)
+		assert.False(t, s.enqueue(slid), "a slide extends the pending task, it adds no second one")
+		s.start(context.Background(), graph.New())
+
+		noRecv(t, p.drained, 450*time.Millisecond) // past the FIRST window — the slide must hold
+		assert.Equal(t, "repo-a", recv(t, p.drained), "the task drains after the slid window")
+		noRecv(t, p.drained, 100*time.Millisecond)
+	})
+
 	t.Run("FailedDrainVisibleInStatus", func(t *testing.T) {
 		// A repeatedly failing repo must be visible on the health surface,
 		// not only in the logs — the lane has no retry loop, so a repo whose
