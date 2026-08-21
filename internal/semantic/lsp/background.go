@@ -143,6 +143,30 @@ func (p *Provider) newLaneProvider() (*Provider, error) {
 	return lane, nil
 }
 
+// InvalidateBackground drops the drained-completion claim for repoPrefix: a
+// repository mutation re-parsed files of this provider's languages, and the
+// re-parse discarded those files' semantic_heavy stamps — the lane marker no
+// longer describes the store. Blanking the marker's sha (rather than
+// deleting the row) is enough: backgroundMarkerCurrent requires it to equal
+// the fast tier's non-empty sha. The fast marker is the fast tier's claim,
+// not the lane's to revoke. Writes only when a claim exists — an idle or
+// never-drained repo pays one read, no write.
+func (p *Provider) InvalidateBackground(g graph.Store, repoPrefix string) {
+	store, ok := g.(graph.EnrichmentStateStore)
+	if !ok {
+		return
+	}
+	lane, found, err := store.GetEnrichmentState(repoPrefix, p.Name()+backgroundMarkerSuffix)
+	if err != nil || !found || lane.IndexedSHA == "" {
+		return
+	}
+	lane.IndexedSHA = ""
+	lane.CompletedAt = time.Now().Unix()
+	if err := store.SetEnrichmentState(lane); err != nil && p.logger != nil {
+		p.logger.Warn("invalidate background lane marker failed")
+	}
+}
+
 // backgroundMarkerCurrent reports whether the lane marker exists and sits at
 // the fast tier's marker sha. Any missing marker, read error, or
 // non-persisting backend means "not provably drained" — the census errs

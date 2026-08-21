@@ -107,6 +107,13 @@ type BackgroundEnricher interface {
 	HasBackgroundWork(g graph.Store, repoPrefix string) bool
 	// EnrichBackground drains the deferred tier for the repo.
 	EnrichBackground(ctx context.Context, g graph.Store, repoPrefix, repoRoot string) (*EnrichResult, error)
+	// InvalidateBackground drops any recorded "tier drained" claim for the
+	// repo. Called after a repository mutation re-parsed files of the
+	// provider's languages: the re-parse discarded those files' progress
+	// stamps, so HasBackgroundWork must answer true again until a fresh
+	// drain completes — the drain itself stays cheap for untouched files,
+	// whose stamps survive.
+	InvalidateBackground(g graph.Store, repoPrefix string)
 }
 
 // PreselectionDeadlineEnricher marks a ContextEnricher whose expensive work
