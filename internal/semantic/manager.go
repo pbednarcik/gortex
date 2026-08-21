@@ -193,6 +193,19 @@ func (m *Manager) CancelBackgroundDrains(repoName string, langs []string) {
 	m.background.cancelRepo(repoName, langKeySet(langs))
 }
 
+// HoldBackgroundMutations parks repoName's background-lane tasks at the
+// scheduler's dequeue gate until the returned release runs. A repository
+// mutation establishes its hold BEFORE CancelBackgroundDrains and releases
+// it only after its complete tail: cancellation clears the tasks that
+// exist, the hold catches the ones the mutation itself creates — above all
+// the pass-end enqueue of its own semantic tail, which is born with no
+// cooldown and would otherwise start a drain against rows the resolver and
+// derived passes are still writing. Refcounted; release is idempotent and
+// never nil.
+func (m *Manager) HoldBackgroundMutations(repoName string) func() {
+	return m.background.hold(repoName)
+}
+
 // laneMutationCooldown is the quiet period a mutation-requeued drain waits
 // before becoming eligible; every further mutation of the repo slides the
 // window. Without it an editing session would start (and cancel) a drain —
@@ -210,17 +223,14 @@ var laneMutationCooldown = 60 * time.Second
 // those files' progress stamps, so the completion marker no longer
 // describes the store) and re-enter the queue after laneMutationCooldown.
 // The re-drain is request-free for untouched files, whose stamps survive.
-// nil langs means the mutation's file scope was unknown (a full-root
-// incremental walk) — every provider's claim is suspect, mirroring
-// CancelBackgroundDrains' nil-is-unscoped contract. A scoped call whose
-// languages all filtered to empty has nothing to requeue.
+// Callers pass the languages of rows that were actually cancelled or
+// rewritten — a mutation that touched nothing calls nothing.
 func (m *Manager) RequeueBackgroundForRepo(g graph.Store, repoName, repoRoot string, langs []string) {
 	if !m.config.Enabled || repoName == "" || repoRoot == "" {
 		return
 	}
 	set := langKeySet(langs)
-	scoped := langs != nil
-	if scoped && len(set) == 0 {
+	if len(set) == 0 {
 		return
 	}
 	invalidateAndEnqueue := func(provider Provider) {
@@ -228,7 +238,7 @@ func (m *Manager) RequeueBackgroundForRepo(g graph.Store, repoName, repoRoot str
 		if !ok || !provider.Available() || m.providerDisabled(provider.Name()) {
 			return
 		}
-		if scoped && !anyLangPresent(provider.Languages(), set) {
+		if !anyLangPresent(provider.Languages(), set) {
 			return
 		}
 		be.InvalidateBackground(g, repoName)
@@ -259,7 +269,7 @@ func (m *Manager) RequeueBackgroundForRepo(g graph.Store, repoName, repoRoot str
 	if !canPeek {
 		return
 	}
-	for _, name := range m.routerCensusWinners(set, scoped) {
+	for _, name := range m.routerCensusWinners(set, true) {
 		provider, err := peekRouter.PeekProviderForSpec(name)
 		if err != nil {
 			continue

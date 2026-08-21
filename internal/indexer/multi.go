@@ -2207,6 +2207,20 @@ func (mi *MultiIndexer) IndexRepo(repoPrefix string) (*IndexResult, error) {
 	var result *IndexResult
 	var indexErr error
 	err := mi.repositoryMutationCoordinator(repoPrefix).runExclusive(context.Background(), func() error {
+		// A full re-index rewrites every row — no background drain of this
+		// repository may overlap it, whatever its language (the same rule
+		// IndexCtx applies on the single-indexer path). Hold first (the
+		// rebuild's own enrichment pass-end enqueue must park until the
+		// lane is handed back), then wait the drains out BEFORE taking the
+		// topology gate, so a slow cancellation never blocks graph
+		// readers. No requeue: the rebuilt index's own enrichment
+		// re-enqueues, and the restart census covers an interrupted run.
+		if semMgr := mi.SemanticManager(); semMgr != nil {
+			release := semMgr.HoldBackgroundMutations(repoPrefix)
+			defer release()
+			semMgr.CancelBackgroundDrains(repoPrefix, nil)
+		}
+
 		finishTopologyMutation := reach.BeginTopologyMutation(mi.graph)
 		defer finishTopologyMutation(true)
 		result, indexErr = mi.indexRepoRaw(repoPrefix)
@@ -2226,15 +2240,6 @@ func (mi *MultiIndexer) indexRepoRaw(repoPrefix string) (*IndexResult, error) {
 	mi.mu.RUnlock()
 	if !ok {
 		return nil, fmt.Errorf("repository not found: %s", repoPrefix)
-	}
-
-	// A full re-index rewrites every row — no background drain of this
-	// repository may overlap it, whatever its language (the same rule
-	// IndexCtx applies on the single-indexer path). No requeue: the rebuilt
-	// index's own enrichment re-enqueues once the fast markers move, and
-	// the restart census covers an interrupted run.
-	if semMgr := mi.SemanticManager(); semMgr != nil {
-		semMgr.CancelBackgroundDrains(repoPrefix, nil)
 	}
 
 	// Evict existing data for this repo before re-indexing. Always — a lone
@@ -2450,10 +2455,11 @@ func (mi *MultiIndexer) incrementalEvictRepoRaw(repoPrefix, path string) (nodesR
 		return 0, 0, fmt.Errorf("repository mutation executor has no live indexer: %s", repoPrefix)
 	}
 
-	// Deferred first so LIFO runs the requeue after the complete forced-delete
-	// resolver/derived tail below — and after the topology gate closes.
-	requeueBackgroundLane := idx.backgroundMutationBracket([]string{path})
-	defer requeueBackgroundLane()
+	// Deferred first so LIFO runs the requeue+release after the complete
+	// forced-delete resolver/derived tail below — and after the topology
+	// gate closes. The evicted file's rows resolve its languages up front.
+	laneBracket := idx.beginBackgroundLaneBracket([]string{path})
+	defer laneBracket.finish()
 
 	finishTopologyMutation := reach.BeginTopologyMutation(mi.graph)
 	topologyChanged := true
@@ -2509,12 +2515,14 @@ func (mi *MultiIndexer) incrementalReindexRepoRawMode(repoPrefix string, paths [
 		return nil, fmt.Errorf("repository mutation executor has no live indexer: %s", repoPrefix)
 	}
 
-	// The stable per-repository lane is held before this executor runs. Wait
-	// out any background drain of the touched languages before the gate and
-	// the first store write; LIFO runs the requeue after the complete
-	// resolver/metadata/derived tail below.
-	requeueBackgroundLane := idx.backgroundMutationBracket(paths)
-	defer requeueBackgroundLane()
+	// The stable per-repository lane is held before this executor runs.
+	// Hold the lane's dequeue gate for the whole mutation and cancel known
+	// file paths' languages before the topology gate; the engine cancels
+	// the classified remainder before its first write. LIFO runs the
+	// requeue+release after the complete resolver/metadata/derived tail.
+	laneBracket := idx.beginBackgroundLaneBracket(paths)
+	defer laneBracket.finish()
+	mode.laneBracket = laneBracket
 
 	// Take the global reachability topology gate second and keep it through
 	// the resolver, metadata, and derived tails to avoid lane/gate inversion.

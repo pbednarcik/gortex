@@ -347,18 +347,25 @@ daemon health snapshot under `background_lane` and in the `background
 enrichment complete` / `partial` / `failed` log lines.
 
 A repository mutation — a watcher batch, a branch switch, a full re-index —
-never overlaps a drain of the languages it touches: the mutation cancels
-that drain and waits it out before its first store write, revokes the
-lane's completion claim for the mutated languages, and re-enqueues the repo
-once the batch and its incremental enrichment settle. The fast path always
-wins; the lane drains the delta afterwards, resuming from the per-file
-stamps so untouched files cost no requests. Drains of unrelated languages
-keep running — they write disjoint rows, and cancelling them would only
-re-pay their server spawn on every edit. A mutation-requeued drain waits
-out a quiet period first (60s, slid forward by every further mutation), so
-an editing session coalesces into one drain after its last save instead of
-spawning and cancelling a server per batch. Untracking a repository
-cancels and discards its lane work outright.
+never overlaps a drain of the languages it touches. The mutation first
+parks the repo's lane queue for its whole duration (so even the trigger
+its own enrichment pass creates cannot start a drain mid-mutation), then
+cancels the in-flight drain and waits it out before its first store
+write, revokes the lane's completion claim for the mutated languages, and
+re-enqueues the repo once the batch and its incremental enrichment
+settle. The languages come from the files that actually changed — a
+directory scope or a full-root reconcile resolves them after
+classification, and a reconcile that finds nothing changed touches the
+lane not at all: no cancel, no claim revoked, the active drain just keeps
+running. The fast path always wins; the lane drains the delta afterwards,
+resuming from the per-file stamps so untouched files cost no requests.
+Drains of unrelated languages keep running — they write disjoint rows,
+and cancelling them would only re-pay their server spawn on every edit. A
+mutation-requeued drain waits out a quiet period first (60s, slid forward
+by every further mutation), so an editing session coalesces into one
+drain after its last save instead of spawning and cancelling a server per
+batch. Untracking a repository cancels and discards its lane work
+outright.
 
 On-demand confirmation stays disabled under `background`, exactly as under
 `off`: `find_usages` / `get_callers` answer from the stored graph tiers,

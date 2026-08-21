@@ -3,6 +3,7 @@ package indexer
 import (
 	"context"
 	"errors"
+	"os"
 	"path/filepath"
 	"sync"
 	"testing"
@@ -280,17 +281,27 @@ func (p *laneBracketProvider) EnrichBackground(ctx context.Context, g graph.Stor
 // mutation path brackets it.
 func laneBracketHarness(t *testing.T) (*MultiIndexer, *laneBracketProvider, string) {
 	t.Helper()
+	return laneBracketHarnessWith(t, "repo/main.go", nil)
+}
+
+// laneBracketHarnessWith is laneBracketHarness with a custom watched graph
+// path and a fixture hook that runs before the repo is tracked.
+func laneBracketHarnessWith(t *testing.T, watched string, prepare func(repoDir string)) (*MultiIndexer, *laneBracketProvider, string) {
+	t.Helper()
 	// The fixture repo is a handful of nodes — keep the enrichment admission
 	// floor from silently skipping the tail whose ordering this asserts.
 	t.Setenv("GORTEX_ENRICH_MIN_NODES", "0")
 	repo := setupRepoDir(t, "repo")
+	if prepare != nil {
+		prepare(repo)
+	}
 	mi := newLifecycleTestMultiIndexer(t)
 	t.Cleanup(func() { closeLifecycleTestMultiIndexer(t, mi) })
 
 	_, err := mi.TrackRepo(config.RepoEntry{Path: repo, Name: "repo"})
 	require.NoError(t, err)
 
-	bg := newLaneBracketProvider("repo/main.go")
+	bg := newLaneBracketProvider(watched)
 	mgr := semantic.NewManager(semantic.Config{Enabled: true, EnrichOnWatch: true}, zap.NewNop())
 	mgr.RegisterProvider(bg)
 	t.Cleanup(func() { require.NoError(t, mgr.Close()) })
@@ -415,4 +426,78 @@ func TestLifecycleIndexRepoCancelsBackgroundLane(t *testing.T) {
 	require.Contains(t, events, "cancelled-before-first-write",
 		"the full reindex must wait the drain out before evicting the repo: %v", events)
 	require.NotContains(t, events, "cancelled-after-write", "events: %v", events)
+}
+
+// The mutation's own semantic tail ends with the manager's pass-end
+// enqueue, and that task is born with no cooldown. Cancellation cannot
+// stop it — it does not exist yet when the mutation cancels — so the
+// executor must park the repo at the scheduler's dequeue gate for the
+// whole mutation. Without the hold, the lane starts a drain against a
+// store the resolver/derived tail is still writing.
+func TestLifecycleMutationHoldsPassEndDrain(t *testing.T) {
+	mi, bg, repo := laneBracketHarness(t)
+
+	writeFile(t, filepath.Join(repo, "main.go"), `package main
+
+func Hello() {}
+func Grown() {}
+`)
+	_, err := mi.IncrementalReindexRepo("repo", []string{"main.go"})
+	require.NoError(t, err)
+	requireLaneCancelled(t, bg, "IncrementalReindexRepo")
+
+	// Settle window: a drain leaked mid-tail records its start within it.
+	time.Sleep(300 * time.Millisecond)
+	events := bg.eventLog()
+	starts := 0
+	for _, e := range events {
+		if e == "drain-start" {
+			starts++
+		}
+	}
+	require.Equal(t, 1, starts,
+		"the pass-end enqueue born inside the mutation tail must stay parked until the mutation completes: %v", events)
+}
+
+// A zero-change full-root reconcile (the watcher's overflow recovery
+// passes nil paths) writes nothing, so there is nothing to protect:
+// cancelling the active drain would throw away a long server warmup, and
+// revoking the drained claim would erase real progress for no data change.
+func TestLifecycleZeroChangeReconcilePreservesLaneWork(t *testing.T) {
+	mi, bg, _ := laneBracketHarness(t)
+
+	_, err := mi.IncrementalReindexRepo("repo", nil)
+	require.NoError(t, err)
+
+	select {
+	case <-bg.cancelled:
+		t.Fatalf("a zero-change reconcile cancelled the active drain: %v", bg.eventLog())
+	case <-time.After(300 * time.Millisecond):
+	}
+	require.NotContains(t, bg.eventLog(), "invalidate",
+		"a zero-change reconcile must not revoke the drained claim")
+}
+
+// The watcher's new-directory discovery passes DIRECTORY paths, and a
+// scoped reindex may too. The raw path derives no languages — only
+// classification knows which files inside changed — so the precise cancel
+// must come from the real stale set, not the caller's path list.
+func TestLifecycleDirectoryScopeReindexCancelsLaneDrain(t *testing.T) {
+	// The graph keys subdirectory files with OS-native separators (see
+	// graphRelKey) — the watched path must match the stored form.
+	mi, bg, repo := laneBracketHarnessWith(t, "repo/"+filepath.FromSlash("sub/lib.go"), func(dir string) {
+		require.NoError(t, os.MkdirAll(filepath.Join(dir, "sub"), 0o755))
+		writeFile(t, filepath.Join(dir, "sub", "lib.go"), "package sub\n\nfunc Lib() {}\n")
+	})
+
+	writeFile(t, filepath.Join(repo, "sub", "lib.go"), "package sub\n\nfunc Lib() {}\nfunc Grown() {}\n")
+	_, err := mi.IncrementalReindexRepo("repo", []string{"sub"})
+	require.NoError(t, err)
+	requireLaneCancelled(t, bg, "directory-scoped IncrementalReindexRepo")
+
+	events := bg.eventLog()
+	require.Contains(t, events, "cancelled-before-first-write", "events: %v", events)
+	require.NotContains(t, events, "cancelled-after-write", "events: %v", events)
+	require.Contains(t, events, "invalidate",
+		"the mutated language's drained claim must be revoked: %v", events)
 }

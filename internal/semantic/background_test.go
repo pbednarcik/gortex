@@ -63,6 +63,82 @@ func (m *mockBackgroundProvider) EnrichBackground(ctx context.Context, _ graph.S
 	return &EnrichResult{Provider: m.name, Language: "go", EdgesConfirmed: 1, Partial: m.partial}, nil
 }
 
+// A mutation hold parks a repo's tasks at the dequeue gate: enqueues (the
+// mutation's own pass-end enqueue included) coalesce normally but nothing
+// dequeues until the last release. This is what makes "fast path first,
+// then the lane" hold against triggers born INSIDE the mutation tail —
+// cancellation can only clear tasks that already exist.
+func TestBackgroundScheduler_MutationHold(t *testing.T) {
+	newProvider := func() *mockBackgroundProvider {
+		return &mockBackgroundProvider{
+			mockProvider: mockProvider{name: "mock-bg", languages: []string{"go"}, available: true},
+			drained:      make(chan string, 8),
+		}
+	}
+	task := func(p Provider, repo string) backgroundTask {
+		return backgroundTask{repoName: repo, repoRoot: "/tmp/" + repo, provider: p, lang: "go"}
+	}
+	recv := func(t *testing.T, ch chan string) string {
+		t.Helper()
+		select {
+		case v := <-ch:
+			return v
+		case <-time.After(2 * time.Second):
+			t.Fatal("timed out waiting for a drain")
+			return ""
+		}
+	}
+	noRecv := func(t *testing.T, ch chan string, window time.Duration) {
+		t.Helper()
+		select {
+		case v := <-ch:
+			t.Fatalf("unexpected drain of %q", v)
+		case <-time.After(window):
+		}
+	}
+
+	t.Run("HoldParksImmediatelyEligibleTasks", func(t *testing.T) {
+		p := newProvider()
+		s := newBackgroundScheduler(zap.NewNop())
+		defer s.close()
+		s.start(context.Background(), graph.New())
+
+		release := s.hold("repo-a")
+		require.True(t, s.enqueue(task(p, "repo-a")), "enqueue under hold must coalesce, not drop")
+		noRecv(t, p.drained, 150*time.Millisecond)
+		release()
+		assert.Equal(t, "repo-a", recv(t, p.drained))
+	})
+
+	t.Run("HoldIsPerRepo", func(t *testing.T) {
+		p := newProvider()
+		s := newBackgroundScheduler(zap.NewNop())
+		defer s.close()
+		s.start(context.Background(), graph.New())
+
+		release := s.hold("repo-a")
+		defer release()
+		require.True(t, s.enqueue(task(p, "repo-b")))
+		assert.Equal(t, "repo-b", recv(t, p.drained), "an unrelated repo's hold must not park this drain")
+	})
+
+	t.Run("HoldRefcountsAndReleaseIsIdempotent", func(t *testing.T) {
+		p := newProvider()
+		s := newBackgroundScheduler(zap.NewNop())
+		defer s.close()
+		s.start(context.Background(), graph.New())
+
+		release1 := s.hold("repo-a")
+		release2 := s.hold("repo-a")
+		require.True(t, s.enqueue(task(p, "repo-a")))
+		release1()
+		release1() // double release must not decrement twice
+		noRecv(t, p.drained, 150*time.Millisecond)
+		release2()
+		assert.Equal(t, "repo-a", recv(t, p.drained))
+	})
+}
+
 func TestBackgroundScheduler(t *testing.T) {
 	newProvider := func() *mockBackgroundProvider {
 		return &mockBackgroundProvider{
