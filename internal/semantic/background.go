@@ -43,9 +43,16 @@ type backgroundScheduler struct {
 	// once it completes rather than dropping the signal.
 	inFlight map[string]backgroundTask
 	requeue  map[string]backgroundTask
-	started  bool
-	closed   bool
-	wake     chan struct{} // buffered(1) nudge: new work or shutdown
+	// inFlightCancel / inFlightDone are the per-drain handles cancelRepo
+	// targets: each drain runs under its own child context so one repo's
+	// mutation can cancel exactly its drain — never the worker, never the
+	// lane. done is closed by finishInFlight AFTER the drain's bookkeeping,
+	// so a waiter observes the fully-settled scheduler state.
+	inFlightCancel map[string]context.CancelFunc
+	inFlightDone   map[string]chan struct{}
+	started        bool
+	closed         bool
+	wake           chan struct{} // buffered(1) nudge: new work or shutdown
 
 	// lane progress, surfaced through status() into the daemon health
 	// snapshot. Guarded by mu. Failure telemetry covers errored and
@@ -100,12 +107,14 @@ func newBackgroundScheduler(logger *zap.Logger) *backgroundScheduler {
 		logger = zap.NewNop()
 	}
 	return &backgroundScheduler{
-		logger:   logger,
-		queued:   map[string]bool{},
-		inFlight: map[string]backgroundTask{},
-		requeue:  map[string]backgroundTask{},
-		wake:     make(chan struct{}, 1),
-		done:     make(chan struct{}),
+		logger:         logger,
+		queued:         map[string]bool{},
+		inFlight:       map[string]backgroundTask{},
+		requeue:        map[string]backgroundTask{},
+		inFlightCancel: map[string]context.CancelFunc{},
+		inFlightDone:   map[string]chan struct{}{},
+		wake:           make(chan struct{}, 1),
+		done:           make(chan struct{}),
 	}
 }
 
@@ -184,7 +193,7 @@ func (s *backgroundScheduler) close() {
 func (s *backgroundScheduler) run(ctx context.Context, g graph.Store) {
 	defer close(s.done)
 	for {
-		t, ok := s.next()
+		t, dctx, ok := s.next(ctx)
 		if !ok {
 			select {
 			case <-s.wake:
@@ -194,39 +203,137 @@ func (s *backgroundScheduler) run(ctx context.Context, g graph.Store) {
 			}
 		}
 		// Close can land between dequeue and drain — never start a drain
-		// (and spawn its server) after cancellation.
+		// (and spawn its server) after cancellation. The registration is
+		// still released so a cancelRepo waiter can't hang on shutdown.
 		if ctx.Err() != nil {
+			s.finishInFlight(t)
 			return
 		}
-		s.drain(ctx, g, t)
-		s.mu.Lock()
-		delete(s.inFlight, t.key())
-		if rt, again := s.requeue[t.key()]; again {
-			// A trigger landed while this drain ran — its frontier predates
-			// the new work, so the key goes straight back to pending
-			// (queued stays set; the slot is already claimed).
-			delete(s.requeue, t.key())
-			s.pending = append(s.pending, rt)
-		} else {
-			delete(s.queued, t.key())
-		}
-		s.mu.Unlock()
+		s.drain(dctx, g, t)
+		s.finishInFlight(t)
 		if ctx.Err() != nil {
 			return
 		}
 	}
 }
 
-func (s *backgroundScheduler) next() (backgroundTask, bool) {
+// next dequeues the oldest pending task and registers its per-drain
+// cancellation handles, so cancelRepo can target exactly one drain without
+// touching the worker or the lane context.
+func (s *backgroundScheduler) next(ctx context.Context) (backgroundTask, context.Context, bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if len(s.pending) == 0 || s.closed {
-		return backgroundTask{}, false
+		return backgroundTask{}, nil, false
 	}
 	t := s.pending[0]
 	s.pending = s.pending[1:]
 	s.inFlight[t.key()] = t
-	return t, true
+	dctx, dcancel := context.WithCancel(ctx)
+	s.inFlightCancel[t.key()] = dcancel
+	s.inFlightDone[t.key()] = make(chan struct{})
+	return t, dctx, true
+}
+
+// finishInFlight settles a dequeued task: the requeue-or-clear bookkeeping,
+// then the per-drain handle release. done closes LAST, after the scheduler
+// state is fully settled, so a cancelRepo waiter never observes a half-done
+// transition.
+func (s *backgroundScheduler) finishInFlight(t backgroundTask) {
+	s.mu.Lock()
+	delete(s.inFlight, t.key())
+	if rt, again := s.requeue[t.key()]; again {
+		// A trigger landed while this drain ran — its frontier predates
+		// the new work, so the key goes straight back to pending
+		// (queued stays set; the slot is already claimed).
+		delete(s.requeue, t.key())
+		s.pending = append(s.pending, rt)
+	} else {
+		delete(s.queued, t.key())
+	}
+	cancel := s.inFlightCancel[t.key()]
+	done := s.inFlightDone[t.key()]
+	delete(s.inFlightCancel, t.key())
+	delete(s.inFlightDone, t.key())
+	s.mu.Unlock()
+	if cancel != nil {
+		cancel() // release the child context's resources
+	}
+	if done != nil {
+		close(done)
+	}
+}
+
+// cancelRepo cancels the in-flight drain(s) matching repoName and langs,
+// WAITS for them to exit, and purges matching pending / requeue entries, so
+// the caller can mutate the repository knowing no drain of it is running
+// and none will start mid-mutation. langs scopes the match to providers
+// whose languages intersect it (nil or empty = every provider): a drain
+// only writes nodes of its own languages, so an unrelated-language drain
+// cannot conflict with the mutation, and cancelling it anyway would only
+// make it re-pay its server spawn. Purged work is never lost — the caller
+// re-enqueues after the mutation, and the post-mutation state decides what
+// still needs draining.
+func (s *backgroundScheduler) cancelRepo(repoName string, langs map[string]bool) {
+	match := func(t backgroundTask) bool {
+		if t.repoName != repoName {
+			return false
+		}
+		if len(langs) == 0 {
+			return true
+		}
+		for _, l := range t.provider.Languages() {
+			if langs[l] {
+				return true
+			}
+		}
+		return false
+	}
+	for {
+		s.mu.Lock()
+		s.purgeMatchingLocked(match)
+		var waits []chan struct{}
+		for key, t := range s.inFlight {
+			if !match(t) {
+				continue
+			}
+			if c := s.inFlightCancel[key]; c != nil {
+				c()
+			}
+			if d := s.inFlightDone[key]; d != nil {
+				waits = append(waits, d)
+			}
+		}
+		s.mu.Unlock()
+		if len(waits) == 0 {
+			return
+		}
+		for _, d := range waits {
+			<-d
+		}
+		// Go around again: the finished drain may have promoted a requeue
+		// slot into pending after our purge — re-purge until quiescent.
+	}
+}
+
+// purgeMatchingLocked removes matching pending tasks (clearing their dedup
+// keys) and matching requeue slots. An in-flight key's dedup entry is left
+// alone — finishInFlight clears it once the drain exits. Caller holds mu.
+func (s *backgroundScheduler) purgeMatchingLocked(match func(backgroundTask) bool) {
+	kept := s.pending[:0]
+	for _, t := range s.pending {
+		if match(t) {
+			delete(s.queued, t.key())
+			continue
+		}
+		kept = append(kept, t)
+	}
+	s.pending = kept
+	for key, t := range s.requeue {
+		if match(t) {
+			delete(s.requeue, key)
+		}
+	}
 }
 
 func (s *backgroundScheduler) drain(ctx context.Context, g graph.Store, t backgroundTask) {
