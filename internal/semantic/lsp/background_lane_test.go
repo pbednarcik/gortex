@@ -3,6 +3,7 @@ package lsp
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"path/filepath"
 	"sync"
 	"testing"
@@ -211,6 +212,40 @@ func TestLSPProvider_EnrichBackground_NotReadyRecordsNothing(t *testing.T) {
 
 	total := rig.references.Load() + rig.prepareCall.Load() + rig.incoming.Load()
 	assert.Zero(t, total, "a not-ready server must receive no drain requests")
+	_, found, _ := ms.GetEnrichmentState("", p.Name()+backgroundMarkerSuffix)
+	assert.False(t, found, "no marker for a drain that never ran")
+}
+
+// The readiness gate aborts on ANY error, not only ErrWorkspaceNotReady: a
+// lane server that failed to spawn (WaitReady's ensureClient leg), a
+// cancelled context, or an unexpected probe failure must not be drained —
+// running the pass anyway would issue requests against a dead or unready
+// server and mask the original error with a later, less specific one.
+func TestLSPProvider_EnrichBackground_ReadinessErrorAbortsDrain(t *testing.T) {
+	repoRoot, g, _ := heavyDeltaFixture(t)
+	ms := newMarkerStore(g)
+
+	server := newFakeLSPServer()
+	rig := newHeavyDeltaRig(server.handle, repoRoot)
+	lane, cleanup := providerWithFakeServer(t, server, []string{"go"})
+	defer cleanup()
+	lane.heavyDelta = true
+
+	p := NewProvider("fake-lsp", nil, []string{"go"}, false, 2, nil)
+	p.laneProviderFactory = func() (*Provider, error) { return lane, nil }
+	require.NoError(t, ms.SetEnrichmentState(graph.EnrichmentState{
+		RepoPrefix: "", Provider: p.Name(), IndexedSHA: "sha-fast"}))
+
+	spawnErr := errors.New("lane server failed to spawn")
+	prev := laneWaitReady
+	laneWaitReady = func(context.Context, *Provider, string) error { return spawnErr }
+	defer func() { laneWaitReady = prev }()
+
+	_, err := p.EnrichBackground(context.Background(), ms, "", repoRoot)
+	require.ErrorIs(t, err, spawnErr)
+
+	total := rig.references.Load() + rig.prepareCall.Load() + rig.incoming.Load()
+	assert.Zero(t, total, "a drain must not run behind a failed readiness gate")
 	_, found, _ := ms.GetEnrichmentState("", p.Name()+backgroundMarkerSuffix)
 	assert.False(t, found, "no marker for a drain that never ran")
 }
