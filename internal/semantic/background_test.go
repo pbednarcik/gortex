@@ -235,6 +235,95 @@ func TestBackgroundScheduler(t *testing.T) {
 		assert.Empty(t, st.LastRepo)
 	})
 
+	t.Run("CancelRepoWaitsOutInFlightDrain", func(t *testing.T) {
+		// A repository mutation must not overlap a drain of the same repo:
+		// cancelRepo cancels the in-flight drain and RETURNS ONLY AFTER the
+		// drain exited, so the caller can start writing the store knowing no
+		// stale lane flush can land behind it. The lane itself survives.
+		p := newProvider()
+		p.block = make(chan struct{}) // never closed — only cancellation frees it
+		p.ctxErr = make(chan error, 1)
+		s := newBackgroundScheduler(zap.NewNop())
+		defer s.close()
+		require.True(t, s.enqueue(task(p, "repo-a")))
+		s.start(context.Background(), graph.New())
+		assert.Equal(t, "repo-a", recv(t, p.drained))
+
+		returned := make(chan struct{})
+		go func() { s.cancelRepo("repo-a", nil); close(returned) }()
+		select {
+		case err := <-p.ctxErr:
+			assert.ErrorIs(t, err, context.Canceled)
+		case <-time.After(2 * time.Second):
+			t.Fatal("cancelRepo did not cancel the in-flight drain")
+		}
+		select {
+		case <-returned:
+		case <-time.After(2 * time.Second):
+			t.Fatal("cancelRepo did not wait for the drain to exit")
+		}
+
+		// The worker is still alive: a different repo drains normally.
+		q := newProvider()
+		require.True(t, s.enqueue(task(q, "repo-b")))
+		assert.Equal(t, "repo-b", recv(t, q.drained))
+	})
+
+	t.Run("CancelRepoIsLanguageScoped", func(t *testing.T) {
+		// A drain only writes nodes of its own languages — a Go edit cannot
+		// clobber a C# drain's rows, and cancelling it anyway would make the
+		// drain re-pay its server spawn on every unrelated edit.
+		p := newProvider() // languages: go
+		p.block = make(chan struct{})
+		p.ctxErr = make(chan error, 1)
+		s := newBackgroundScheduler(zap.NewNop())
+		defer s.close()
+		require.True(t, s.enqueue(task(p, "repo-a")))
+		s.start(context.Background(), graph.New())
+		assert.Equal(t, "repo-a", recv(t, p.drained))
+
+		s.cancelRepo("repo-a", map[string]bool{"csharp": true})
+		select {
+		case err := <-p.ctxErr:
+			t.Fatalf("a csharp mutation must not cancel a go drain (got %v)", err)
+		case <-time.After(100 * time.Millisecond):
+		}
+
+		go s.cancelRepo("repo-a", map[string]bool{"go": true})
+		select {
+		case err := <-p.ctxErr:
+			assert.ErrorIs(t, err, context.Canceled)
+		case <-time.After(2 * time.Second):
+			t.Fatal("a go mutation must cancel the go drain")
+		}
+	})
+
+	t.Run("CancelRepoPurgesPendingAndRequeue", func(t *testing.T) {
+		// Pending tasks for the mutating repo must not start mid-mutation,
+		// and a requeue slot parked behind the cancelled drain must not
+		// resurrect it — the post-mutation requeue re-derives the state.
+		p := newProvider()
+		p.block = make(chan struct{})
+		s := newBackgroundScheduler(zap.NewNop())
+		defer s.close()
+		q := newProvider()
+		require.True(t, s.enqueue(task(p, "repo-a")))
+		s.start(context.Background(), graph.New())
+		assert.Equal(t, "repo-a", recv(t, p.drained)) // in flight, blocked
+		require.True(t, s.enqueue(task(p, "repo-a")), "requeue slot claimed")
+		require.True(t, s.enqueue(task(q, "repo-b")), "unrelated repo stays pending")
+
+		s.cancelRepo("repo-a", nil)
+		// repo-b (untouched) drains; repo-a does NOT drain again — neither
+		// from pending nor from the purged requeue slot.
+		assert.Equal(t, "repo-b", recv(t, q.drained))
+		noRecv(t, p.drained, 150*time.Millisecond)
+
+		// A fresh enqueue after the mutation works normally.
+		require.True(t, s.enqueue(task(p, "repo-a")))
+		assert.Equal(t, "repo-a", recv(t, p.drained))
+	})
+
 	t.Run("FailedDrainVisibleInStatus", func(t *testing.T) {
 		// A repeatedly failing repo must be visible on the health surface,
 		// not only in the logs — the lane has no retry loop, so a repo whose
