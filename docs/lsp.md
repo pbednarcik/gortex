@@ -339,12 +339,22 @@ repo rather than being claimed by a marker for state the drain never
 visited. A drain cancelled by daemon shutdown resumes from the stamps at the
 next trigger (a fast pass completing, or the restart census in
 `StartBackgroundLane`, which re-enqueues repos whose fast tier is current
-but whose deep tier never finished). The drain waits for a
-readiness-probing server's workspace load before starting, exactly like the
-foreground pass — a still-loading server answers heavy requests empty, which
-must not be recorded as a drained tier. Lane progress is surfaced in the
-daemon health snapshot under `background_lane` and in the `background
-enrichment complete` / `partial` / `failed` log lines.
+but whose deep tier never finished). An **errored or partial drain retries
+on its own** with bounded exponential backoff (1 min doubling to a 30 min
+cap, reset by a clean drain or any fresh trigger) — a server that was
+briefly unavailable or still loading recovers without waiting for the next
+mutation or restart, and a persistently failing one becomes a slow
+heartbeat, never a spin. The lane obeys the same **admission floor** as
+index-time enrichment (`GORTEX_ENRICH_MIN_NODES`, default 16): a language
+too small for a fast pass is never census-enqueued or mutation-requeued —
+with no fast marker its drain could never record completion and would
+re-spawn a server for the same incidental subtree on every restart. The
+drain waits for a readiness-probing server's workspace load before
+starting, exactly like the foreground pass — a still-loading server answers
+heavy requests empty, which must not be recorded as a drained tier. Lane
+progress is surfaced in the daemon health snapshot under `background_lane`
+(including a `retries` counter) and in the `background enrichment
+complete` / `partial` / `failed` log lines.
 
 A repository mutation — a watcher batch, a branch switch, a full re-index —
 never overlaps a drain of the languages it touches. The mutation first

@@ -233,6 +233,25 @@ func (m *Manager) RequeueBackgroundForRepo(g graph.Store, repoName, repoRoot str
 	if len(set) == 0 {
 		return
 	}
+	// The admission floor gates the requeue exactly as it gates the fast
+	// tier and the census: editing the lone file of an incidental language
+	// must not re-enter the lane for it (its drain could never record
+	// completion — see applyAdmissionFloor). The repo-scoped projection is
+	// the same grouped read the mutation's own semantic tail already pays;
+	// an empty projection is no evidence (a store without the capability),
+	// so it gates nothing — mirroring EnrichAll.
+	present, _, langCounts := m.repoLanguages(g, map[string]string{repoName: repoRoot})
+	if len(langCounts) > 0 {
+		applyAdmissionFloor(present, langCounts, EnrichmentAdmissionFloor())
+		for lang := range set {
+			if !present[lang] {
+				delete(set, lang)
+			}
+		}
+		if len(set) == 0 {
+			return
+		}
+	}
 	invalidateAndEnqueue := func(provider Provider) {
 		be, ok := provider.(BackgroundEnricher)
 		if !ok || !provider.Available() || m.providerDisabled(provider.Name()) {
@@ -300,15 +319,20 @@ type backgroundPeekRouter interface {
 
 // backgroundCensus enqueues every (repo, provider) pair whose deferred tier
 // is undrained. It mirrors EnrichAll's eligibility gates (availability,
-// disablement, language presence) AND its per-language spec arbitration —
-// an arbitration-loser spec never runs a fast pass, never earns a fast
-// marker, and would therefore drain (spawning a rejected server) on every
-// restart, forever.
+// disablement, language presence, the admission floor) AND its per-language
+// spec arbitration — a spec the fast tier rejects (arbitration loser,
+// below-floor language) never runs a fast pass, never earns a fast marker,
+// and would therefore drain (spawning a rejected server) on every restart,
+// forever.
 func (m *Manager) backgroundCensus(g graph.Store, roots map[string]string) {
 	if len(roots) == 0 {
 		return
 	}
 	present, nodeCounts, langCounts := m.repoLanguages(g, roots)
+	if below := applyAdmissionFloor(present, langCounts, EnrichmentAdmissionFloor()); len(below) > 0 {
+		m.logger.Info("background lane: census skipping languages below admission floor",
+			zap.Any("skipped", below))
+	}
 	gateOnPresence := len(langCounts) > 0
 
 	enqueue := func(repoName, repoRoot string, provider Provider) {
@@ -603,19 +627,10 @@ func (m *Manager) EnrichAll(g graph.Store, roots map[string]string, opts EnrichO
 	// nodeCounts (enrichable nodes per repo) feeds the size-scaled per-repo
 	// deadline — see enrichRepoTimeout.
 	present, nodeCounts, langCounts := m.repoLanguages(g, roots)
-	if floor := opts.MinLanguageNodes; floor > 0 {
-		below := make(map[string]int)
-		for lang, count := range langCounts {
-			if count < floor {
-				below[lang] = count
-				delete(present, lang)
-			}
-		}
-		if len(below) > 0 {
-			m.logger.Info("semantic enrichment: languages below admission floor",
-				zap.Int("floor", floor),
-				zap.Any("skipped", below))
-		}
+	if below := applyAdmissionFloor(present, langCounts, opts.MinLanguageNodes); len(below) > 0 {
+		m.logger.Info("semantic enrichment: languages below admission floor",
+			zap.Int("floor", opts.MinLanguageNodes),
+			zap.Any("skipped", below))
 	}
 	// Presence gating needs only EVIDENCE, not survivors: when the census saw
 	// rows but the floor rejected every language, providers must still be
@@ -813,6 +828,32 @@ func (m *Manager) repoLanguages(g graph.Store, roots map[string]string) (map[str
 		langCounts[row.Language] += row.Count
 	}
 	return present, counts, langCounts
+}
+
+// applyAdmissionFloor removes from present every language whose enrichable
+// node count is under floor (0 = disabled), returning the removed languages
+// with their counts for logging. Shared by the index-time EnrichAll
+// admission, the restart census, and the mutation requeue, so every
+// lane-eligibility decision applies the same size gate: a language too
+// small for the fast tier must not spawn a deferred drain either — with no
+// fast pass there is no fast marker, the drain could never record
+// completion, and the lane would re-spawn its server for the same
+// incidental subtree on every restart, forever.
+func applyAdmissionFloor(present map[string]bool, langCounts map[string]int, floor int) map[string]int {
+	if floor <= 0 {
+		return nil
+	}
+	var below map[string]int
+	for lang, count := range langCounts {
+		if count < floor {
+			if below == nil {
+				below = make(map[string]int)
+			}
+			below[lang] = count
+			delete(present, lang)
+		}
+	}
+	return below
 }
 
 // anyLangPresent reports whether any of langs is in the present set.
