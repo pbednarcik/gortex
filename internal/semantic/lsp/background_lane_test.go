@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"path/filepath"
+	"reflect"
 	"sync"
 	"testing"
 	"time"
@@ -150,12 +151,16 @@ func TestLSPProvider_LaneInheritsForegroundConfig(t *testing.T) {
 	p.opensDocs = false
 	p.workspaceFolders = []string{"D:/extra/root"}
 	p.maxParallel = 2
+	// The router can augment env post-construction (BUNDLE_GEMFILE for a
+	// Gemfile workspace) — rebuilding from the spec alone would drop it.
+	p.env = []string{"BUNDLE_GEMFILE=D:/repo/Gemfile"}
 
 	lane, err := p.newLaneProvider()
 	require.NoError(t, err)
 	assert.True(t, lane.heavyDelta)
 	assert.False(t, lane.noHeavyRequests)
 	assert.Equal(t, p.excludeGlobs, lane.excludeGlobs, "operator exclude globs must reach the drain")
+	assert.Equal(t, p.env, lane.env, "router-augmented env must reach the drain server")
 	assert.Equal(t, "off", lane.sweepMode, "configured sweep mode must reach the drain")
 	assert.False(t, lane.opensDocs, "didOpen override must reach the drain")
 	assert.Equal(t, p.workspaceFolders, lane.workspaceFolders)
@@ -166,6 +171,80 @@ func TestLSPProvider_LaneInheritsForegroundConfig(t *testing.T) {
 	lane, err = p.newLaneProvider()
 	require.NoError(t, err)
 	assert.Equal(t, backgroundLaneMaxParallel, lane.maxParallel, "the lane cap bounds a wide foreground width")
+}
+
+// newLaneProvider builds the drain instance by copying configuration
+// field-by-field — the classic source of "a new Provider field silently
+// never reaches the lane" (it happened twice already: the lane dropped the
+// operator config in review, then the router's env augmentation after).
+// This inventory forces the decision: every Provider field is classified,
+// and a new field fails the test until it is placed —
+//
+//	inherited:   newLaneProvider must copy it from the foreground instance
+//	             (and TestLSPProvider_LaneInheritsForegroundConfig must
+//	             assert the copy actually lands),
+//	overridden:  newLaneProvider sets a deliberate lane value,
+//	constructed: NewProviderFromSpec derives it from spec + logger,
+//	runtime:     per-instance state a fresh lane must NOT share.
+func TestLSPProvider_NewLaneProvider_FieldInventoryPinned(t *testing.T) {
+	classified := map[string]string{
+		"env":              "inherited",
+		"workspaceFolders": "inherited",
+		"excludeGlobs":     "inherited",
+		"sweepMode":        "inherited",
+		"opensDocs":        "inherited",
+		"maxParallel":      "inherited", // foreground width, capped at backgroundLaneMaxParallel
+
+		"heavyDelta":      "overridden", // true: the drain runs only the deferred classes
+		"noHeavyRequests": "overridden", // false: the drain exists to run them
+		"connect":         "overridden", // nil: never dial an IDE-attached server
+
+		"command":            "constructed",
+		"args":               "constructed",
+		"languages":          "constructed",
+		"daemon":             "constructed",
+		"logger":             "constructed",
+		"spec":               "constructed",
+		"altInitOptions":     "constructed",
+		"altInitOptionsFunc": "constructed",
+		"dialBackoffStart":   "constructed",
+		"maxDialBackoff":     "constructed",
+
+		"laneProviderFactory": "runtime", // a lane must never spawn lanes
+		"client":              "runtime",
+		"sourceCache":         "runtime",
+		"docMu":               "runtime",
+		"docVersions":         "runtime",
+		"openDocs":            "runtime",
+		"lastDiag":            "runtime",
+		"diagWaitersMu":       "runtime",
+		"diagWaiters":         "runtime",
+		"diagHookMu":          "runtime",
+		"diagHook":            "runtime",
+		"capsMu":              "runtime",
+		"caps":                "runtime",
+		"dynamicCaps":         "runtime",
+		"dialBackoff":         "runtime",
+		"reconnectMu":         "runtime",
+		"reconnectAttempts":   "runtime",
+		"connectOnce":         "runtime",
+		"reqStats":            "runtime",
+	}
+
+	tp := reflect.TypeOf(Provider{})
+	seen := map[string]bool{}
+	for i := 0; i < tp.NumField(); i++ {
+		name := tp.Field(i).Name
+		seen[name] = true
+		if _, ok := classified[name]; !ok {
+			t.Errorf("Provider field %q is not classified against the background lane — decide whether newLaneProvider must copy it (inherited), override it, or leave it to construction/runtime, then record it here; an inherited field also needs its copy asserted in TestLSPProvider_LaneInheritsForegroundConfig", name)
+		}
+	}
+	for name := range classified {
+		if !seen[name] {
+			t.Errorf("classified field %q no longer exists on Provider — drop it from the inventory", name)
+		}
+	}
 }
 
 // laneDrainClean is the marker predicate: only a completed, uncancelled,
