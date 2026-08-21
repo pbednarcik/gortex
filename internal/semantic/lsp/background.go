@@ -89,9 +89,12 @@ func (p *Provider) EnrichBackground(ctx context.Context, g graph.Store, repoPref
 		rctx, rcancel := context.WithTimeout(ctx, backgroundLaneReadinessBudget)
 		err := laneWaitReady(rctx, lane, repoRoot)
 		rcancel()
-		if errors.Is(err, semantic.ErrWorkspaceNotReady) {
-			// Nothing ran and nothing is stamped — the repo stays undrained
-			// and the next trigger retries against a warmer server.
+		if err != nil {
+			// Any gate failure aborts — ErrWorkspaceNotReady, a spawn
+			// failure inside WaitReady, or cancellation. Nothing ran and
+			// nothing is stamped, so the repo stays undrained and the next
+			// trigger retries; draining anyway would issue requests against
+			// a dead or unready server and mask this error with a later one.
 			return nil, err
 		}
 	}
