@@ -157,6 +157,9 @@ func (p *laneUntrackProvider) EnrichBackground(ctx context.Context, _ graph.Stor
 // spawns a server at the abandoned root, and writes the removed repo's
 // nodes back into the store.
 func TestLifecycleUntrackCancelsBackgroundLane(t *testing.T) {
+	// The fixture repo is far below the lane admission floor — disable it so
+	// the census enqueues (the floor has its own tests in internal/semantic).
+	t.Setenv("GORTEX_ENRICH_MIN_NODES", "0")
 	repo := setupRepoDir(t, "repo")
 	mi := newLifecycleTestMultiIndexer(t)
 	t.Cleanup(func() { closeLifecycleTestMultiIndexer(t, mi) })

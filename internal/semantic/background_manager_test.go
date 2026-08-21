@@ -14,6 +14,10 @@ import (
 
 func backgroundLaneManager(t *testing.T, p Provider) (*Manager, graph.Store, map[string]string) {
 	t.Helper()
+	// The harness graph holds ONE node — disable the admission floor so
+	// lane-mechanics tests aren't gated on repo size (the floor has its own
+	// tests below, which re-raise it).
+	t.Setenv("GORTEX_ENRICH_MIN_NODES", "0")
 	cfg := Config{
 		Enabled: true,
 		Providers: []ProviderConfig{
@@ -23,7 +27,9 @@ func backgroundLaneManager(t *testing.T, p Provider) (*Manager, graph.Store, map
 	mgr := NewManager(cfg, zap.NewNop())
 	mgr.RegisterProvider(p)
 	g := graph.New()
-	g.AddNode(&graph.Node{ID: "main.go::main", Kind: graph.KindFunction, Name: "main", FilePath: "main.go", Language: "go"})
+	// RepoPrefix makes the node visible to the repo-language projection the
+	// census and requeue admission-floor gates read.
+	g.AddNode(&graph.Node{ID: "main.go::main", Kind: graph.KindFunction, Name: "main", FilePath: "main.go", Language: "go", RepoPrefix: "default"})
 	return mgr, g, map[string]string{"default": "/tmp/test"}
 }
 
@@ -357,4 +363,47 @@ func TestManagerBackgroundLane_MutationHold(t *testing.T) {
 	case <-time.After(2 * time.Second):
 		t.Fatal("released hold did not let the parked task drain")
 	}
+}
+
+// The lane obeys the same admission floor as the fast tier
+// (GORTEX_ENRICH_MIN_NODES, default 16): a language too small for
+// index-time enrichment must not spawn a deferred drain either. The
+// pairing without this gate is pathological — no fast pass means no fast
+// marker, so the drain could never record completion and the census would
+// re-spawn its server on EVERY restart, forever.
+func TestManagerBackgroundLane_CensusAppliesAdmissionFloor(t *testing.T) {
+	p := &mockBackgroundProvider{
+		mockProvider: mockProvider{name: "go", languages: []string{"go"}, available: true},
+		drained:      make(chan string, 1),
+	}
+	mgr, g, roots := backgroundLaneManager(t, p)
+	defer func() { require.NoError(t, mgr.Close()) }()
+	t.Setenv("GORTEX_ENRICH_MIN_NODES", "16") // the harness graph holds one go node
+
+	mgr.StartBackgroundLane(context.Background(), g, roots)
+	select {
+	case repo := <-p.drained:
+		t.Fatalf("census enqueued %q for a language below the admission floor", repo)
+	case <-time.After(300 * time.Millisecond):
+	}
+	assert.Zero(t, mgr.BackgroundLaneStatus().Pending)
+}
+
+// A mutation requeue is floored the same way: editing the lone file of an
+// incidental language must not re-enter the lane for it (the drain could
+// never mark itself done — see the census test above). The floor gates the
+// whole pipeline: no invalidation either, so the language's lane state is
+// exactly as if it had never been eligible.
+func TestManagerBackgroundLane_RequeueAppliesAdmissionFloor(t *testing.T) {
+	p := &mockBackgroundProvider{
+		mockProvider: mockProvider{name: "go", languages: []string{"go"}, available: true},
+		drained:      make(chan string, 1),
+	}
+	mgr, g, roots := backgroundLaneManager(t, p)
+	defer func() { require.NoError(t, mgr.Close()) }()
+	t.Setenv("GORTEX_ENRICH_MIN_NODES", "16")
+
+	mgr.RequeueBackgroundForRepo(g, "default", roots["default"], []string{"go"})
+	assert.Zero(t, mgr.BackgroundLaneStatus().Pending, "a below-floor language must not re-enter the lane")
+	assert.Empty(t, p.invalidated, "the floor gates the whole lane pipeline, invalidation included")
 }
