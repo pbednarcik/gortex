@@ -354,14 +354,14 @@ func TestBackgroundScheduler(t *testing.T) {
 		s := newBackgroundScheduler(zap.NewNop())
 		defer s.close()
 		first := task(p, "repo-a")
-		first.notBefore = time.Now().Add(250 * time.Millisecond)
+		first.notBefore = time.Now().Add(300 * time.Millisecond)
 		require.True(t, s.enqueue(first))
 		slid := task(p, "repo-a")
-		slid.notBefore = time.Now().Add(700 * time.Millisecond)
+		slid.notBefore = time.Now().Add(1200 * time.Millisecond)
 		assert.False(t, s.enqueue(slid), "a slide extends the pending task, it adds no second one")
 		s.start(context.Background(), graph.New())
 
-		noRecv(t, p.drained, 450*time.Millisecond) // past the FIRST window — the slide must hold
+		noRecv(t, p.drained, 700*time.Millisecond) // well past the FIRST window — the slide must hold
 		assert.Equal(t, "repo-a", recv(t, p.drained), "the task drains after the slid window")
 		noRecv(t, p.drained, 100*time.Millisecond)
 	})
