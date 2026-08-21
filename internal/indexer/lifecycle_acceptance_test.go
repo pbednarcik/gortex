@@ -3,6 +3,8 @@ package indexer
 import (
 	"context"
 	"errors"
+	"path/filepath"
+	"sync"
 	"testing"
 	"time"
 
@@ -199,4 +201,218 @@ func TestLifecycleUntrackCancelsBackgroundLane(t *testing.T) {
 		t.Fatalf("untracked repo drained again: %q", r)
 	case <-time.After(150 * time.Millisecond):
 	}
+}
+
+// laneBracketProvider records the mutation-vs-lane ordering signals as a
+// single event log: drain start, drain cancellation (with whether the
+// mutated file's pre-mutation rows were still in the graph at that moment),
+// the foreground incremental enrichment, and the requeue's claim revocation.
+// The executor bracket's whole contract is the order of these events.
+type laneBracketProvider struct {
+	mu      sync.Mutex
+	events  []string
+	watched string // graph path whose rows the drain would have read
+
+	drainStarted chan struct{}
+	cancelled    chan struct{}
+	release      chan struct{}
+}
+
+func newLaneBracketProvider(watched string) *laneBracketProvider {
+	return &laneBracketProvider{
+		watched:      watched,
+		drainStarted: make(chan struct{}, 4),
+		cancelled:    make(chan struct{}, 4),
+		release:      make(chan struct{}),
+	}
+}
+
+func (p *laneBracketProvider) record(event string) {
+	p.mu.Lock()
+	p.events = append(p.events, event)
+	p.mu.Unlock()
+}
+
+func (p *laneBracketProvider) eventLog() []string {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return append([]string(nil), p.events...)
+}
+
+func (p *laneBracketProvider) Name() string        { return "lane-bracket" }
+func (p *laneBracketProvider) Languages() []string { return []string{"go"} }
+func (p *laneBracketProvider) Available() bool     { return true }
+func (p *laneBracketProvider) Close() error        { return nil }
+func (p *laneBracketProvider) Enrich(graph.Store, string) (*semantic.EnrichResult, error) {
+	p.record("enrich")
+	return &semantic.EnrichResult{}, nil
+}
+func (p *laneBracketProvider) EnrichFile(graph.Store, string, string) (*semantic.EnrichResult, error) {
+	p.record("enrich")
+	return nil, nil
+}
+func (p *laneBracketProvider) HasBackgroundWork(graph.Store, string) bool { return true }
+func (p *laneBracketProvider) InvalidateBackground(graph.Store, string) {
+	p.record("invalidate")
+}
+func (p *laneBracketProvider) EnrichBackground(ctx context.Context, g graph.Store, _, _ string) (*semantic.EnrichResult, error) {
+	p.record("drain-start")
+	p.drainStarted <- struct{}{}
+	select {
+	case <-p.release:
+		return &semantic.EnrichResult{}, nil
+	case <-ctx.Done():
+		// The moment of cancellation is the bracket's promise: the mutation
+		// is still waiting on this drain, so the rows it read must still be
+		// in the store — nothing was evicted or rewritten under it.
+		if len(g.GetFileNodes(p.watched)) > 0 {
+			p.record("cancelled-before-first-write")
+		} else {
+			p.record("cancelled-after-write")
+		}
+		p.cancelled <- struct{}{}
+		return nil, ctx.Err()
+	}
+}
+
+// laneBracketHarness tracks one repo, registers a blocking background
+// provider, and holds a lane drain in flight so a test can assert how a
+// mutation path brackets it.
+func laneBracketHarness(t *testing.T) (*MultiIndexer, *laneBracketProvider, string) {
+	t.Helper()
+	// The fixture repo is a handful of nodes — keep the enrichment admission
+	// floor from silently skipping the tail whose ordering this asserts.
+	t.Setenv("GORTEX_ENRICH_MIN_NODES", "0")
+	repo := setupRepoDir(t, "repo")
+	mi := newLifecycleTestMultiIndexer(t)
+	t.Cleanup(func() { closeLifecycleTestMultiIndexer(t, mi) })
+
+	_, err := mi.TrackRepo(config.RepoEntry{Path: repo, Name: "repo"})
+	require.NoError(t, err)
+
+	bg := newLaneBracketProvider("repo/main.go")
+	mgr := semantic.NewManager(semantic.Config{Enabled: true, EnrichOnWatch: true}, zap.NewNop())
+	mgr.RegisterProvider(bg)
+	t.Cleanup(func() { require.NoError(t, mgr.Close()) })
+	// Unblock any still-parked drain before the manager's mandatory-drain
+	// close waits on it (LIFO: this runs before the mgr.Close cleanup).
+	t.Cleanup(func() { close(bg.release) })
+	mi.SetSemanticManager(mgr)
+
+	mgr.StartBackgroundLane(context.Background(), mi.Graph(), map[string]string{"repo": repo})
+	select {
+	case <-bg.drainStarted:
+	case <-time.After(2 * time.Second):
+		t.Fatal("census did not start the drain")
+	}
+	return mi, bg, repo
+}
+
+func requireLaneCancelled(t *testing.T, bg *laneBracketProvider, op string) {
+	t.Helper()
+	select {
+	case <-bg.cancelled:
+	case <-time.After(5 * time.Second):
+		t.Fatalf("%s did not cancel the in-flight background drain", op)
+	}
+}
+
+// An incremental reindex must wait out the repo's in-flight drain before its
+// first store write, and must not hand the lane back (the requeue that
+// revokes the drained claim) until its complete tail — the incremental
+// semantic enrichment included — has finished writing. A requeue that fires
+// between the reparse and the tail re-admits the lane against a store the
+// foreground is still mutating.
+func TestLifecycleIncrementalReindexBracketsBackgroundLane(t *testing.T) {
+	mi, bg, repo := laneBracketHarness(t)
+
+	writeFile(t, filepath.Join(repo, "main.go"), `package main
+
+func Hello() {}
+func Added() {}
+`)
+	_, err := mi.IncrementalReindexRepo("repo", []string{"main.go"})
+	require.NoError(t, err)
+	requireLaneCancelled(t, bg, "IncrementalReindexRepo")
+
+	events := bg.eventLog()
+	require.Contains(t, events, "cancelled-before-first-write",
+		"the drain must observe an unmutated store at cancellation: %v", events)
+	require.NotContains(t, events, "cancelled-after-write", "events: %v", events)
+
+	// First occurrences on both sides: ANY claim revocation landing before
+	// the tail's enrichment re-admits the lane against a store the
+	// foreground is still writing.
+	enrichAt, invalidateAt := -1, -1
+	for i, e := range events {
+		if e == "enrich" && enrichAt == -1 {
+			enrichAt = i
+		}
+		if e == "invalidate" && invalidateAt == -1 {
+			invalidateAt = i
+		}
+	}
+	require.GreaterOrEqual(t, enrichAt, 0, "the mutation tail must run the incremental enrichment: %v", events)
+	require.GreaterOrEqual(t, invalidateAt, 0, "the mutation must revoke the drained claim: %v", events)
+	require.Greater(t, invalidateAt, enrichAt,
+		"the requeue must not re-admit the lane before the mutation's semantic tail finished: %v", events)
+}
+
+// A forced single-file eviction is a repository mutation like any other: it
+// must cancel the languages it touches BEFORE removing the rows an in-flight
+// drain may have read (or the resumed drain flushes its stale copies back —
+// resurrecting the deleted file), and revoke the drained claim after.
+func TestLifecycleForcedEvictBracketsBackgroundLane(t *testing.T) {
+	mi, bg, _ := laneBracketHarness(t)
+	idx := mi.GetIndexer("repo")
+	require.NotNil(t, idx)
+
+	done := make(chan struct{})
+	var nodesRemoved int
+	go func() {
+		nodesRemoved, _ = idx.EvictFile("main.go")
+		close(done)
+	}()
+	requireLaneCancelled(t, bg, "EvictFile")
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("EvictFile did not return")
+	}
+	require.Positive(t, nodesRemoved)
+
+	events := bg.eventLog()
+	require.Contains(t, events, "cancelled-before-first-write",
+		"the eviction must wait the drain out before removing the rows it read: %v", events)
+	require.NotContains(t, events, "cancelled-after-write", "events: %v", events)
+	require.Contains(t, events, "invalidate",
+		"the eviction must revoke the drained claim: %v", events)
+	require.Empty(t, mi.Graph().GetFileNodes("repo/main.go"), "the eviction itself must still land")
+}
+
+// MultiIndexer.IndexRepo rewrites every row of the repository — the same
+// full-reindex shape IndexCtx already brackets. Its separate raw path must
+// cancel the repo's in-flight drain before EvictRepo, or the old drain
+// flushes its pre-eviction snapshot over the rebuilt graph.
+func TestLifecycleIndexRepoCancelsBackgroundLane(t *testing.T) {
+	mi, bg, _ := laneBracketHarness(t)
+
+	done := make(chan struct{})
+	var indexErr error
+	go func() {
+		_, indexErr = mi.IndexRepo("repo")
+		close(done)
+	}()
+	requireLaneCancelled(t, bg, "IndexRepo")
+	select {
+	case <-done:
+	case <-time.After(10 * time.Second):
+		t.Fatal("IndexRepo did not return")
+	}
+	require.NoError(t, indexErr)
+
+	events := bg.eventLog()
+	require.Contains(t, events, "cancelled-before-first-write",
+		"the full reindex must wait the drain out before evicting the repo: %v", events)
+	require.NotContains(t, events, "cancelled-after-write", "events: %v", events)
 }
