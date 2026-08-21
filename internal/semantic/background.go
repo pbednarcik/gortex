@@ -24,9 +24,43 @@ type backgroundTask struct {
 	// an editing session coalesces into ONE drain after its last save —
 	// not a server spawn per batch, each cancelled by the next.
 	notBefore time.Time
+	// retry marks a task the scheduler re-enqueued itself after an errored
+	// or partial drain (notBefore carries its backoff). An external enqueue
+	// of the same key REPLACES the backoff window with its own — even an
+	// earlier one — because a fresh trigger is new signal, not a repeat of
+	// the failure.
+	retry bool
 }
 
 func (t backgroundTask) key() string { return t.repoName + "\x00" + t.provider.Name() }
+
+// backgroundRetryBase / backgroundRetryCap bound the retry backoff for
+// errored and partial drains: the first retry waits base, each further
+// failure doubles the wait, capped. Vars for tests.
+var (
+	backgroundRetryBase = time.Minute
+	backgroundRetryCap  = 30 * time.Minute
+)
+
+// backgroundRetryDelay maps a consecutive-failure streak (1-based) to the
+// wait before the next attempt: base doubling per failure, capped — long
+// enough that a persistently failing drain becomes a slow heartbeat instead
+// of a spin, short enough that a transiently unavailable server (still
+// warming, package restore holding a lock) recovers without waiting for the
+// next mutation or restart.
+func backgroundRetryDelay(streak int) time.Duration {
+	d := backgroundRetryBase
+	for i := 1; i < streak; i++ {
+		if d >= backgroundRetryCap {
+			break
+		}
+		d *= 2
+	}
+	if d > backgroundRetryCap {
+		d = backgroundRetryCap
+	}
+	return d
+}
 
 // backgroundScheduler drains deferred deep-tier enrichment one task at a
 // time, strictly after the daemon says go (start) — the lane must never
@@ -62,22 +96,29 @@ type backgroundScheduler struct {
 	// pending but cannot start a drain until the mutation releases.
 	// Cancellation alone cannot give this guarantee: it only clears tasks
 	// that already exist.
-	holds   map[string]int
-	started bool
-	closed  bool
-	wake    chan struct{} // buffered(1) nudge: new work, a released hold, or shutdown
+	holds map[string]int
+	// failStreaks counts consecutive errored/partial drains per task key —
+	// the input to the retry backoff. Reset on a clean drain and by any
+	// external enqueue of the key (a mutation requeue or pass-end trigger
+	// is fresh signal; its drain starts from the base backoff again).
+	failStreaks map[string]int
+	started     bool
+	closed      bool
+	wake        chan struct{} // buffered(1) nudge: new work, a released hold, or shutdown
 
 	// lane progress, surfaced through status() into the daemon health
 	// snapshot. Guarded by mu. Failure telemetry covers errored and
 	// panicking drains but NOT shutdown cancellation (lifecycle, not
-	// pathology) and NOT partial drains (progress, re-triggered later) —
-	// the lane has no retry loop, so without this surface a repo whose
-	// drain keeps erroring silently never deepens.
+	// pathology) and NOT partial drains (progress, re-triggered later).
+	// retries counts backoff re-enqueues of errored/partial drains — a
+	// climbing retries with a standing lastFailure is the "server keeps
+	// refusing this repo" signature on the health surface.
 	inFlightRepo   string
 	lastRepo       string
 	lastDurationMs int64
 	drained        int
 	failed         int
+	retries        int
 	lastFailedRepo string
 	lastFailure    string
 
@@ -95,6 +136,7 @@ type BackgroundLaneStatus struct {
 	LastDurationMs int64  `json:"last_duration_ms,omitempty"`
 	Drained        int    `json:"drained"`
 	Failed         int    `json:"failed,omitempty"`
+	Retries        int    `json:"retries,omitempty"`
 	LastFailedRepo string `json:"last_failed_repo,omitempty"`
 	LastFailure    string `json:"last_failure,omitempty"`
 }
@@ -110,6 +152,7 @@ func (s *backgroundScheduler) status() BackgroundLaneStatus {
 		LastDurationMs: s.lastDurationMs,
 		Drained:        s.drained,
 		Failed:         s.failed,
+		Retries:        s.retries,
 		LastFailedRepo: s.lastFailedRepo,
 		LastFailure:    s.lastFailure,
 	}
@@ -127,6 +170,7 @@ func newBackgroundScheduler(logger *zap.Logger) *backgroundScheduler {
 		inFlightCancel: map[string]context.CancelFunc{},
 		inFlightDone:   map[string]chan struct{}{},
 		holds:          map[string]int{},
+		failStreaks:    map[string]int{},
 		wake:           make(chan struct{}, 1),
 		done:           make(chan struct{}),
 	}
@@ -170,17 +214,37 @@ func (s *backgroundScheduler) enqueue(t backgroundTask) bool {
 	if s.closed {
 		return false
 	}
+	// Any external trigger resets the retry backoff: this enqueue is fresh
+	// signal (a mutation happened, a fast pass completed), so its drain
+	// starts a new streak rather than inheriting the old failures' wait.
+	delete(s.failStreaks, t.key())
 	if _, busy := s.inFlight[t.key()]; busy {
 		s.requeue[t.key()] = t
 		return true
 	}
 	if s.queued[t.key()] {
-		// Already pending — slide its eligibility window forward when the
-		// new trigger cools longer (the drain runs after the session's
-		// LAST mutation), but add no second task.
+		// Already pending. A parked RETRY yields its backoff window to the
+		// external trigger's own — even an earlier one (the wake nudge lets
+		// the worker recompute its cooldown timer). Between two external
+		// triggers the window only slides forward: the drain runs after the
+		// session's LAST mutation. Either way, no second task.
+		pulled := false
 		for i := range s.pending {
-			if s.pending[i].key() == t.key() && t.notBefore.After(s.pending[i].notBefore) {
+			if s.pending[i].key() != t.key() {
+				continue
+			}
+			if s.pending[i].retry {
 				s.pending[i].notBefore = t.notBefore
+				s.pending[i].retry = false
+				pulled = true
+			} else if t.notBefore.After(s.pending[i].notBefore) {
+				s.pending[i].notBefore = t.notBefore
+			}
+		}
+		if pulled {
+			select {
+			case s.wake <- struct{}{}:
+			default:
 			}
 		}
 		return false
@@ -268,11 +332,11 @@ func (s *backgroundScheduler) run(ctx context.Context, g graph.Store) {
 		// (and spawn its server) after cancellation. The registration is
 		// still released so a cancelRepo waiter can't hang on shutdown.
 		if ctx.Err() != nil {
-			s.finishInFlight(t)
+			s.finishInFlight(t, 0)
 			return
 		}
-		s.drain(dctx, g, t)
-		s.finishInFlight(t)
+		retryDelay := s.drain(dctx, g, t)
+		s.finishInFlight(t, retryDelay)
 		if ctx.Err() != nil {
 			return
 		}
@@ -320,11 +384,14 @@ func (s *backgroundScheduler) next(ctx context.Context) (t backgroundTask, dctx 
 	return t, dctx, true, 0
 }
 
-// finishInFlight settles a dequeued task: the requeue-or-clear bookkeeping,
-// then the per-drain handle release. done closes LAST, after the scheduler
-// state is fully settled, so a cancelRepo waiter never observes a half-done
-// transition.
-func (s *backgroundScheduler) finishInFlight(t backgroundTask) {
+// finishInFlight settles a dequeued task: the requeue-or-retry-or-clear
+// bookkeeping, then the per-drain handle release. done closes LAST, after
+// the scheduler state is fully settled, so a cancelRepo waiter never
+// observes a half-done transition. retryDelay > 0 asks for a backoff retry
+// of an errored/partial drain — an external requeue slot wins over it (its
+// enqueue already reset the streak and carries the fresher trigger's
+// window), and a closed lane parks nothing.
+func (s *backgroundScheduler) finishInFlight(t backgroundTask, retryDelay time.Duration) {
 	s.mu.Lock()
 	delete(s.inFlight, t.key())
 	if rt, again := s.requeue[t.key()]; again {
@@ -333,6 +400,12 @@ func (s *backgroundScheduler) finishInFlight(t backgroundTask) {
 		// (queued stays set; the slot is already claimed).
 		delete(s.requeue, t.key())
 		s.pending = append(s.pending, rt)
+	} else if retryDelay > 0 && !s.closed {
+		rt := t
+		rt.retry = true
+		rt.notBefore = time.Now().Add(retryDelay)
+		s.pending = append(s.pending, rt)
+		s.retries++
 	} else {
 		delete(s.queued, t.key())
 	}
@@ -409,6 +482,7 @@ func (s *backgroundScheduler) purgeMatchingLocked(match func(backgroundTask) boo
 	for _, t := range s.pending {
 		if match(t) {
 			delete(s.queued, t.key())
+			delete(s.failStreaks, t.key())
 			continue
 		}
 		kept = append(kept, t)
@@ -417,11 +491,16 @@ func (s *backgroundScheduler) purgeMatchingLocked(match func(backgroundTask) boo
 	for key, t := range s.requeue {
 		if match(t) {
 			delete(s.requeue, key)
+			delete(s.failStreaks, key)
 		}
 	}
 }
 
-func (s *backgroundScheduler) drain(ctx context.Context, g graph.Store, t backgroundTask) {
+// drain runs one task and returns the backoff to wait before retrying it —
+// 0 for a clean drain, a cancelled one (the canceller owns the requeue), a
+// panicking one (likely deterministic; retrying would churn a server spawn
+// per attempt), or a task with nothing to do.
+func (s *backgroundScheduler) drain(ctx context.Context, g graph.Store, t backgroundTask) (retryDelay time.Duration) {
 	// A panicking drain must not take the daemon down (the worker is a bare
 	// goroutine) nor kill the lane for the remaining queue.
 	defer func() {
@@ -468,10 +547,19 @@ func (s *backgroundScheduler) drain(ctx context.Context, g graph.Store, t backgr
 		s.lastRepo = t.repoName
 		s.lastDurationMs = time.Since(startedAt).Milliseconds()
 		s.drained++
+		delete(s.failStreaks, t.key())
 	case err != nil && ctx.Err() == nil:
 		s.failed++
 		s.lastFailedRepo = t.repoName
 		s.lastFailure = err.Error()
+	}
+	// An errored or partial drain retries with backoff — a transiently
+	// unavailable server (still warming, a package restore holding a lock)
+	// must not strand the repo's deep tier until the next mutation or
+	// restart. Cancellation is excluded: the canceller owns the requeue.
+	if ctx.Err() == nil && (err != nil || partial) {
+		s.failStreaks[t.key()]++
+		retryDelay = backgroundRetryDelay(s.failStreaks[t.key()])
 	}
 	s.mu.Unlock()
 	fields := []zap.Field{
@@ -492,15 +580,17 @@ func (s *backgroundScheduler) drain(ctx context.Context, g graph.Store, t backgr
 		s.logger.Info("background enrichment cancelled; progress is stamped and resumes on the next trigger",
 			append(fields, zap.Error(err))...)
 	case err != nil:
-		// No retry loop — the next natural trigger (reindex, restart)
-		// re-enqueues. Worst case is today's steady state: deep edges absent.
-		s.logger.Warn("background enrichment failed", append(fields, zap.Error(err))...)
+		s.logger.Warn("background enrichment failed; retrying with backoff",
+			append(fields, zap.Error(err), zap.Duration("retry_in", retryDelay))...)
 	case partial:
 		// Progress landed but the pass was cut — the tier is NOT drained.
-		// No in-process retry loop (a persistently-cut drain would spin);
-		// the next natural trigger resumes from the stamps.
-		s.logger.Warn("background enrichment partial", fields...)
+		// The backoff retry resumes from the stamps (request-free for the
+		// files that made it), so a persistently-cut drain becomes a slow
+		// bounded heartbeat, never a spin.
+		s.logger.Warn("background enrichment partial; retrying with backoff",
+			append(fields, zap.Duration("retry_in", retryDelay))...)
 	default:
 		s.logger.Info("background enrichment complete", fields...)
 	}
+	return retryDelay
 }

@@ -3,6 +3,7 @@ package semantic
 import (
 	"context"
 	"errors"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -27,6 +28,10 @@ type mockBackgroundProvider struct {
 	drainErr     error                  // non-nil: drain returns this error
 	panicOnDrain bool
 	invalidated  []string // repos whose drained claim was revoked
+	// drainFunc, when set, decides each attempt's outcome (1-based attempt
+	// counter) — for fail-then-succeed retry tests. Overrides partial/drainErr.
+	drainFunc func(attempt int) (*EnrichResult, error)
+	attempts  atomic.Int32
 }
 
 func (m *mockBackgroundProvider) InvalidateBackground(_ graph.Store, repo string) {
@@ -56,6 +61,9 @@ func (m *mockBackgroundProvider) EnrichBackground(ctx context.Context, _ graph.S
 			}
 			return nil, ctx.Err()
 		}
+	}
+	if m.drainFunc != nil {
+		return m.drainFunc(int(m.attempts.Add(1)))
 	}
 	if m.drainErr != nil {
 		return nil, m.drainErr
@@ -308,7 +316,7 @@ func TestBackgroundScheduler(t *testing.T) {
 		s.start(context.Background(), graph.New())
 		assert.Equal(t, "repo-a", recv(t, p.drained))
 		require.Eventually(t, func() bool {
-			return len(obs.FilterMessage("background enrichment partial").All()) == 1
+			return len(obs.FilterMessage("background enrichment partial; retrying with backoff").All()) == 1
 		}, 2*time.Second, 5*time.Millisecond)
 		assert.Empty(t, obs.FilterMessage("background enrichment complete").All())
 		st := s.status()
@@ -509,5 +517,153 @@ func TestBackgroundScheduler(t *testing.T) {
 		require.True(t, s.enqueue(task(p, "repo-y")))
 		s.start(context.Background(), graph.New())
 		assert.Equal(t, "repo-y", recv(t, p.drained))
+	})
+}
+
+// A transiently failing or partial drain must recover on its own: the
+// scheduler re-enqueues it with bounded exponential backoff instead of
+// stranding the repo until the next mutation or restart. A fresh external
+// trigger resets the backoff — a parked retry never outlives a real signal —
+// and a CANCELLED drain is not retried: the canceller owns the requeue.
+func TestBackgroundScheduler_RetryBackoff(t *testing.T) {
+	setBackoff := func(t *testing.T, base, ceil time.Duration) {
+		t.Helper()
+		prevBase, prevCap := backgroundRetryBase, backgroundRetryCap
+		backgroundRetryBase, backgroundRetryCap = base, ceil
+		t.Cleanup(func() { backgroundRetryBase, backgroundRetryCap = prevBase, prevCap })
+	}
+	task := func(p Provider, repo string) backgroundTask {
+		return backgroundTask{repoName: repo, repoRoot: "/tmp/" + repo, provider: p, lang: "go"}
+	}
+	recv := func(t *testing.T, ch chan string) string {
+		t.Helper()
+		select {
+		case v := <-ch:
+			return v
+		case <-time.After(2 * time.Second):
+			t.Fatal("timed out waiting for a drain")
+			return ""
+		}
+	}
+	noRecv := func(t *testing.T, ch chan string, window time.Duration) {
+		t.Helper()
+		select {
+		case v := <-ch:
+			t.Fatalf("unexpected drain of %q", v)
+		case <-time.After(window):
+		}
+	}
+
+	t.Run("FailedDrainRetriesWithBackoff", func(t *testing.T) {
+		setBackoff(t, 250*time.Millisecond, 2*time.Second)
+		p := &mockBackgroundProvider{
+			mockProvider: mockProvider{name: "mock-bg", languages: []string{"go"}, available: true},
+			drained:      make(chan string, 8),
+			drainFunc: func(attempt int) (*EnrichResult, error) {
+				if attempt == 1 {
+					return nil, errors.New("server still warming")
+				}
+				return &EnrichResult{Provider: "mock-bg", Language: "go", EdgesConfirmed: 1}, nil
+			},
+		}
+		s := newBackgroundScheduler(zap.NewNop())
+		defer s.close()
+		s.start(context.Background(), graph.New())
+
+		require.True(t, s.enqueue(task(p, "repo-a")))
+		assert.Equal(t, "repo-a", recv(t, p.drained), "first attempt")
+		noRecv(t, p.drained, 120*time.Millisecond) // still cooling — retry waits out the backoff
+		assert.Equal(t, "repo-a", recv(t, p.drained), "the failed drain must retry on its own")
+		assert.Eventually(t, func() bool { return s.status().Drained == 1 },
+			2*time.Second, 10*time.Millisecond, "the retry must complete cleanly")
+		st := s.status()
+		assert.Equal(t, 1, st.Failed, "the first attempt's failure stays on the telemetry surface")
+		assert.Equal(t, 1, st.Retries)
+	})
+
+	t.Run("PartialDrainRetriesWithBackoff", func(t *testing.T) {
+		setBackoff(t, 250*time.Millisecond, 2*time.Second)
+		p := &mockBackgroundProvider{
+			mockProvider: mockProvider{name: "mock-bg", languages: []string{"go"}, available: true},
+			drained:      make(chan string, 8),
+			drainFunc: func(attempt int) (*EnrichResult, error) {
+				if attempt == 1 {
+					return &EnrichResult{Provider: "mock-bg", Language: "go", Partial: true}, nil
+				}
+				return &EnrichResult{Provider: "mock-bg", Language: "go", EdgesConfirmed: 1}, nil
+			},
+		}
+		s := newBackgroundScheduler(zap.NewNop())
+		defer s.close()
+		s.start(context.Background(), graph.New())
+
+		require.True(t, s.enqueue(task(p, "repo-a")))
+		assert.Equal(t, "repo-a", recv(t, p.drained), "first attempt")
+		noRecv(t, p.drained, 120*time.Millisecond)
+		assert.Equal(t, "repo-a", recv(t, p.drained), "a partial drain must retry on its own")
+		assert.Eventually(t, func() bool { return s.status().Drained == 1 },
+			2*time.Second, 10*time.Millisecond)
+		st := s.status()
+		assert.Equal(t, 0, st.Failed, "partial is progress, not failure — telemetry semantics unchanged")
+		assert.Equal(t, 1, st.Retries)
+	})
+
+	t.Run("RetryDelayDoublesUpToTheCap", func(t *testing.T) {
+		setBackoff(t, 100*time.Millisecond, 350*time.Millisecond)
+		assert.Equal(t, 100*time.Millisecond, backgroundRetryDelay(1))
+		assert.Equal(t, 200*time.Millisecond, backgroundRetryDelay(2))
+		assert.Equal(t, 350*time.Millisecond, backgroundRetryDelay(3), "growth is capped")
+		assert.Equal(t, 350*time.Millisecond, backgroundRetryDelay(40), "a huge streak must not overflow past the cap")
+	})
+
+	t.Run("ExternalEnqueueResetsBackoff", func(t *testing.T) {
+		setBackoff(t, 10*time.Second, 20*time.Second)
+		p := &mockBackgroundProvider{
+			mockProvider: mockProvider{name: "mock-bg", languages: []string{"go"}, available: true},
+			drained:      make(chan string, 8),
+			drainFunc: func(attempt int) (*EnrichResult, error) {
+				if attempt == 1 {
+					return nil, errors.New("server still warming")
+				}
+				return &EnrichResult{Provider: "mock-bg", Language: "go", EdgesConfirmed: 1}, nil
+			},
+		}
+		s := newBackgroundScheduler(zap.NewNop())
+		defer s.close()
+		s.start(context.Background(), graph.New())
+
+		require.True(t, s.enqueue(task(p, "repo-a")))
+		assert.Equal(t, "repo-a", recv(t, p.drained), "first attempt")
+		require.Eventually(t, func() bool { return s.status().Pending == 1 },
+			2*time.Second, 10*time.Millisecond, "the failed drain must park as a pending retry")
+		// A fresh trigger (mutation requeue, pass-end enqueue) arrives while
+		// the retry cools for 10s: it must pull the task eligible NOW, not
+		// merely fail dedup and leave the backoff window standing.
+		s.enqueue(task(p, "repo-a"))
+		assert.Equal(t, "repo-a", recv(t, p.drained), "the external trigger must override the backoff window")
+		assert.Eventually(t, func() bool { return s.status().Drained == 1 },
+			2*time.Second, 10*time.Millisecond)
+	})
+
+	t.Run("CancelledDrainDoesNotRetry", func(t *testing.T) {
+		setBackoff(t, 100*time.Millisecond, time.Second)
+		p := &mockBackgroundProvider{
+			mockProvider: mockProvider{name: "mock-bg", languages: []string{"go"}, available: true},
+			drained:      make(chan string, 8),
+			block:        make(chan struct{}),
+			ctxErr:       make(chan error, 1),
+		}
+		s := newBackgroundScheduler(zap.NewNop())
+		defer s.close()
+		s.start(context.Background(), graph.New())
+
+		require.True(t, s.enqueue(task(p, "repo-a")))
+		assert.Equal(t, "repo-a", recv(t, p.drained))
+		s.cancelRepo("repo-a", nil)
+		noRecv(t, p.drained, 400*time.Millisecond) // the canceller owns the requeue — no self-retry
+		st := s.status()
+		assert.Equal(t, 0, st.Failed, "shutdown/mutation cancellation is lifecycle, not pathology")
+		assert.Equal(t, 0, st.Retries)
+		assert.Equal(t, 0, st.Pending)
 	})
 }
