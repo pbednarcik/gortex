@@ -296,6 +296,7 @@ func TestLSP_Provider_AddsMissingCallEdgeViaCallHierarchy(t *testing.T) {
 // line — and (b) be stamped at the call-expression line the server
 // reported in fromRanges, not at the caller's declaration line.
 func TestLSP_Provider_IncomingCallStampsCallSiteNotDeclaration(t *testing.T) {
+	t.Setenv(HeavyRequestsEnv, "")
 	t.Setenv("GORTEX_LSP_SWEEP", "full") // exercise the full per-file sweep, not the demand-gated default
 	repoRoot := t.TempDir()
 	require.NoError(t, os.WriteFile(
@@ -526,6 +527,7 @@ func TestIdentifierIndex(t *testing.T) {
 // precision filter then suppressed — silently costing recall on repeated
 // calls within one function.
 func TestLSP_Provider_PromotesEveryVerifiedCallSite(t *testing.T) {
+	t.Setenv(HeavyRequestsEnv, "")
 	t.Setenv("GORTEX_LSP_SWEEP", "full") // exercise the full per-file sweep, not the demand-gated default
 	repoRoot := t.TempDir()
 	require.NoError(t, os.WriteFile(

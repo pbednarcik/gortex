@@ -244,6 +244,7 @@ func TestLSP_Provider_AddsImplementsFromLSP(t *testing.T) {
 }
 
 func TestLSP_Provider_ConfirmsEdgeFromMatchingReferences(t *testing.T) {
+	t.Setenv(HeavyRequestsEnv, "")
 	repoRoot := t.TempDir()
 	require.NoError(t, os.WriteFile(
 		filepath.Join(repoRoot, "main.go"),
@@ -801,6 +802,7 @@ func TestLSP_Provider_DoesNotPromoteMismatchedEdgeWithoutDefinitionVerdict(t *te
 // server's reference list names the edge's own site line — confirmed
 // straight from references, no definition round trip.
 func TestLSP_Provider_ConfirmsEdgeAtRecordedSiteLine(t *testing.T) {
+	t.Setenv(HeavyRequestsEnv, "")
 	repoRoot := t.TempDir()
 	require.NoError(t, os.WriteFile(filepath.Join(repoRoot, "a.py"), []byte(pyTwoClassSource), 0o644))
 
@@ -861,6 +863,7 @@ func TestLSP_Provider_ConfirmsEdgeAtRecordedSiteLine(t *testing.T) {
 // site-line confirm scenario against a real sqlite store and assert
 // the promotion SURVIVES a re-read.
 func TestLSP_Provider_ConfirmationPersistsOnDiskBackend(t *testing.T) {
+	t.Setenv(HeavyRequestsEnv, "")
 	repoRoot := t.TempDir()
 	require.NoError(t, os.WriteFile(filepath.Join(repoRoot, "a.py"), []byte(pyTwoClassSource), 0o644))
 
