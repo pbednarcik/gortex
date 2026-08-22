@@ -12,6 +12,7 @@ import (
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"go.uber.org/zap"
 
 	"github.com/zzet/gortex/internal/graph"
 	"github.com/zzet/gortex/internal/semantic"
@@ -223,6 +224,7 @@ func TestLSPProvider_NewLaneProvider_FieldInventoryPinned(t *testing.T) {
 		"heavyDelta":      "overridden", // true: the drain runs only the deferred classes
 		"noHeavyRequests": "overridden", // false: the drain exists to run them
 		"connect":         "overridden", // nil: never dial an IDE-attached server
+		"callTimeoutFn":   "overridden", // resolveLaneCallTimeout: the lane's larger request budget
 
 		"command":            "constructed",
 		"args":               "constructed",
@@ -447,6 +449,55 @@ func TestLSPProvider_EnrichBackground_MarkerUsesDrainStartSHA(t *testing.T) {
 	require.True(t, found)
 	assert.Equal(t, "sha-1", laneMarker.IndexedSHA,
 		"the marker claims only the state the drain actually visited")
+}
+
+// The lane's per-request budget is deliberately larger than the
+// foreground's: the drain has nobody waiting, and the measured whale tail
+// (solution-wide references on the highest-fan-in members) converts at a
+// 3-minute budget where the 30s foreground default times out. Explicit
+// operator settings still win: the lane env first, then the global env.
+func TestResolveLaneCallTimeout(t *testing.T) {
+	t.Run("default is the lane budget", func(t *testing.T) {
+		t.Setenv(laneCallTimeoutEnv, "")
+		t.Setenv("GORTEX_LSP_CALL_TIMEOUT", "")
+		assert.Equal(t, laneCallTimeoutDefault, resolveLaneCallTimeout())
+	})
+	t.Run("lane env wins", func(t *testing.T) {
+		t.Setenv(laneCallTimeoutEnv, "90s")
+		t.Setenv("GORTEX_LSP_CALL_TIMEOUT", "45s")
+		assert.Equal(t, 90*time.Second, resolveLaneCallTimeout())
+	})
+	t.Run("lane env can disable the bound", func(t *testing.T) {
+		t.Setenv(laneCallTimeoutEnv, "off")
+		assert.Equal(t, time.Duration(0), resolveLaneCallTimeout())
+	})
+	t.Run("global env applies when the lane env is unset", func(t *testing.T) {
+		t.Setenv(laneCallTimeoutEnv, "")
+		t.Setenv("GORTEX_LSP_CALL_TIMEOUT", "45s")
+		assert.Equal(t, 45*time.Second, resolveLaneCallTimeout())
+	})
+	t.Run("garbage falls back to the lane default", func(t *testing.T) {
+		t.Setenv(laneCallTimeoutEnv, "soon")
+		t.Setenv("GORTEX_LSP_CALL_TIMEOUT", "")
+		assert.Equal(t, laneCallTimeoutDefault, resolveLaneCallTimeout())
+	})
+}
+
+// newLaneProvider must wire the lane budget so ensureClient applies it
+// after the initialize handshake; a foreground provider keeps the global
+// resolution.
+func TestLSPProvider_NewLaneProviderUsesLaneCallTimeout(t *testing.T) {
+	t.Setenv(laneCallTimeoutEnv, "")
+	t.Setenv("GORTEX_LSP_CALL_TIMEOUT", "")
+
+	p := NewProviderFromSpec(&ServerSpec{Name: "fake", Command: "fake-lsp", Languages: []string{"go"}}, zap.NewNop())
+	assert.Equal(t, defaultLSPCallTimeout, p.effectiveCallTimeout(),
+		"a foreground provider keeps the global call budget")
+
+	lane, err := p.newLaneProvider()
+	require.NoError(t, err)
+	assert.Equal(t, laneCallTimeoutDefault, lane.effectiveCallTimeout(),
+		"the drain instance runs under the lane budget")
 }
 
 // failingMarkerStore injects marker-table failures around markerStore.

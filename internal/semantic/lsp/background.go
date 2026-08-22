@@ -189,6 +189,9 @@ func (p *Provider) newLaneProvider() (*Provider, error) {
 	lane := NewProviderFromSpec(p.spec, p.logger)
 	lane.heavyDelta = true
 	lane.noHeavyRequests = false
+	// The drain runs under the lane's larger per-request budget: nobody
+	// waits on it, and the measured whale tail only converts there.
+	lane.callTimeoutFn = resolveLaneCallTimeout
 	lane.excludeGlobs = append([]string(nil), p.excludeGlobs...)
 	lane.workspaceFolders = append([]string(nil), p.workspaceFolders...)
 	lane.sweepMode = p.sweepMode
