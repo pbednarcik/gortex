@@ -6,6 +6,8 @@ import (
 	"fmt"
 	"time"
 
+	"go.uber.org/zap"
+
 	"github.com/zzet/gortex/internal/graph"
 	"github.com/zzet/gortex/internal/semantic"
 )
@@ -136,6 +138,24 @@ func (p *Provider) EnrichBackground(ctx context.Context, g graph.Store, repoPref
 	}
 
 	result, err := lane.EnrichRepoContext(ctx, g, repoPrefix, repoRoot, nil)
+	// A drain that saw zero symbols for its languages proves nothing about
+	// the tier — the store held no rows for the repo (typically a live
+	// track whose nodes are still in the indexer's shadow graph, invisible
+	// to the durable store the lane reads). Recording the marker there
+	// would claim a tier that was never drained; surfacing the result as
+	// partial parks the task for a backoff retry, which succeeds once the
+	// rows land. An all-stamped repo is different and stays clean: its
+	// SymbolsTotal counts the covered symbols even when nothing re-drains.
+	if err == nil && ctx.Err() == nil && result != nil && result.SymbolsTotal == 0 {
+		result.Partial = true
+		if p.logger != nil {
+			p.logger.Warn("LSP background drain saw no repo evidence; deferring",
+				zap.String("provider", p.Name()),
+				zap.String("repo_prefix", repoPrefix),
+			)
+		}
+		return result, nil
+	}
 	if laneDrainClean(ctx, result, err) {
 		p.recordBackgroundMarker(g, repoPrefix, startSHA)
 	}

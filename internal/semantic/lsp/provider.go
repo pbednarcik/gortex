@@ -884,6 +884,15 @@ func (p *Provider) EnrichRepoContext(ctx context.Context, g graph.Store, repoPre
 				zap.String("repo_prefix", repoPrefix),
 			)
 		}
+		// Populate the symbol counters even on the no-work return: a caller
+		// deciding whether this pass proved anything (the lane's completion
+		// marker) needs "N symbols, all covered" to stay distinguishable
+		// from "the store held no rows for this repo at all".
+		result.SymbolsTotal = skippedAlreadyStamped
+		if hasProjectedRepo {
+			result.SymbolsTotal = projectedRepo.symbolsTotal
+		}
+		result.SymbolsCovered = skippedAlreadyStamped
 		result.DurationMs = time.Since(start).Milliseconds()
 		return result, nil
 	}
