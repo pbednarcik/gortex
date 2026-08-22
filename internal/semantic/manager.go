@@ -279,6 +279,12 @@ func (m *Manager) RequeueBackgroundForRepo(g graph.Store, repoName, repoRoot str
 		// deep tier until the next commit moves the fast marker.
 		forced := false
 		if err := be.InvalidateBackground(g, repoName); err != nil {
+			// The force flag bypasses the MARKER gates, not the lane mode:
+			// a store hiccup while the lane is disabled must not spawn a
+			// drain in a mode where the lane never runs.
+			if gate, ok := be.(backgroundLaneGate); ok && !gate.BackgroundLaneEnabled() {
+				return
+			}
 			m.logger.Warn("background lane: marker invalidation failed; enqueuing conservatively",
 				zap.String("provider", provider.Name()),
 				zap.String("repo", repoName),

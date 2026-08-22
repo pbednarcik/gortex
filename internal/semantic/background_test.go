@@ -35,8 +35,17 @@ type mockBackgroundProvider struct {
 	// invalidateErr, when set, is returned by InvalidateBackground — the
 	// stale-marker world where the blanking write failed.
 	invalidateErr error
+	// laneEnabled, when set, answers the fail-open mode gate; nil = enabled.
+	laneEnabled func() bool
 	// roots, when non-nil, receives the repoRoot each drain was handed.
 	roots chan string
+}
+
+func (m *mockBackgroundProvider) BackgroundLaneEnabled() bool {
+	if m.laneEnabled == nil {
+		return true
+	}
+	return m.laneEnabled()
 }
 
 func (m *mockBackgroundProvider) InvalidateBackground(_ graph.Store, repo string) error {

@@ -242,6 +242,7 @@ func TestLSPProvider_NewLaneProvider_FieldInventoryPinned(t *testing.T) {
 		"clientMu":            "runtime", // client lifecycle handoff — per instance
 		"pendingClient":       "runtime", // spawn-to-publish window handle — per instance
 		"closeGen":            "runtime", // Close counter for the handoff — per instance
+		"clientsSealed":       "runtime", // single-use teardown latch — per instance
 		"sourceCache":         "runtime",
 		"docMu":               "runtime",
 		"docVersions":         "runtime",

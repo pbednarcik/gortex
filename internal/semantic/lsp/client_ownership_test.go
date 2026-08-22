@@ -21,7 +21,8 @@ func TestLSPProvider_CloseReapsPendingClient(t *testing.T) {
 	go newFakeLSPServer().run(serverIn, serverOut)
 
 	p := NewProvider("fake-lsp", nil, []string{"go"}, false, 0, zap.NewNop())
-	p.registerPendingClient(c)
+	_, accepted := p.registerPendingClient(c)
+	require.True(t, accepted)
 
 	require.NoError(t, p.Close())
 	select {
@@ -40,7 +41,8 @@ func TestLSPProvider_LatePublicationAfterCloseIsReaped(t *testing.T) {
 	go newFakeLSPServer().run(serverIn, serverOut)
 
 	p := NewProvider("fake-lsp", nil, []string{"go"}, false, 0, zap.NewNop())
-	gen := p.registerPendingClient(c)
+	gen, accepted := p.registerPendingClient(c)
+	require.True(t, accepted)
 
 	require.NoError(t, p.Close())
 	assert.False(t, p.publishClient(c, gen),
@@ -53,6 +55,31 @@ func TestLSPProvider_LatePublicationAfterCloseIsReaped(t *testing.T) {
 	assert.Nil(t, p.client, "no client may be published over a closed window")
 }
 
+// A sealed provider accepts no new clients, ever: the lane's readiness
+// teardown can abandon a prober wedged BEFORE the spawn (package restore,
+// process start) — when that leg finally returns, its registration and
+// publication must be refused and the fresh server reaped, or it leaks
+// for the daemon's lifetime with nobody left to Close it. Sealing is for
+// single-use lane instances; a foreground Close stays reversible.
+func TestLSPProvider_SealRefusesLateSpawn(t *testing.T) {
+	c, serverIn, serverOut, cleanup := newPipedClient(t)
+	defer cleanup()
+	go newFakeLSPServer().run(serverIn, serverOut)
+
+	p := NewProvider("fake-lsp", nil, []string{"go"}, false, 0, zap.NewNop())
+	p.sealClients() // the teardown ran while the prober was wedged pre-spawn
+
+	gen, accepted := p.registerPendingClient(c)
+	assert.False(t, accepted, "a sealed provider must refuse a late registration")
+	assert.False(t, p.publishClient(c, gen), "and a late publication")
+	select {
+	case <-c.Done():
+	case <-time.After(2 * time.Second):
+		t.Fatal("the refused registration did not reap the client")
+	}
+	assert.Nil(t, p.client)
+}
+
 // The undisturbed path publishes normally.
 func TestLSPProvider_PublishClientHappyPath(t *testing.T) {
 	c, serverIn, serverOut, cleanup := newPipedClient(t)
@@ -60,7 +87,8 @@ func TestLSPProvider_PublishClientHappyPath(t *testing.T) {
 	go newFakeLSPServer().run(serverIn, serverOut)
 
 	p := NewProvider("fake-lsp", nil, []string{"go"}, false, 0, zap.NewNop())
-	gen := p.registerPendingClient(c)
+	gen, accepted := p.registerPendingClient(c)
+	require.True(t, accepted)
 	require.True(t, p.publishClient(c, gen))
 	assert.Same(t, c, p.client)
 	require.NoError(t, p.Close())

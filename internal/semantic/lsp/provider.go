@@ -99,6 +99,14 @@ type Provider struct {
 	clientMu      sync.Mutex
 	pendingClient *Client
 	closeGen      uint64
+	// clientsSealed permanently refuses new client registrations and
+	// publications (sealClients). Single-use lane instances seal on every
+	// teardown path: an abandoned readiness prober can still be wedged
+	// BEFORE its spawn (package restore, process start), and without the
+	// seal the client it eventually builds would register against a
+	// provider nobody will ever Close again. Foreground providers never
+	// seal — their Close stays reversible for the reconnect path.
+	clientsSealed bool
 
 	// callTimeoutFn, when set, resolves this instance's post-initialize
 	// Call bound instead of the global lspCallTimeout — the lane drain
@@ -390,24 +398,33 @@ func (p *Provider) Close() error {
 // registerPendingClient records a freshly spawned client as owned-but-
 // unpublished, returning the close generation the eventual publication
 // must present. From this call on, Close reaps the client even though
-// p.client does not reference it yet.
-func (p *Provider) registerPendingClient(c *Client) uint64 {
+// p.client does not reference it yet. A sealed provider refuses the
+// registration and reaps the client immediately — its owner has already
+// torn the instance down for good.
+func (p *Provider) registerPendingClient(c *Client) (uint64, bool) {
 	p.clientMu.Lock()
-	defer p.clientMu.Unlock()
+	if p.clientsSealed {
+		p.clientMu.Unlock()
+		_ = c.Shutdown()
+		return 0, false
+	}
 	p.pendingClient = c
-	return p.closeGen
+	gen := p.closeGen
+	p.clientMu.Unlock()
+	return gen, true
 }
 
-// publishClient promotes a pending client to p.client — unless a Close ran
-// since the client registered (gen mismatch), in which case the client is
-// shut down and false is returned: the provider's owner already tore it
-// down and will never Close again, so publishing would orphan the server.
+// publishClient promotes a pending client to p.client — unless a Close or
+// seal ran since the client registered (gen mismatch / sealed), in which
+// case the client is shut down and false is returned: the provider's
+// owner already tore it down and will never Close again, so publishing
+// would orphan the server.
 func (p *Provider) publishClient(c *Client, gen uint64) bool {
 	p.clientMu.Lock()
 	if p.pendingClient == c {
 		p.pendingClient = nil
 	}
-	if p.closeGen != gen {
+	if p.clientsSealed || p.closeGen != gen {
 		p.clientMu.Unlock()
 		_ = c.Shutdown()
 		return false
@@ -415,6 +432,28 @@ func (p *Provider) publishClient(c *Client, gen uint64) bool {
 	p.client = c
 	p.clientMu.Unlock()
 	return true
+}
+
+// sealClients is Close for a single-use instance: shuts down the
+// published and pending clients AND permanently refuses new ones. The
+// lane calls this on every teardown path so a prober still wedged before
+// its spawn cannot later hand a live server to a provider nothing will
+// ever Close.
+func (p *Provider) sealClients() {
+	p.clientMu.Lock()
+	p.clientsSealed = true
+	p.closeGen++
+	c := p.client
+	pending := p.pendingClient
+	p.pendingClient = nil
+	p.clientMu.Unlock()
+
+	if c != nil {
+		_ = c.Shutdown()
+	}
+	if pending != nil && pending != c {
+		_ = pending.Shutdown()
+	}
 }
 
 // effectiveCallTimeout resolves this instance's post-initialize Call
@@ -631,7 +670,11 @@ func markNodeHeavyStamped(n *graph.Node) {
 // kind + language, wider than a strict override check: a custom
 // Equals(T) or ToString(format) overload on a hot type draws the same
 // solution-wide fan-in, and the cost of a false positive is one edge
-// left at its static confidence, not lost work.
+// left at its static confidence, not lost work. Only the references
+// confirm skips these targets — the sweep's prepareCallHierarchy /
+// incomingCalls legs on the same members completed cleanly in the same
+// measured runs (every drain error was references-class), so skipping
+// the sweep would only discard good incoming edges.
 func terminalUnconfirmable(n *graph.Node) bool {
 	if n == nil || n.Kind != graph.KindMethod || n.Language != "csharp" {
 		return false
@@ -1765,6 +1808,14 @@ func (p *Provider) EnrichRepoContext(ctx context.Context, g graph.Store, repoPre
 		if aborted.Load() {
 			return nil, abortErr
 		}
+		// A cancelled pass must not rebuild the server it was just torn
+		// away from: the lane watchdog seals the client on ctx death, and
+		// reconnecting would re-pay a spawn (for C# a restore + solution
+		// load) only for the pass to unwind — stalling the cancelRepo
+		// waiter or daemon shutdown behind it.
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
 		if cur := activeClient.Load(); cur != stale {
 			return cur, nil // someone else already reconnected
 		}
@@ -2355,10 +2406,16 @@ func (p *Provider) resetForReconnect() {
 	// Drop the dead client so the next ensureClient branch builds a
 	// fresh transport. Close it best-effort first to free any
 	// pending pending-map entries; the dead read loop already closed
-	// `done` so Shutdown() is a no-op past that point.
-	if p.client != nil {
-		_ = p.client.Shutdown()
-		p.client = nil
+	// `done` so Shutdown() is a no-op past that point. The pointer write
+	// goes under clientMu: the lane watchdog's seal can run concurrently
+	// with a drain goroutine's reconnect, and Close/seal read p.client
+	// under the same lock.
+	p.clientMu.Lock()
+	c := p.client
+	p.client = nil
+	p.clientMu.Unlock()
+	if c != nil {
+		_ = c.Shutdown()
 	}
 	p.docMu.Lock()
 	p.docVersions = map[string]int{}
@@ -2763,7 +2820,10 @@ func (p *Provider) ensureClient(workspaceRoot string) error {
 	// teardown, provider shutdown) can only reach it through this
 	// registration — and the initialize Call below is unbounded, so this
 	// window is where a wedged server would otherwise be orphaned.
-	spawnGen := p.registerPendingClient(client)
+	spawnGen, accepted := p.registerPendingClient(client)
+	if !accepted {
+		return errors.New("lsp: provider sealed during spawn; server reaped")
+	}
 
 	// Wire diagnostic + reverse-RPC handlers before initialize so we
 	// don't lose the first publishDiagnostics burst that some servers

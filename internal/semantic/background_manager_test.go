@@ -443,6 +443,36 @@ func TestManagerBackgroundLane_RequeueEnqueuesWhenInvalidationFails(t *testing.T
 	}
 }
 
+// The fail-open path must not out-privilege a healthy one: a forced task
+// bypasses the marker gates because the MARKER is untrustworthy — but the
+// lane MODE is not in question, and a store hiccup during a requeue while
+// the lane is disabled must not force a drain in a mode where the lane
+// must never run.
+func TestManagerBackgroundLane_FailOpenRespectsLaneMode(t *testing.T) {
+	p := &mockBackgroundProvider{
+		mockProvider:  mockProvider{name: "go", languages: []string{"go"}, available: true},
+		drained:       make(chan string, 1),
+		invalidateErr: errors.New("injected marker write failure"),
+		laneEnabled:   func() bool { return false }, // lane mode off
+		hasWork:       func(string) bool { return false },
+	}
+	mgr, g, roots := backgroundLaneManager(t, p)
+	defer func() { require.NoError(t, mgr.Close()) }()
+
+	mgr.StartBackgroundLane(context.Background(), g, roots)
+
+	prevCooldown := laneMutationCooldown
+	laneMutationCooldown = 50 * time.Millisecond
+	defer func() { laneMutationCooldown = prevCooldown }()
+
+	mgr.RequeueBackgroundForRepo(g, "default", roots["default"], []string{"go"})
+	select {
+	case repo := <-p.drained:
+		t.Fatalf("fail-open forced a drain of %q with the lane mode disabled", repo)
+	case <-time.After(400 * time.Millisecond):
+	}
+}
+
 // Census admission is PER REPO, matching production foreground enrichment
 // (each indexer enriches its own root): languages, floor, and winners come
 // from each repo's own rows. Aggregating across roots would let two

@@ -119,6 +119,16 @@ type BackgroundEnricher interface {
 	InvalidateBackground(g graph.Store, repoPrefix string) error
 }
 
+// backgroundLaneGate is an optional refinement a BackgroundEnricher MAY
+// implement: whether the lane can run for this provider AT ALL (mode and
+// construction), independent of any completion marker. The fail-open
+// requeue consults it — a forced task bypasses the marker gates because
+// the marker is untrustworthy, but must never run in a mode where the
+// lane is disabled.
+type backgroundLaneGate interface {
+	BackgroundLaneEnabled() bool
+}
+
 // PreselectionDeadlineEnricher marks a ContextEnricher whose expensive work
 // begins before it can count a post-filter candidate frontier (for example a
 // SCIP provider must first run its external indexer). The Manager gives these
