@@ -446,6 +446,76 @@ func TestLSPProvider_EnrichBackground_MarkerUsesDrainStartSHA(t *testing.T) {
 		"the marker claims only the state the drain actually visited")
 }
 
+// A drain that saw ZERO symbols for its language proves nothing about the
+// tier: the store simply held no rows for the repo yet. The live-track
+// pass-end enqueue can fire while the repo's nodes still sit in the
+// indexer's shadow graph, invisible to the durable store the lane reads —
+// claiming completion there would permanently skip the real drain wherever
+// a fast marker already exists. No evidence => no marker, and the result
+// is partial so the scheduler retries after the rows land.
+func TestLSPProvider_EnrichBackground_NoRepoEvidenceIsNotClean(t *testing.T) {
+	t.Setenv(SweepEnv, "")
+	t.Setenv(HeavyRequestsEnv, "background")
+
+	ms := newMarkerStore(graph.New()) // zero nodes anywhere: the repo is not visible yet
+
+	server := newFakeLSPServer()
+	lane, cleanup := providerWithFakeServer(t, server, []string{"go"})
+	defer cleanup()
+	lane.heavyDelta = true
+
+	p := NewProvider("fake-lsp", nil, []string{"go"}, false, 2, nil)
+	p.laneProviderFactory = func() (*Provider, error) { return lane, nil }
+	require.NoError(t, ms.SetEnrichmentState(graph.EnrichmentState{
+		RepoPrefix: "", Provider: p.Name(), IndexedSHA: "sha-fast"}))
+
+	result, err := p.EnrichBackground(context.Background(), ms, "", t.TempDir())
+	require.NoError(t, err)
+	require.NotNil(t, result)
+
+	assert.True(t, result.Partial, "zero repo evidence must surface as partial so the scheduler retries")
+	_, found, _ := ms.GetEnrichmentState("", p.Name()+backgroundMarkerSuffix)
+	assert.False(t, found, "no marker may be recorded for a drain that saw no rows")
+	assert.True(t, p.HasBackgroundWork(ms, ""), "the repo must stay drainable")
+}
+
+// The inverse must keep working: a repo whose symbols are ALL heavy-stamped
+// drains to an empty frontier legitimately — zero requests, clean, marker
+// recorded. The no-evidence guard keys on symbols seen, not requests sent.
+func TestLSPProvider_EnrichBackground_AllStampedDrainStaysClean(t *testing.T) {
+	t.Setenv(SweepEnv, "")
+	t.Setenv(HeavyRequestsEnv, "background")
+
+	g := graph.New()
+	g.AddBatch([]*graph.Node{
+		{ID: "a", Language: "go", Kind: graph.KindFunction, Name: "A", FilePath: "a.go",
+			StartLine: 1, EndLine: 3, Meta: map[string]any{"semantic_type": "func()", "semantic_heavy": "1"}},
+		{ID: "b", Language: "go", Kind: graph.KindFunction, Name: "B", FilePath: "a.go",
+			StartLine: 5, EndLine: 7, Meta: map[string]any{"semantic_type": "func()", "semantic_heavy": "1"}},
+	}, nil)
+	ms := newMarkerStore(g)
+
+	server := newFakeLSPServer()
+	lane, cleanup := providerWithFakeServer(t, server, []string{"go"})
+	defer cleanup()
+	lane.heavyDelta = true
+
+	p := NewProvider("fake-lsp", nil, []string{"go"}, false, 2, nil)
+	p.laneProviderFactory = func() (*Provider, error) { return lane, nil }
+	require.NoError(t, ms.SetEnrichmentState(graph.EnrichmentState{
+		RepoPrefix: "", Provider: p.Name(), IndexedSHA: "sha-fast"}))
+
+	result, err := p.EnrichBackground(context.Background(), ms, "", t.TempDir())
+	require.NoError(t, err)
+	require.NotNil(t, result)
+
+	assert.False(t, result.Partial, "an all-stamped drain is complete, not partial")
+	laneMarker, found, err := ms.GetEnrichmentState("", p.Name()+backgroundMarkerSuffix)
+	require.NoError(t, err)
+	require.True(t, found, "an all-stamped drain records the lane marker")
+	assert.Equal(t, "sha-fast", laneMarker.IndexedSHA)
+}
+
 // A clean, uncancelled drain records the lane marker at the fast tier's
 // sha; a factory failure records nothing.
 func TestLSPProvider_EnrichBackground_Marker(t *testing.T) {
