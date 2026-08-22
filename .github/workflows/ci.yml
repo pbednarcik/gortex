@@ -102,12 +102,18 @@ jobs:
       - name: Test store path separator handling
         run: go test -timeout=5m -count=1 ./internal/graphpath
 
+      # The same asymmetry reaches the other direction too: a test that spells
+      # an expected path with '/' passes on POSIX whatever the code does, and
+      # only this runner can tell whether the value under test is a native
+      # filesystem path (filepath.Join / filepath.Clean) or a '/'-keyed store
+      # path. ParseDiffGitPaths, ParseDiffLinesNewSide and FeedbackDir all
+      # assert on native paths, so they belong here rather than nowhere.
       - name: Test native-separator store path comparisons
         run: >
           go test -timeout=10m -count=1
-          -run 'NativeSeparator|MixedSeparator|ImportAdjacency'
+          -run 'NativeSeparator|MixedSeparator|ImportAdjacency|ParseDiffGitPaths|ParseDiffLinesNewSide|FeedbackDir'
           ./internal/analysis ./internal/graph/store_sqlite
-          ./internal/mcp ./internal/resolver
+          ./internal/mcp ./internal/resolver ./internal/persistence
 
   build-linux-static:
     # The linux release ships a statically linked binary so it runs on any

@@ -55,10 +55,16 @@ func TestParseDiffHunksEqualsInternal(t *testing.T) {
 	}
 }
 
+// diffKey spells a repo-relative path the way parseDiffLines keys its map and
+// DiffHunk.FilePath is cleaned: filepath.Clean, so the key carries the running
+// platform's separators. Writing the '/' form directly reads fine on POSIX and
+// misses on Windows, where the map key is `pkg\foo.go`.
+func diffKey(p string) string { return filepath.Clean(p) }
+
 func TestParseDiffLinesNewSide(t *testing.T) {
 	lines := parseDiffLines(sampleDiff)
 
-	foo := lines["pkg/foo.go"]
+	foo := lines[diffKey("pkg/foo.go")]
 	if len(foo) == 0 {
 		t.Fatalf("expected new-side lines for pkg/foo.go")
 	}
@@ -86,7 +92,7 @@ func TestParseDiffLinesNewSide(t *testing.T) {
 	}
 
 	// New-file lines all carry "+", numbered 1..3.
-	baz := lines["pkg/baz.go"]
+	baz := lines[diffKey("pkg/baz.go")]
 	if len(baz) != 3 {
 		t.Fatalf("expected 3 new-side lines for pkg/baz.go, got %d (%#v)", len(baz), baz)
 	}
@@ -682,8 +688,14 @@ func TestParseDiffGitPaths(t *testing.T) {
 		{`diff --git "a/od\td.go" "b/od\td.go"`, ""},
 		{"diff --git nonsense", ""},
 	} {
-		if got := parseDiffGitPaths(tc.line); got != tc.want {
-			t.Fatalf("parseDiffGitPaths(%q) = %q, want %q", tc.line, got, tc.want)
+		// The recovered path is cleaned, so it carries native separators;
+		// the '/' spelling above is the diff's, not the result's.
+		want := tc.want
+		if want != "" {
+			want = filepath.Clean(want)
+		}
+		if got := parseDiffGitPaths(tc.line); got != want {
+			t.Fatalf("parseDiffGitPaths(%q) = %q, want %q", tc.line, got, want)
 		}
 	}
 }
