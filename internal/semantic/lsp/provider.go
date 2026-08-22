@@ -100,6 +100,11 @@ type Provider struct {
 	pendingClient *Client
 	closeGen      uint64
 
+	// callTimeoutFn, when set, resolves this instance's post-initialize
+	// Call bound instead of the global lspCallTimeout — the lane drain
+	// runs under a larger budget (see resolveLaneCallTimeout).
+	callTimeoutFn func() time.Duration
+
 	// sourceCache holds file contents read by openDocument so the
 	// per-symbol column-resolution lookups don't reread the file for
 	// every hover / references / implementation query. Keyed by
@@ -412,6 +417,16 @@ func (p *Provider) publishClient(c *Client, gen uint64) bool {
 	return true
 }
 
+// effectiveCallTimeout resolves this instance's post-initialize Call
+// bound: the instance override when present (the lane's larger budget),
+// the global resolution otherwise.
+func (p *Provider) effectiveCallTimeout() time.Duration {
+	if p.callTimeoutFn != nil {
+		return p.callTimeoutFn()
+	}
+	return lspCallTimeout()
+}
+
 // releasePendingClient disowns a pending client whose initialization
 // failed — the caller shuts it down itself and returns the real error.
 func (p *Provider) releasePendingClient(c *Client) {
@@ -601,6 +616,27 @@ func markNodeHeavyStamped(n *graph.Node) {
 		n.Meta = map[string]any{}
 	}
 	n.Meta["semantic_heavy"] = "1"
+}
+
+// terminalUnconfirmable identifies confirm targets no finite references
+// budget can adjudicate: C# object-override members (ToString /
+// GetHashCode / Equals). textDocument/references on a System.Object
+// override degenerates into a solution-wide implicit-call search —
+// measured on a 118k-node solution, every other high-fan-in target
+// converts at the lane's 3-minute budget while these still time out.
+// They are identifiable up front, so a heavyDelta drain never asks:
+// their edges stay at the static tier, no drain error is recorded, and
+// the completion marker may land over them — a retry would never
+// converge, only re-pay the timeout.
+func terminalUnconfirmable(n *graph.Node) bool {
+	if n == nil || n.Kind != graph.KindMethod || n.Language != "csharp" {
+		return false
+	}
+	switch n.Name {
+	case "ToString", "GetHashCode", "Equals":
+		return true
+	}
+	return false
 }
 
 // tierStamped reports whether THIS pass's tier already covered the node:
@@ -1326,6 +1362,10 @@ func (p *Provider) EnrichRepoContext(ctx context.Context, g graph.Store, repoPre
 	// same document.
 	var confirmMu sync.Mutex
 	confirmPromotions := make(map[*graph.Edge]struct{})
+	// Confirm targets skipped by the terminal-unconfirmable policy (see
+	// terminalUnconfirmable) — surfaced on the completion log so a drain
+	// that leaves edges at the static tier says so.
+	var diagTerminalSkipped atomic.Int64
 	var fallback []enrichTarget
 	if p.noHeavyRequests {
 		// This server leaks per references request (ServerSpec.NoHeavyRequests)
@@ -1400,6 +1440,14 @@ func (p *Provider) EnrichRepoContext(ctx context.Context, g graph.Store, repoPre
 					}
 					toNode := view.nodesByID[t.edge.To]
 					if toNode == nil {
+						continue
+					}
+					// Policy skip, not an error: a terminal-unconfirmable
+					// target would only re-pay a guaranteed timeout. Its
+					// edges keep their static confidence and the drain
+					// stays clean.
+					if p.heavyDelta && terminalUnconfirmable(toNode) {
+						diagTerminalSkipped.Add(1)
 						continue
 					}
 					line, ok := lspLine(toNode)
@@ -2225,6 +2273,7 @@ func (p *Provider) EnrichRepoContext(ctx context.Context, g graph.Store, repoPre
 		zap.String("first_node_file", diagFirstNodeFile),
 		zap.Bool("targeted_breaker_tripped", targetedBreaker.isTripped()),
 		zap.Bool("hover_breaker_tripped", hoverBreaker.isTripped()),
+		zap.Int64("drain_skipped_terminal", diagTerminalSkipped.Load()),
 		zap.Int64("drain_errored", drainErrs.total()),
 		zap.Int64("drain_errored_confirm_acquire", drainErrs.confirmAcquire.Load()),
 		zap.Int64("drain_errored_references", drainErrs.references.Load()),
@@ -2416,6 +2465,35 @@ func (p *Provider) dialOrSpawn(workspaceRoot string) (*Client, error) {
 		// server never starves foreground work (see background.go).
 		LowPriority: p.heavyDelta,
 	}, p.logger)
+}
+
+// laneCallTimeoutEnv / laneCallTimeoutDefault bound a single lane-drain
+// request. The lane has nobody waiting, and the measured whale tail —
+// solution-wide references on the highest-fan-in members — converts at a
+// 3-minute budget where the 30s foreground default times out (+127 edges
+// on the most-queried symbols of a 118k-node solution in the A/B run).
+// Resolution order: the lane env, then the global GORTEX_LSP_CALL_TIMEOUT
+// (an explicit operator bound applies to the lane too), then the lane
+// default. Same syntax as the global env ("0"/"off"/"none" disables).
+const laneCallTimeoutEnv = "GORTEX_LSP_LANE_CALL_TIMEOUT"
+
+const laneCallTimeoutDefault = 3 * time.Minute
+
+func resolveLaneCallTimeout() time.Duration {
+	switch v := strings.TrimSpace(os.Getenv(laneCallTimeoutEnv)); v {
+	case "":
+		if strings.TrimSpace(os.Getenv("GORTEX_LSP_CALL_TIMEOUT")) != "" {
+			return lspCallTimeout()
+		}
+		return laneCallTimeoutDefault
+	case "0", "off", "none":
+		return 0
+	default:
+		if d, err := time.ParseDuration(v); err == nil {
+			return d
+		}
+		return laneCallTimeoutDefault
+	}
 }
 
 // defaultLSPCallTimeout bounds a single post-initialize LSP request.
@@ -2840,8 +2918,9 @@ func (p *Provider) ensureClient(workspaceRoot string) error {
 
 	// The (possibly slow) cold-workspace load is done — bound every
 	// subsequent request so a server that wedges mid-session can no
-	// longer block an enrichment Call forever. See lspCallTimeout.
-	client.SetCallTimeout(lspCallTimeout())
+	// longer block an enrichment Call forever. See lspCallTimeout and,
+	// for lane instances, resolveLaneCallTimeout.
+	client.SetCallTimeout(p.effectiveCallTimeout())
 
 	if !p.publishClient(client, spawnGen) {
 		// A Close ran while this goroutine initialized: the provider's

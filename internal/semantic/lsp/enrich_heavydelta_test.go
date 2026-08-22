@@ -190,6 +190,74 @@ func TestLSP_Enrich_HeavyDelta_RequestClasses(t *testing.T) {
 // One drain stamps its frontier; a second heavyDelta pass over the same
 // graph finds nothing to do — the drain is idempotent and the stamps are
 // the resume ledger.
+// C# object-override members (ToString / GetHashCode / Equals) are
+// terminal-unconfirmable: references on a System.Object override
+// degenerates into a solution-wide implicit-call search that no finite
+// budget converts — measured, every other whale converts at the lane's
+// 3-minute budget while these still time out at 3 minutes. They are
+// identifiable up front, so a heavyDelta drain must never ask: their
+// edges stay at the static tier, no drain error is recorded, and the
+// completion marker may land over them (a retry would never converge).
+func TestLSP_Enrich_HeavyDelta_SkipsTerminalUnconfirmableTargets(t *testing.T) {
+	t.Setenv(SweepEnv, "")
+	t.Setenv(HeavyRequestsEnv, "background")
+
+	repoRoot := t.TempDir()
+	require.NoError(t, os.WriteFile(filepath.Join(repoRoot, "svc.cs"), []byte(
+		"class C {\n"+
+			"    public override string ToString() { return \"\"; }\n"+
+			"    public void Target() { }\n"+
+			"    public void Caller() { this.Target(); }\n"+
+			"}\n"), 0o644))
+
+	g := graph.New()
+	g.AddNode(&graph.Node{ID: "svc.cs::C.ToString", Kind: graph.KindMethod, Name: "ToString",
+		FilePath: "svc.cs", StartLine: 2, EndLine: 2, Language: "csharp"})
+	g.AddNode(&graph.Node{ID: "svc.cs::C.Target", Kind: graph.KindMethod, Name: "Target",
+		FilePath: "svc.cs", StartLine: 3, EndLine: 3, Language: "csharp"})
+	g.AddNode(&graph.Node{ID: "svc.cs::C.Caller", Kind: graph.KindMethod, Name: "Caller",
+		FilePath: "svc.cs", StartLine: 4, EndLine: 4, Language: "csharp"})
+	g.AddEdge(&graph.Edge{From: "svc.cs::C.Caller", To: "svc.cs::C.ToString", Kind: graph.EdgeCalls,
+		FilePath: "svc.cs", Line: 4, Confidence: 0.7, ConfidenceLabel: "INFERRED", Origin: graph.OriginTextMatched})
+	g.AddEdge(&graph.Edge{From: "svc.cs::C.Caller", To: "svc.cs::C.Target", Kind: graph.EdgeCalls,
+		FilePath: "svc.cs", Line: 4, Confidence: 0.7, ConfidenceLabel: "INFERRED", Origin: graph.OriginTextMatched})
+
+	server := newFakeLSPServer()
+	var refCalls atomic.Int64
+	server.handle("textDocument/references", func(json.RawMessage) (any, *jsonRPCError) {
+		refCalls.Add(1)
+		return []Location{{
+			URI:   pathToURI(filepath.Join(repoRoot, "svc.cs")),
+			Range: Range{Start: Position{Line: 3, Character: 26}, End: Position{Line: 3, Character: 32}},
+		}}, nil
+	})
+	server.handle("textDocument/prepareCallHierarchy", func(json.RawMessage) (any, *jsonRPCError) {
+		return []CallHierarchyItem{}, nil
+	})
+	server.handle("callHierarchy/incomingCalls", func(json.RawMessage) (any, *jsonRPCError) {
+		return []CallHierarchyIncomingCall{}, nil
+	})
+
+	p, cleanup := providerWithFakeServer(t, server, []string{"csharp"})
+	defer cleanup()
+	p.heavyDelta = true
+	p.noHeavyRequests = false
+	p.caps = ServerCapabilities{
+		ReferencesProvider:    true,
+		CallHierarchyProvider: true,
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	result, err := p.EnrichRepoContext(ctx, g, "", repoRoot, nil)
+	require.NoError(t, err)
+	require.NotNil(t, result)
+
+	assert.EqualValues(t, 1, refCalls.Load(),
+		"only the ordinary target may be asked; the object override is terminal-unconfirmable")
+	assert.False(t, result.Partial, "a policy skip is not an error — the drain stays clean")
+}
+
 func TestLSP_Enrich_HeavyDelta_StampsAndSecondPassIdle(t *testing.T) {
 	t.Setenv(SweepEnv, "")
 	t.Setenv(HeavyRequestsEnv, "")
