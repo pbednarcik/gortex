@@ -97,6 +97,38 @@ func clangdLikeSpec() *ServerSpec {
 	}
 }
 
+// The degraded return finalises the result BEFORE the sweep machinery, so
+// it must apply the same pass-level honesty the normal completion applies:
+// a heavyDelta drain whose confirm pass hit error-shaped skips may not
+// report clean — the lane would record its completion marker over targets
+// that were never adjudicated, and no retry would ever revisit them.
+func TestLSP_Enrich_DegradedHeavyDeltaKeepsErrorHonesty(t *testing.T) {
+	t.Setenv(HeavyRequestsEnv, "background")
+	repoRoot, g := degradedFixture(t)
+	// No compile_commands.json — the degraded gate must trip.
+
+	server := newInstrumentedServer()
+	server.handle("textDocument/references", func(json.RawMessage) (any, *jsonRPCError) {
+		return nil, &jsonRPCError{Code: -32603, Message: "references worker crashed"}
+	})
+
+	p, cleanup := providerWithInstrumentedServer(t, server, []string{"c", "cpp"}, 2)
+	defer cleanup()
+	p.spec = clangdLikeSpec()
+	p.heavyDelta = true
+	p.noHeavyRequests = false
+
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	result, err := p.EnrichRepoContext(ctx, g, "", repoRoot, nil)
+	require.NoError(t, err)
+	require.NotNil(t, result)
+
+	require.True(t, result.Degraded, "fixture sanity: the degraded gate must trip")
+	assert.True(t, result.Partial,
+		"a degraded heavyDelta pass with drain errors must be partial, not clean")
+}
+
 // TestLSP_Enrich_DegradesWithoutCompileDB pins the degraded path: with a
 // NeedsCompileDB server and no database, only the reference-confirm pass runs —
 // the hover / hierarchy sweep and interface pass are skipped, header referents

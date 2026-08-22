@@ -1541,6 +1541,20 @@ func (p *Provider) EnrichRepoContext(ctx context.Context, g graph.Store, repoPre
 			result.Partial = true
 			result.AbortReason = ctx.Err().Error()
 		}
+		// The same pass-level honesty the normal completion applies below:
+		// the confirm pass ran and can have tripped its breaker or fed the
+		// drain-error ledger — returning clean here would let the lane
+		// record its completion marker over never-adjudicated targets.
+		result.BreakerTripped = targetedBreaker.isTripped()
+		if p.heavyDelta && drainErrs.total() > 0 {
+			result.Partial = true
+			if p.logger != nil {
+				p.logger.Warn("LSP enrich: drain errors sampled",
+					zap.String("repo", repoPrefix),
+					zap.Int64("total", drainErrs.total()),
+					zap.Strings("samples", drainErrs.sampleList()))
+			}
+		}
 		if p.logger != nil {
 			didOpens, reopenedFiles, docEvictions, peakOpenDocs := session.stats()
 			p.logger.Info("LSP enrich: degraded pass complete (reference confirmation only)",
@@ -1555,6 +1569,8 @@ func (p *Provider) EnrichRepoContext(ctx context.Context, g graph.Store, repoPre
 				zap.Int("peak_open_docs", peakOpenDocs),
 				zap.Int64("req_references", p.reqStats.references.Load()),
 				zap.Int64("req_definitions", p.reqStats.definitions.Load()),
+				zap.Bool("targeted_breaker_tripped", targetedBreaker.isTripped()),
+				zap.Int64("drain_errored", drainErrs.total()),
 			)
 		}
 		return result, nil
@@ -1568,7 +1584,7 @@ func (p *Provider) EnrichRepoContext(ctx context.Context, g graph.Store, repoPre
 	// a deadline cut sheds hover work, not the recall-bearing add.
 	if !p.noHeavyRequests &&
 		p.Supports("textDocument/references") && !p.Supports("textDocument/prepareCallHierarchy") {
-		p.referencesAddPass(targetedCtx, g, view, repoPrefix, absRoot, langNodes, rmu, session, result)
+		p.referencesAddPass(targetedCtx, g, view, repoPrefix, absRoot, langNodes, rmu, session, result, drainErrs)
 	}
 	refsAddDone := time.Now()
 
