@@ -52,6 +52,17 @@ func (p *Provider) HasBackgroundWork(g graph.Store, repoPrefix string) bool {
 	return !p.backgroundMarkerCurrent(g, repoPrefix)
 }
 
+// BackgroundLaneEnabled reports whether the lane can run for this
+// provider at all — the mode is background and a drain instance can be
+// built. Marker state is deliberately excluded: the fail-open requeue
+// asks exactly when the markers are untrustworthy.
+func (p *Provider) BackgroundLaneEnabled() bool {
+	if !resolveBackgroundHeavy(p.spec) {
+		return false
+	}
+	return p.spec != nil || p.laneProviderFactory != nil
+}
+
 // backgroundLaneReadinessBudget bounds the lane's wait for a
 // ReadinessProber server (the Roslyn / MSBuild solution load) before the
 // drain begins. Mirrors the manager's foreground gate: a still-loading
@@ -94,7 +105,11 @@ func (p *Provider) EnrichBackground(ctx context.Context, g graph.Store, repoPref
 	if err != nil {
 		return nil, err
 	}
-	defer func() { _ = lane.Close() }()
+	// Seal, not Close: the lane instance is single-use, and sealing also
+	// refuses any client a still-wedged prober or reconnect leg builds
+	// AFTER this teardown — without it that late server would publish
+	// into a provider nobody will ever Close again.
+	defer lane.sealClients()
 
 	if backgroundLaneReadinessBudget > 0 {
 		rctx, rcancel := context.WithTimeout(ctx, backgroundLaneReadinessBudget)
@@ -106,13 +121,16 @@ func (p *Provider) EnrichBackground(ctx context.Context, g graph.Store, repoPref
 		case err = <-readyErr:
 		case <-rctx.Done():
 			// The prober can be wedged in a leg that takes no context —
-			// WaitReady's spawn, initialize, or package-restore. Closing
+			// WaitReady's spawn, initialize, or package-restore. Sealing
 			// the lane unblocks a stuck LSP Call (the client's done
-			// channel) and reaps the server; a prober even that cannot
-			// free is abandoned after the grace — the drain, and the
-			// cancelRepo waiter behind it, must return rather than block
-			// a repository mutation.
-			_ = lane.Close()
+			// channel), reaps the server, and refuses any client the
+			// prober builds later (a leg wedged BEFORE its spawn — a
+			// package restore — would otherwise hand its eventual server
+			// to a provider nothing will ever Close). A prober even that
+			// cannot free is abandoned after the grace — the drain, and
+			// the cancelRepo waiter behind it, must return rather than
+			// block a repository mutation.
+			lane.sealClients()
 			select {
 			case err = <-readyErr:
 			case <-time.After(laneReadinessTeardownGrace):
@@ -144,7 +162,7 @@ func (p *Provider) EnrichBackground(ctx context.Context, g graph.Store, repoPref
 	// behind it — unboundedly. Closing the lane on ctx death unblocks any
 	// in-flight Call through the client's done channel and reaps the
 	// server; the drain then surfaces the failure and stays undrained.
-	stopWatchdog := context.AfterFunc(ctx, func() { _ = lane.Close() })
+	stopWatchdog := context.AfterFunc(ctx, func() { lane.sealClients() })
 	defer stopWatchdog()
 
 	result, err := lane.EnrichRepoContext(ctx, g, repoPrefix, repoRoot, nil)
