@@ -107,9 +107,16 @@ type backgroundScheduler struct {
 	// external enqueue of the key (a mutation requeue or pass-end trigger
 	// is fresh signal; its drain starts from the base backoff again).
 	failStreaks map[string]int
-	started     bool
-	closed      bool
-	wake        chan struct{} // buffered(1) nudge: new work, a released hold, or shutdown
+	// rootResolver, when set, is the live repository registry: it answers
+	// (current root, tracked) for a repo name immediately before a drain.
+	// A task whose stored root disagrees is dropped — the census can
+	// enqueue for a repo a concurrent untrack removed (purge only clears
+	// tasks that already exist), and a purged repo's missing markers read
+	// as "undrained", so no marker check can catch it.
+	rootResolver func(repoName string) (root string, tracked bool)
+	started      bool
+	closed       bool
+	wake         chan struct{} // buffered(1) nudge: new work, a released hold, or shutdown
 
 	// lane progress, surfaced through status() into the daemon health
 	// snapshot. Guarded by mu. Failure telemetry covers errored and
@@ -205,6 +212,14 @@ func (s *backgroundScheduler) hold(repoName string) (release func()) {
 	}
 }
 
+// setRootResolver installs the live repository registry consulted at the
+// dequeue gate. Safe to call before or after start.
+func (s *backgroundScheduler) setRootResolver(fn func(repoName string) (string, bool)) {
+	s.mu.Lock()
+	s.rootResolver = fn
+	s.mu.Unlock()
+}
+
 // enqueue adds a task unless an identical (repo, provider) task is already
 // pending (that task will see the new state when it runs). A task whose key
 // is IN FLIGHT is accepted into the requeue slot instead: the running drain
@@ -248,6 +263,12 @@ func (s *backgroundScheduler) enqueue(t backgroundTask) bool {
 			if t.force {
 				s.pending[i].force = true
 			}
+			// The key is (repo, provider) — root is not part of it. Adopt
+			// the newest trigger's root so a re-tracked prefix drains its
+			// NEW checkout, matching what the in-flight requeue slot (which
+			// replaces the whole task) already does.
+			s.pending[i].repoRoot = t.repoRoot
+			s.pending[i].lang = t.lang
 		}
 		if pulled {
 			select {
@@ -537,6 +558,27 @@ func (s *backgroundScheduler) drain(ctx context.Context, g graph.Store, t backgr
 		s.logger.Debug("background lane: provider does not opt in; dropping task",
 			zap.String("provider", t.provider.Name()), zap.String("repo", t.repoName))
 		return
+	}
+	// Live-registry check immediately before draining: a stale task (repo
+	// untracked mid-census, or its prefix re-rooted to a different
+	// checkout) must not spawn a server at an abandoned root and write
+	// into the purged namespace. The marker gate below cannot catch this —
+	// a purge deletes the markers, which reads as "undrained".
+	s.mu.Lock()
+	resolve := s.rootResolver
+	s.mu.Unlock()
+	if resolve != nil {
+		root, tracked := resolve(t.repoName)
+		if !tracked || root != t.repoRoot {
+			s.logger.Info("background lane: dropping stale task; repository untracked or re-rooted",
+				zap.String("provider", t.provider.Name()),
+				zap.String("repo", t.repoName),
+				zap.String("task_root", t.repoRoot),
+				zap.String("live_root", root),
+				zap.Bool("tracked", tracked),
+			)
+			return
+		}
 	}
 	// Re-check at dequeue: the tier may have drained (or the mode changed)
 	// while the task sat in the queue. A forced task skips the check — its

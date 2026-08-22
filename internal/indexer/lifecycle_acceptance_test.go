@@ -280,6 +280,56 @@ func TestLifecycleTrackParksBackgroundDrainUntilRowsVisible(t *testing.T) {
 	}
 }
 
+// The scheduler's live-root check is only as good as its wiring into the
+// registry: after an untrack, a straggling requeue for the removed repo
+// (the census race — UntrackRepo purges only tasks that already exist)
+// must not drain. A purged repo's markers are gone, so the marker gate
+// reads "undrained" and lets it through; only the registry says no.
+func TestLifecycleStaleRequeueAfterUntrackDoesNotDrain(t *testing.T) {
+	t.Setenv("GORTEX_ENRICH_MIN_NODES", "0")
+	repo := setupRepoDir(t, "repo")
+	mi := newLifecycleTestMultiIndexer(t)
+	t.Cleanup(func() { closeLifecycleTestMultiIndexer(t, mi) })
+
+	_, err := mi.TrackRepo(config.RepoEntry{Path: repo, Name: "repo"})
+	require.NoError(t, err)
+
+	drained := make(chan struct{}, 4)
+	bg := &laneTrackProbeProvider{probe: func(graph.Store) { drained <- struct{}{} }}
+	mgr := semantic.NewManager(semantic.Config{Enabled: true}, zap.NewNop())
+	mgr.RegisterProvider(bg)
+	t.Cleanup(func() { require.NoError(t, mgr.Close()) })
+	mi.SetSemanticManager(mgr)
+
+	mgr.StartBackgroundLane(context.Background(), mi.Graph(), map[string]string{"repo": repo})
+	select {
+	case <-drained: // the census drain for the still-tracked repo
+	case <-time.After(2 * time.Second):
+		t.Fatal("census did not start the drain")
+	}
+
+	_, _ = mi.UntrackRepo("repo")
+
+	// A second lane fed the pre-untrack roots snapshot models the census
+	// race: warmup snapshots AllMetadata, the untrack lands mid-census, and
+	// the stale enqueue arrives after the purge (census enqueues carry no
+	// cooldown). The registry resolver is the only gate left standing —
+	// the purge deleted the markers, so HasBackgroundWork reads undrained.
+	drained2 := make(chan struct{}, 4)
+	bg2 := &laneTrackProbeProvider{probe: func(graph.Store) { drained2 <- struct{}{} }}
+	mgr2 := semantic.NewManager(semantic.Config{Enabled: true}, zap.NewNop())
+	mgr2.RegisterProvider(bg2)
+	t.Cleanup(func() { require.NoError(t, mgr2.Close()) })
+	mi.SetSemanticManager(mgr2)
+
+	mgr2.StartBackgroundLane(context.Background(), mi.Graph(), map[string]string{"repo": repo})
+	select {
+	case <-drained2:
+		t.Fatal("a stale census enqueue drained the untracked repo at its abandoned root")
+	case <-time.After(500 * time.Millisecond):
+	}
+}
+
 // laneBracketProvider records the mutation-vs-lane ordering signals as a
 // single event log: drain start, drain cancellation (with whether the
 // mutated file's pre-mutation rows were still in the graph at that moment),

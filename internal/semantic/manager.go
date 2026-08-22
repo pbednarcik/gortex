@@ -206,6 +206,17 @@ func (m *Manager) HoldBackgroundMutations(repoName string) func() {
 	return m.background.hold(repoName)
 }
 
+// SetBackgroundRepoRootResolver installs the live repository registry the
+// background lane consults immediately before draining a task: fn answers
+// (current root, tracked) for a repo name. A task whose stored root
+// disagrees — the repo was untracked mid-census, or its prefix re-tracked
+// at a different checkout — is dropped instead of spawning a server at an
+// abandoned root. fn must not block: it is called on the lane worker with
+// no scheduler locks held, but a drain waits on it.
+func (m *Manager) SetBackgroundRepoRootResolver(fn func(repoName string) (string, bool)) {
+	m.background.setRootResolver(fn)
+}
+
 // laneMutationCooldown is the quiet period a mutation-requeued drain waits
 // before becoming eligible; every further mutation of the repo slides the
 // window. Without it an editing session would start (and cancel) a drain —

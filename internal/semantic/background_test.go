@@ -35,6 +35,8 @@ type mockBackgroundProvider struct {
 	// invalidateErr, when set, is returned by InvalidateBackground — the
 	// stale-marker world where the blanking write failed.
 	invalidateErr error
+	// roots, when non-nil, receives the repoRoot each drain was handed.
+	roots chan string
 }
 
 func (m *mockBackgroundProvider) InvalidateBackground(_ graph.Store, repo string) error {
@@ -49,9 +51,12 @@ func (m *mockBackgroundProvider) HasBackgroundWork(_ graph.Store, repo string) b
 	return m.hasWork(repo)
 }
 
-func (m *mockBackgroundProvider) EnrichBackground(ctx context.Context, _ graph.Store, repo, _ string) (*EnrichResult, error) {
+func (m *mockBackgroundProvider) EnrichBackground(ctx context.Context, _ graph.Store, repo, root string) (*EnrichResult, error) {
 	if m.panicOnDrain {
 		panic("drain exploded")
+	}
+	if m.roots != nil {
+		m.roots <- root
 	}
 	if m.drained != nil {
 		m.drained <- repo
@@ -73,6 +78,97 @@ func (m *mockBackgroundProvider) EnrichBackground(ctx context.Context, _ graph.S
 		return nil, m.drainErr
 	}
 	return &EnrichResult{Provider: m.name, Language: "go", EdgesConfirmed: 1, Partial: m.partial}, nil
+}
+
+// The pending-dedup branch must adopt the newer trigger's repoRoot: the
+// task key is (repo, provider) — root is not part of it — so replacing a
+// prefix (untrack, then re-track a different checkout under the same name)
+// re-enqueues with a new root that the parked task otherwise silently
+// discards, draining the OLD checkout into the NEW namespace. The
+// in-flight requeue slot already adopts the whole newer task; the pending
+// branch must match.
+func TestBackgroundScheduler_PendingDedupAdoptsNewerRoot(t *testing.T) {
+	p := &mockBackgroundProvider{
+		mockProvider: mockProvider{name: "mock-bg", languages: []string{"go"}, available: true},
+		drained:      make(chan string, 2),
+		roots:        make(chan string, 2),
+	}
+	s := newBackgroundScheduler(zap.NewNop())
+	defer s.close()
+	s.start(context.Background(), graph.New())
+
+	release := s.hold("repo") // park the first task so the second dedups against it
+	require.True(t, s.enqueue(backgroundTask{repoName: "repo", repoRoot: "/old/checkout", provider: p, lang: "go"}))
+	require.False(t, s.enqueue(backgroundTask{repoName: "repo", repoRoot: "/new/checkout", provider: p, lang: "go"}))
+	release()
+
+	select {
+	case root := <-p.roots:
+		assert.Equal(t, "/new/checkout", root, "the drain must run at the newest trigger's root")
+	case <-time.After(2 * time.Second):
+		t.Fatal("drain did not run")
+	}
+}
+
+// A task whose stored root no longer matches the live registry must be
+// dropped at dequeue: the once-per-warmup census can enqueue for a repo a
+// concurrent untrack is removing (UntrackRepo purges only tasks that
+// already exist), and a PURGED repo passes the HasBackgroundWork gate —
+// its markers were deleted with the purge, which reads as "undrained".
+// The registry resolver is the live authority on both existence and root.
+func TestBackgroundScheduler_RootResolverGatesDequeue(t *testing.T) {
+	newProvider := func() *mockBackgroundProvider {
+		return &mockBackgroundProvider{
+			mockProvider: mockProvider{name: "mock-bg", languages: []string{"go"}, available: true},
+			drained:      make(chan string, 2),
+		}
+	}
+
+	t.Run("untracked repo is dropped", func(t *testing.T) {
+		p := newProvider()
+		s := newBackgroundScheduler(zap.NewNop())
+		defer s.close()
+		s.setRootResolver(func(string) (string, bool) { return "", false })
+		s.start(context.Background(), graph.New())
+
+		require.True(t, s.enqueue(backgroundTask{repoName: "gone", repoRoot: "/old", provider: p, lang: "go"}))
+		select {
+		case repo := <-p.drained:
+			t.Fatalf("drained %q at an abandoned root", repo)
+		case <-time.After(150 * time.Millisecond):
+		}
+	})
+
+	t.Run("re-rooted prefix is dropped", func(t *testing.T) {
+		p := newProvider()
+		s := newBackgroundScheduler(zap.NewNop())
+		defer s.close()
+		s.setRootResolver(func(string) (string, bool) { return "/new/checkout", true })
+		s.start(context.Background(), graph.New())
+
+		require.True(t, s.enqueue(backgroundTask{repoName: "repo", repoRoot: "/old/checkout", provider: p, lang: "go"}))
+		select {
+		case repo := <-p.drained:
+			t.Fatalf("drained %q with a stale root", repo)
+		case <-time.After(150 * time.Millisecond):
+		}
+	})
+
+	t.Run("matching root drains", func(t *testing.T) {
+		p := newProvider()
+		s := newBackgroundScheduler(zap.NewNop())
+		defer s.close()
+		s.setRootResolver(func(string) (string, bool) { return "/live/checkout", true })
+		s.start(context.Background(), graph.New())
+
+		require.True(t, s.enqueue(backgroundTask{repoName: "repo", repoRoot: "/live/checkout", provider: p, lang: "go"}))
+		select {
+		case repo := <-p.drained:
+			assert.Equal(t, "repo", repo)
+		case <-time.After(2 * time.Second):
+			t.Fatal("a live-rooted task must drain")
+		}
+	})
 }
 
 // A mutation hold parks a repo's tasks at the dequeue gate: enqueues (the

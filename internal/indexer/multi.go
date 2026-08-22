@@ -425,6 +425,24 @@ func (mi *MultiIndexer) SetSemanticManager(m *semantic.Manager) {
 	for _, idx := range live {
 		idx.SetSemanticManager(m)
 	}
+	if m != nil {
+		// The background lane validates every task against the live
+		// registry immediately before draining: an untrack can land inside
+		// the warmup census (its purge only clears tasks that already
+		// exist), and a re-tracked prefix can point at a different
+		// checkout. Called without mi.mu held on the scheduler side; the
+		// read here is a brief RLock, and no mutation path waits on drains
+		// while holding mi.mu.
+		m.SetBackgroundRepoRootResolver(func(repoName string) (string, bool) {
+			mi.mu.RLock()
+			defer mi.mu.RUnlock()
+			meta, ok := mi.repos[repoName]
+			if !ok || meta == nil {
+				return "", false
+			}
+			return meta.RootPath, true
+		})
+	}
 }
 
 // SetResolverLSPHelper installs the resolve-time LSP helper used by
