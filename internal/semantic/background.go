@@ -47,6 +47,17 @@ var (
 	backgroundRetryCap  = 30 * time.Minute
 )
 
+// backgroundRetryMaxZeroProgress bounds CONSECUTIVE retries that made no
+// progress at all — no edge yield and no frontier shrinkage. A server with
+// a persistent per-target error otherwise re-runs an identical drain every
+// backoff interval for the daemon's lifetime; after this many stuck
+// attempts the task is abandoned until the next external trigger (mutation
+// requeue, restart census, pass-end enqueue), which grants a fresh
+// allowance. A converging drain never hits this: its per-node stamps
+// shrink the next attempt's frontier, which counts as progress. Var for
+// tests.
+var backgroundRetryMaxZeroProgress = 5
+
 // backgroundRetryDelay maps a consecutive-failure streak (1-based) to the
 // wait before the next attempt: base doubling per failure, capped — long
 // enough that a persistently failing drain becomes a slow heartbeat instead
@@ -107,6 +118,13 @@ type backgroundScheduler struct {
 	// external enqueue of the key (a mutation requeue or pass-end trigger
 	// is fresh signal; its drain starts from the base backoff again).
 	failStreaks map[string]int
+	// zeroProgress counts consecutive retries with no edge yield AND no
+	// frontier shrinkage; crossing backgroundRetryMaxZeroProgress abandons
+	// the task until the next external trigger. lastFrontier remembers the
+	// previous attempt's candidate-frontier size per key so shrinkage —
+	// per-node stamps landing — is visible even at zero yield.
+	zeroProgress map[string]int
+	lastFrontier map[string]int
 	// rootResolver, when set, is the live repository registry: it answers
 	// (current root, tracked) for a repo name immediately before a drain.
 	// A task whose stored root disagrees is dropped — the census can
@@ -125,14 +143,16 @@ type backgroundScheduler struct {
 	// retries counts backoff re-enqueues of errored/partial drains — a
 	// climbing retries with a standing lastFailure is the "server keeps
 	// refusing this repo" signature on the health surface.
-	inFlightRepo   string
-	lastRepo       string
-	lastDurationMs int64
-	drained        int
-	failed         int
-	retries        int
-	lastFailedRepo string
-	lastFailure    string
+	inFlightRepo      string
+	lastRepo          string
+	lastDurationMs    int64
+	drained           int
+	failed            int
+	retries           int
+	abandoned         int
+	lastAbandonedRepo string
+	lastFailedRepo    string
+	lastFailure       string
 
 	cancel context.CancelFunc
 	done   chan struct{} // worker exit
@@ -149,8 +169,13 @@ type BackgroundLaneStatus struct {
 	Drained        int    `json:"drained"`
 	Failed         int    `json:"failed,omitempty"`
 	Retries        int    `json:"retries,omitempty"`
-	LastFailedRepo string `json:"last_failed_repo,omitempty"`
-	LastFailure    string `json:"last_failure,omitempty"`
+	// Abandoned counts tasks parked after backgroundRetryMaxZeroProgress
+	// consecutive zero-progress retries — the "server keeps refusing an
+	// identical drain" signature. They revive on the next external trigger.
+	Abandoned         int    `json:"abandoned,omitempty"`
+	LastAbandonedRepo string `json:"last_abandoned_repo,omitempty"`
+	LastFailedRepo    string `json:"last_failed_repo,omitempty"`
+	LastFailure       string `json:"last_failure,omitempty"`
 }
 
 func (s *backgroundScheduler) status() BackgroundLaneStatus {
@@ -162,11 +187,13 @@ func (s *backgroundScheduler) status() BackgroundLaneStatus {
 		InFlightRepo:   s.inFlightRepo,
 		LastRepo:       s.lastRepo,
 		LastDurationMs: s.lastDurationMs,
-		Drained:        s.drained,
-		Failed:         s.failed,
-		Retries:        s.retries,
-		LastFailedRepo: s.lastFailedRepo,
-		LastFailure:    s.lastFailure,
+		Drained:           s.drained,
+		Failed:            s.failed,
+		Retries:           s.retries,
+		Abandoned:         s.abandoned,
+		LastAbandonedRepo: s.lastAbandonedRepo,
+		LastFailedRepo:    s.lastFailedRepo,
+		LastFailure:       s.lastFailure,
 	}
 }
 
@@ -183,6 +210,8 @@ func newBackgroundScheduler(logger *zap.Logger) *backgroundScheduler {
 		inFlightDone:   map[string]chan struct{}{},
 		holds:          map[string]int{},
 		failStreaks:    map[string]int{},
+		zeroProgress:   map[string]int{},
+		lastFrontier:   map[string]int{},
 		wake:           make(chan struct{}, 1),
 		done:           make(chan struct{}),
 	}
@@ -234,10 +263,14 @@ func (s *backgroundScheduler) enqueue(t backgroundTask) bool {
 	if s.closed {
 		return false
 	}
-	// Any external trigger resets the retry backoff: this enqueue is fresh
-	// signal (a mutation happened, a fast pass completed), so its drain
-	// starts a new streak rather than inheriting the old failures' wait.
+	// Any external trigger resets the retry backoff AND the zero-progress
+	// allowance: this enqueue is fresh signal (a mutation happened, a fast
+	// pass completed), so its drain starts a new streak rather than
+	// inheriting the old failures' wait — and an abandoned task revives.
+	// lastFrontier survives deliberately: the shrink baseline stays valid
+	// across triggers.
 	delete(s.failStreaks, t.key())
+	delete(s.zeroProgress, t.key())
 	if _, busy := s.inFlight[t.key()]; busy {
 		s.requeue[t.key()] = t
 		return true
@@ -437,12 +470,14 @@ func (s *backgroundScheduler) finishInFlight(t backgroundTask, retryDelay time.D
 		s.retries++
 	} else {
 		// Terminal drop — the key leaves the scheduler, and any streak a
-		// prior failure left goes with it (a cancelled, no-work, or
-		// panicking attempt earns no retry but must not strand a map entry
-		// for the daemon's lifetime; a later external enqueue starts fresh
-		// anyway).
+		// prior failure left goes with it (a cancelled, no-work, abandoned,
+		// or panicking attempt earns no retry but must not strand a map
+		// entry for the daemon's lifetime; a later external enqueue starts
+		// fresh anyway).
 		delete(s.queued, t.key())
 		delete(s.failStreaks, t.key())
+		delete(s.zeroProgress, t.key())
+		delete(s.lastFrontier, t.key())
 	}
 	cancel := s.inFlightCancel[t.key()]
 	done := s.inFlightDone[t.key()]
@@ -518,6 +553,8 @@ func (s *backgroundScheduler) purgeMatchingLocked(match func(backgroundTask) boo
 		if match(t) {
 			delete(s.queued, t.key())
 			delete(s.failStreaks, t.key())
+			delete(s.zeroProgress, t.key())
+			delete(s.lastFrontier, t.key())
 			continue
 		}
 		kept = append(kept, t)
@@ -605,6 +642,8 @@ func (s *backgroundScheduler) drain(ctx context.Context, g graph.Store, t backgr
 		s.lastDurationMs = time.Since(startedAt).Milliseconds()
 		s.drained++
 		delete(s.failStreaks, t.key())
+		delete(s.zeroProgress, t.key())
+		delete(s.lastFrontier, t.key())
 	case err != nil && ctx.Err() == nil:
 		s.failed++
 		s.lastFailedRepo = t.repoName
@@ -614,9 +653,38 @@ func (s *backgroundScheduler) drain(ctx context.Context, g graph.Store, t backgr
 	// unavailable server (still warming, a package restore holding a lock)
 	// must not strand the repo's deep tier until the next mutation or
 	// restart. Cancellation is excluded: the canceller owns the requeue.
+	// Retries are NOT unconditional: an attempt with no edge yield and no
+	// frontier shrinkage made no progress at all, and after
+	// backgroundRetryMaxZeroProgress consecutive stuck attempts the task
+	// is abandoned until the next external trigger — a server with a
+	// persistent per-target error otherwise re-runs an identical drain
+	// every backoff interval for the daemon's lifetime.
+	abandonedNow := false
 	if ctx.Err() == nil && (err != nil || partial) {
+		yield, frontier := 0, -1
+		if result != nil {
+			yield = result.EdgesConfirmed + result.EdgesAdded + result.EdgesRebound + result.NodesEnriched
+			frontier = result.HoverCandidates
+		}
+		prevFrontier, seen := s.lastFrontier[t.key()]
+		progress := yield > 0 || (seen && frontier >= 0 && frontier < prevFrontier)
+		if frontier >= 0 {
+			s.lastFrontier[t.key()] = frontier
+		}
 		s.failStreaks[t.key()]++
-		retryDelay = backgroundRetryDelay(s.failStreaks[t.key()])
+		if progress {
+			s.zeroProgress[t.key()] = 0
+			retryDelay = backgroundRetryDelay(s.failStreaks[t.key()])
+		} else {
+			s.zeroProgress[t.key()]++
+			if s.zeroProgress[t.key()] > backgroundRetryMaxZeroProgress {
+				s.abandoned++
+				s.lastAbandonedRepo = t.repoName
+				abandonedNow = true // retryDelay stays 0: terminal drop
+			} else {
+				retryDelay = backgroundRetryDelay(s.failStreaks[t.key()])
+			}
+		}
 	}
 	s.mu.Unlock()
 	fields := []zap.Field{
@@ -636,6 +704,12 @@ func (s *backgroundScheduler) drain(ctx context.Context, g graph.Store, t backgr
 	case err != nil && ctx.Err() != nil:
 		s.logger.Info("background enrichment cancelled; progress is stamped and resumes on the next trigger",
 			append(fields, zap.Error(err))...)
+	case abandonedNow:
+		if err != nil {
+			fields = append(fields, zap.Error(err))
+		}
+		s.logger.Warn("background enrichment abandoned after repeated zero-progress attempts; the next mutation or restart revives it",
+			append(fields, zap.Int("stuck_attempts", backgroundRetryMaxZeroProgress+1))...)
 	case err != nil:
 		s.logger.Warn("background enrichment failed; retrying with backoff",
 			append(fields, zap.Error(err), zap.Duration("retry_in", retryDelay))...)
