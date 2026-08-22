@@ -80,12 +80,11 @@ func (m *mockBackgroundProvider) EnrichBackground(ctx context.Context, _ graph.S
 	return &EnrichResult{Provider: m.name, Language: "go", EdgesConfirmed: 1, Partial: m.partial}, nil
 }
 
-// A drain that keeps failing WITHOUT progress must not retry forever —
-// the reported failure shape: a server with a persistent per-target error
-// re-ran an identical drain every backoff interval for the daemon's
-// lifetime. After backgroundRetryMaxZeroProgress consecutive
-// zero-progress attempts the scheduler abandons the task until the next
-// external trigger. Progress is edge yield OR a shrinking candidate
+// A drain that keeps failing WITHOUT progress must not retry forever — a
+// server with a persistent per-target error would re-run an identical
+// drain every backoff interval for the daemon's lifetime. After
+// backgroundRetryMaxZeroProgress consecutive zero-progress attempts the
+// scheduler abandons the task until the next external trigger. Progress is edge yield OR a shrinking candidate
 // frontier (per-node stamps make each converging retry smaller), so a
 // slowly converging drain is never abandoned.
 func TestBackgroundScheduler_ZeroProgressRetriesAreBounded(t *testing.T) {

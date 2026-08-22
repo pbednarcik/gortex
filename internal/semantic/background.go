@@ -182,11 +182,11 @@ func (s *backgroundScheduler) status() BackgroundLaneStatus {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return BackgroundLaneStatus{
-		Started:        s.started,
-		Pending:        len(s.pending),
-		InFlightRepo:   s.inFlightRepo,
-		LastRepo:       s.lastRepo,
-		LastDurationMs: s.lastDurationMs,
+		Started:           s.started,
+		Pending:           len(s.pending),
+		InFlightRepo:      s.inFlightRepo,
+		LastRepo:          s.lastRepo,
+		LastDurationMs:    s.lastDurationMs,
 		Drained:           s.drained,
 		Failed:            s.failed,
 		Retries:           s.retries,
