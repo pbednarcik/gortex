@@ -141,7 +141,7 @@ func (p *laneUntrackProvider) EnrichFile(graph.Store, string, string) (*semantic
 	return nil, nil
 }
 func (p *laneUntrackProvider) HasBackgroundWork(graph.Store, string) bool { return true }
-func (p *laneUntrackProvider) InvalidateBackground(graph.Store, string)   {}
+func (p *laneUntrackProvider) InvalidateBackground(graph.Store, string) error { return nil }
 func (p *laneUntrackProvider) EnrichBackground(ctx context.Context, _ graph.Store, repo, _ string) (*semantic.EnrichResult, error) {
 	p.drained <- repo
 	select {
@@ -225,7 +225,7 @@ func (p *laneTrackProbeProvider) EnrichFile(graph.Store, string, string) (*seman
 	return nil, nil
 }
 func (p *laneTrackProbeProvider) HasBackgroundWork(graph.Store, string) bool { return true }
-func (p *laneTrackProbeProvider) InvalidateBackground(graph.Store, string)   {}
+func (p *laneTrackProbeProvider) InvalidateBackground(graph.Store, string) error { return nil }
 func (p *laneTrackProbeProvider) EnrichBackground(_ context.Context, g graph.Store, _, _ string) (*semantic.EnrichResult, error) {
 	p.probe(g)
 	return &semantic.EnrichResult{}, nil
@@ -329,8 +329,9 @@ func (p *laneBracketProvider) EnrichFile(graph.Store, string, string) (*semantic
 	return nil, nil
 }
 func (p *laneBracketProvider) HasBackgroundWork(graph.Store, string) bool { return true }
-func (p *laneBracketProvider) InvalidateBackground(graph.Store, string) {
+func (p *laneBracketProvider) InvalidateBackground(graph.Store, string) error {
 	p.record("invalidate")
+	return nil
 }
 func (p *laneBracketProvider) EnrichBackground(ctx context.Context, g graph.Store, _, _ string) (*semantic.EnrichResult, error) {
 	p.record("drain-start")
