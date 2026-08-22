@@ -1,8 +1,8 @@
 package semantic
 
 import (
-	"errors"
 	"context"
+	"errors"
 	"fmt"
 	"testing"
 	"time"
