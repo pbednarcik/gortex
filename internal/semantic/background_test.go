@@ -80,6 +80,113 @@ func (m *mockBackgroundProvider) EnrichBackground(ctx context.Context, _ graph.S
 	return &EnrichResult{Provider: m.name, Language: "go", EdgesConfirmed: 1, Partial: m.partial}, nil
 }
 
+// A drain that keeps failing WITHOUT progress must not retry forever —
+// the reported failure shape: a server with a persistent per-target error
+// re-ran an identical drain every backoff interval for the daemon's
+// lifetime. After backgroundRetryMaxZeroProgress consecutive
+// zero-progress attempts the scheduler abandons the task until the next
+// external trigger. Progress is edge yield OR a shrinking candidate
+// frontier (per-node stamps make each converging retry smaller), so a
+// slowly converging drain is never abandoned.
+func TestBackgroundScheduler_ZeroProgressRetriesAreBounded(t *testing.T) {
+	prevBase := backgroundRetryBase
+	prevMax := backgroundRetryMaxZeroProgress
+	backgroundRetryBase = 5 * time.Millisecond
+	backgroundRetryMaxZeroProgress = 2
+	defer func() {
+		backgroundRetryBase = prevBase
+		backgroundRetryMaxZeroProgress = prevMax
+	}()
+
+	p := &mockBackgroundProvider{
+		mockProvider: mockProvider{name: "mock-bg", languages: []string{"go"}, available: true},
+		drainFunc: func(int) (*EnrichResult, error) {
+			// Same frontier every attempt, zero yield: the stuck shape.
+			return &EnrichResult{Partial: true, HoverCandidates: 40}, nil
+		},
+	}
+	s := newBackgroundScheduler(zap.NewNop())
+	defer s.close()
+	s.start(context.Background(), graph.New())
+
+	require.True(t, s.enqueue(backgroundTask{repoName: "repo", repoRoot: "/tmp/repo", provider: p, lang: "go"}))
+	// Two zero-progress retries are allowed; the third zero-progress
+	// failure (attempt 3) crosses the cap and abandons: exactly 3 attempts.
+	require.Eventually(t, func() bool { return p.attempts.Load() == 3 }, 2*time.Second, 5*time.Millisecond)
+	time.Sleep(150 * time.Millisecond)
+	assert.EqualValues(t, 3, p.attempts.Load(), "an abandoned task must not self-retry")
+	st := s.status()
+	assert.Equal(t, 1, st.Abandoned, "abandonment must be visible on the health surface")
+	assert.Equal(t, "repo", st.LastAbandonedRepo)
+}
+
+// A converging drain — zero yield but a SHRINKING frontier — must keep
+// retrying past the zero-progress cap: shrinkage is the per-node stamps
+// landing, which is real progress even when no attempt yields edges.
+func TestBackgroundScheduler_ShrinkingFrontierKeepsRetrying(t *testing.T) {
+	prevBase := backgroundRetryBase
+	prevMax := backgroundRetryMaxZeroProgress
+	backgroundRetryBase = 5 * time.Millisecond
+	backgroundRetryMaxZeroProgress = 2
+	defer func() {
+		backgroundRetryBase = prevBase
+		backgroundRetryMaxZeroProgress = prevMax
+	}()
+
+	p := &mockBackgroundProvider{
+		mockProvider: mockProvider{name: "mock-bg", languages: []string{"go"}, available: true},
+		drainFunc: func(attempt int) (*EnrichResult, error) {
+			if attempt < 6 {
+				return &EnrichResult{Partial: true, HoverCandidates: 100 - attempt*10}, nil
+			}
+			return &EnrichResult{EdgesConfirmed: 1}, nil
+		},
+	}
+	s := newBackgroundScheduler(zap.NewNop())
+	defer s.close()
+	s.start(context.Background(), graph.New())
+
+	require.True(t, s.enqueue(backgroundTask{repoName: "repo", repoRoot: "/tmp/repo", provider: p, lang: "go"}))
+	require.Eventually(t, func() bool { return s.status().Drained == 1 }, 2*time.Second, 5*time.Millisecond,
+		"a shrinking-frontier drain must retry to completion, not be abandoned")
+	assert.EqualValues(t, 6, p.attempts.Load())
+	assert.Zero(t, s.status().Abandoned)
+}
+
+// Abandonment is not a tombstone: the next external trigger (mutation
+// requeue, restart census, pass-end enqueue) revives the task with a
+// fresh zero-progress allowance.
+func TestBackgroundScheduler_ExternalEnqueueRevivesAbandonedTask(t *testing.T) {
+	prevBase := backgroundRetryBase
+	prevMax := backgroundRetryMaxZeroProgress
+	backgroundRetryBase = 5 * time.Millisecond
+	backgroundRetryMaxZeroProgress = 1
+	defer func() {
+		backgroundRetryBase = prevBase
+		backgroundRetryMaxZeroProgress = prevMax
+	}()
+
+	p := &mockBackgroundProvider{
+		mockProvider: mockProvider{name: "mock-bg", languages: []string{"go"}, available: true},
+		drainFunc: func(int) (*EnrichResult, error) {
+			return &EnrichResult{Partial: true, HoverCandidates: 40}, nil
+		},
+	}
+	s := newBackgroundScheduler(zap.NewNop())
+	defer s.close()
+	s.start(context.Background(), graph.New())
+
+	task := backgroundTask{repoName: "repo", repoRoot: "/tmp/repo", provider: p, lang: "go"}
+	require.True(t, s.enqueue(task))
+	require.Eventually(t, func() bool { return p.attempts.Load() == 2 }, 2*time.Second, 5*time.Millisecond)
+	time.Sleep(100 * time.Millisecond)
+	require.EqualValues(t, 2, p.attempts.Load(), "abandoned after the cap")
+
+	require.True(t, s.enqueue(task), "a fresh external trigger must be accepted")
+	require.Eventually(t, func() bool { return p.attempts.Load() >= 3 }, 2*time.Second, 5*time.Millisecond,
+		"the external trigger must revive the abandoned task")
+}
+
 // The pending-dedup branch must adopt the newer trigger's repoRoot: the
 // task key is (repo, provider) — root is not part of it — so replacing a
 // prefix (untrack, then re-track a different checkout under the same name)
