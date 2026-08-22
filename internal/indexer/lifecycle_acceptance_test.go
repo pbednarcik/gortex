@@ -14,6 +14,7 @@ import (
 
 	"github.com/zzet/gortex/internal/config"
 	"github.com/zzet/gortex/internal/graph"
+	"github.com/zzet/gortex/internal/graph/store_sqlite"
 	"github.com/zzet/gortex/internal/parser"
 	"github.com/zzet/gortex/internal/search"
 	"github.com/zzet/gortex/internal/semantic"
@@ -204,6 +205,78 @@ func TestLifecycleUntrackCancelsBackgroundLane(t *testing.T) {
 	case r := <-bg.drained:
 		t.Fatalf("untracked repo drained again: %q", r)
 	case <-time.After(150 * time.Millisecond):
+	}
+}
+
+// laneTrackProbeProvider records, at drain start, whatever the injected
+// probe observes about the store and the indexer state at that moment.
+type laneTrackProbeProvider struct {
+	probe func(g graph.Store)
+}
+
+func (p *laneTrackProbeProvider) Name() string        { return "lane-track-probe" }
+func (p *laneTrackProbeProvider) Languages() []string { return []string{"go"} }
+func (p *laneTrackProbeProvider) Available() bool     { return true }
+func (p *laneTrackProbeProvider) Close() error        { return nil }
+func (p *laneTrackProbeProvider) Enrich(graph.Store, string) (*semantic.EnrichResult, error) {
+	return &semantic.EnrichResult{}, nil
+}
+func (p *laneTrackProbeProvider) EnrichFile(graph.Store, string, string) (*semantic.EnrichResult, error) {
+	return nil, nil
+}
+func (p *laneTrackProbeProvider) HasBackgroundWork(graph.Store, string) bool { return true }
+func (p *laneTrackProbeProvider) InvalidateBackground(graph.Store, string)   {}
+func (p *laneTrackProbeProvider) EnrichBackground(_ context.Context, g graph.Store, _, _ string) (*semantic.EnrichResult, error) {
+	p.probe(g)
+	return &semantic.EnrichResult{}, nil
+}
+
+// A live track's inline enrichment enqueues the repo's background drain
+// from INSIDE the mutation, while a first index on a bulk-loading store
+// still holds every row in the indexer's local shadow graph — invisible to
+// the durable store the lane drains against. The track must bracket the
+// lane like every other repository mutation: hold first, so the drain can
+// only start after the shadow has landed and the repo is installed.
+func TestLifecycleTrackParksBackgroundDrainUntilRowsVisible(t *testing.T) {
+	t.Setenv("GORTEX_ENRICH_MIN_NODES", "0")
+	store, err := store_sqlite.Open(filepath.Join(t.TempDir(), "lifecycle-track.sqlite"))
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = store.Close() })
+	repo := setupRepoDir(t, "repo")
+	mi := NewMultiIndexer(store, newTestRegistry(), search.NewNull(), newTestConfigManager(t), zap.NewNop())
+	t.Cleanup(func() { closeLifecycleTestMultiIndexer(t, mi) })
+
+	type drainObs struct {
+		rowsVisible bool
+		installed   bool
+	}
+	seen := make(chan drainObs, 2)
+	bg := &laneTrackProbeProvider{probe: func(g graph.Store) {
+		seen <- drainObs{
+			rowsVisible: len(g.GetFileNodes("repo/main.go")) > 0,
+			installed:   mi.GetIndexer("repo") != nil,
+		}
+	}}
+	mgr := semantic.NewManager(semantic.Config{Enabled: true}, zap.NewNop())
+	mgr.RegisterProvider(bg)
+	t.Cleanup(func() { require.NoError(t, mgr.Close()) })
+	mi.SetSemanticManager(mgr)
+
+	// Lane running with no repos yet — the drain under test is the one the
+	// track's own pass-end enqueue produces, not a census enqueue.
+	mgr.StartBackgroundLane(context.Background(), mi.Graph(), map[string]string{})
+
+	_, err = mi.TrackRepo(config.RepoEntry{Path: repo, Name: "repo"})
+	require.NoError(t, err)
+
+	select {
+	case obs := <-seen:
+		require.True(t, obs.rowsVisible,
+			"the drain started against a store with no rows for the tracked repo — the pass-end enqueue escaped the mutation bracket")
+		require.True(t, obs.installed,
+			"the drain started before the tracked repo was installed")
+	case <-time.After(5 * time.Second):
+		t.Fatal("the track's pass-end enqueue never produced a drain")
 	}
 }
 
