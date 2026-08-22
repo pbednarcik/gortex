@@ -38,6 +38,26 @@ type lspRepoProjection struct {
 	inboundDispatchEdges     []*graph.Edge
 }
 
+// fullUnstampedCandidates re-fetches candidate nodes in full and drops any
+// the tier stamp already covers. Light scans restore only promoted Meta
+// columns, so a blob-only stamp (semantic_heavy) is invisible until this
+// batch — without the recheck every heavy drain rebuilds the whole frontier.
+func (p *Provider) fullUnstampedCandidates(g graph.Store, candidateIDs []string) []*graph.Node {
+	if len(candidateIDs) == 0 {
+		return nil
+	}
+	full := g.GetNodesByIDs(candidateIDs)
+	nodes := make([]*graph.Node, 0, len(candidateIDs))
+	for _, id := range candidateIDs {
+		node := full[id]
+		if node == nil || p.tierStamped(node) {
+			continue
+		}
+		nodes = append(nodes, node)
+	}
+	return nodes
+}
+
 // readLSPRepoProjection builds the smallest exact projection consumed by the
 // existing enrichment phases. It deliberately retains only language symbol
 // locations and LSP-adjudicable adjacency; file/import nodes and opaque Meta
@@ -95,15 +115,7 @@ func (p *Provider) readLSPRepoProjection(g graph.Store, repoPrefix string) (*lsp
 		// The location projection intentionally omits opaque Meta. Re-fetch
 		// only the unstamped candidates that may be enriched or ranked; one
 		// bounded batch per frontier preserves receiver/trait markers exactly.
-		var fullCandidates map[string]*graph.Node
-		if len(candidateIDs) > 0 {
-			fullCandidates = g.GetNodesByIDs(candidateIDs)
-		}
-		for _, id := range candidateIDs {
-			if node := fullCandidates[id]; node != nil {
-				projection.langNodes = append(projection.langNodes, node)
-			}
-		}
+		projection.langNodes = append(projection.langNodes, p.fullUnstampedCandidates(g, candidateIDs)...)
 
 		confirmable := reader.LSPRepoConfirmableEdgesByFiles(repoPrefix, p.languages, frontier, false)
 		memberOf := reader.LSPRepoEdgesByFilesAndKinds(repoPrefix, p.languages, frontier, []graph.EdgeKind{graph.EdgeMemberOf})

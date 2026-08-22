@@ -844,14 +844,7 @@ func (p *Provider) EnrichRepoContext(ctx context.Context, g graph.Store, repoPre
 			}
 			langNodes = append(langNodes, n)
 		}
-		if len(candidateIDs) > 0 {
-			full := g.GetNodesByIDs(candidateIDs)
-			for _, id := range candidateIDs {
-				if n := full[id]; n != nil {
-					langNodes = append(langNodes, n)
-				}
-			}
-		}
+		langNodes = append(langNodes, p.fullUnstampedCandidates(g, candidateIDs)...)
 
 		// Collect AMBIGUOUS edges (confidence < 1.0) whose source is one of this
 		// repo's language nodes — the references pass below confirms / refutes

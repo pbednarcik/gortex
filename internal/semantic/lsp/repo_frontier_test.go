@@ -111,6 +111,49 @@ func (s *lspFrontierCountingStore) observeFiles(files []string) {
 	}
 }
 
+// The semantic_heavy stamp lives in the opaque Meta blob, so the light
+// location projection cannot see it — only the full-node re-fetch can. A
+// heavyDelta frontier must therefore recheck the stamp on the full nodes,
+// or every drain re-issues the deferred tier for the whole repo (SQLite
+// resume regression reported against the lane branch).
+func TestReadLSPRepoProjectionHeavyDeltaSkipsHeavyStampedNodes(t *testing.T) {
+	store, err := store_sqlite.Open(filepath.Join(t.TempDir(), "lsp-frontier-heavy.sqlite"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = store.Close() })
+
+	// Both nodes carry the fast tier's semantic_type stamp — the heavy
+	// frontier is exactly the fast-stamped population — and one already
+	// completed its heavy drain.
+	store.AddBatch([]*graph.Node{
+		{
+			ID: "drained", RepoPrefix: "repo", Language: "go", Kind: graph.KindFunction,
+			Name: "Drained", FilePath: "repo/a.go", StartLine: 1, EndLine: 5,
+			Meta: map[string]any{"semantic_type": "func()", "semantic_heavy": "1"},
+		},
+		{
+			ID: "pending", RepoPrefix: "repo", Language: "go", Kind: graph.KindFunction,
+			Name: "Pending", FilePath: "repo/a.go", StartLine: 7, EndLine: 11,
+			Meta: map[string]any{"semantic_type": "func()"},
+		},
+	}, nil)
+
+	provider := &Provider{languages: []string{"go"}, heavyDelta: true}
+	projection, ok := provider.readLSPRepoProjection(store, "repo")
+	if !ok {
+		t.Fatal("SQLite projection capability was not selected")
+	}
+
+	ids := make([]string, 0, len(projection.langNodes))
+	for _, node := range projection.langNodes {
+		ids = append(ids, node.ID)
+	}
+	if fmt.Sprint(ids) != "[pending]" {
+		t.Fatalf("heavyDelta frontier candidates=%v, want only [pending]: the drained node's semantic_heavy stamp must survive the light projection", ids)
+	}
+}
+
 func TestReadLSPRepoProjectionBoundsFrontiersAndMatchesLegacyDecisions(t *testing.T) {
 	store, err := store_sqlite.Open(filepath.Join(t.TempDir(), "lsp-frontier.sqlite"))
 	if err != nil {
