@@ -2766,6 +2766,19 @@ func (mi *MultiIndexer) TrackRepoCtx(ctx context.Context, entry config.RepoEntry
 	err = mi.coordinateRepositoryTopologyMutation(ctx, idx, func() error {
 		// Construction can precede a queued batch transition. Once the stable
 		// lane and transition generation are held, reapply the authoritative mode.
+		// The track's own inline enrichment enqueues this repo's first
+		// background drain from INSIDE the mutation, while a first index on
+		// a bulk-loading store still holds every row in the indexer's local
+		// shadow graph — invisible to the durable store the lane drains.
+		// Hold the lane until the mutation completes (shadow landed, repo
+		// installed), the same bracket every other repository mutation
+		// takes; nothing can be in flight for a not-yet-tracked prefix, so
+		// no cancel leg is needed.
+		if semMgr := mi.SemanticManager(); semMgr != nil {
+			release := semMgr.HoldBackgroundMutations(prefix)
+			defer release()
+		}
+
 		batchMode := mi.reapplyBatchModeForMutation(idx)
 		finishTopologyMutation := mi.beginRepositoryTopologyMutation(ctx)
 		topologyChanged := false
