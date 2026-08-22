@@ -237,6 +237,9 @@ func TestLSPProvider_NewLaneProvider_FieldInventoryPinned(t *testing.T) {
 
 		"laneProviderFactory": "runtime", // a lane must never spawn lanes
 		"client":              "runtime",
+		"clientMu":            "runtime", // client lifecycle handoff — per instance
+		"pendingClient":       "runtime", // spawn-to-publish window handle — per instance
+		"closeGen":            "runtime", // Close counter for the handoff — per instance
 		"sourceCache":         "runtime",
 		"docMu":               "runtime",
 		"docVersions":         "runtime",
@@ -562,6 +565,71 @@ func TestLSPProvider_EnrichBackground_AllStampedDrainStaysClean(t *testing.T) {
 	require.NoError(t, err)
 	require.True(t, found, "an all-stamped drain records the lane marker")
 	assert.Equal(t, "sha-fast", laneMarker.IndexedSHA)
+}
+
+// Cancelling a drain must interrupt an in-flight LSP request, not wait it
+// out: Client.Call takes no context, so with the call timeout disabled
+// (GORTEX_LSP_CALL_TIMEOUT=off is a supported setting) a wedged server
+// otherwise blocks cancelRepo — and the repository mutation and daemon
+// shutdown behind it — unboundedly. EnrichBackground must close the lane
+// when ctx dies: the close unblocks the Call through the client's done
+// channel and reaps the server.
+func TestLSPProvider_EnrichBackground_CancelInterruptsInFlightCall(t *testing.T) {
+	t.Setenv(SweepEnv, "")
+	t.Setenv(HeavyRequestsEnv, "background")
+
+	repoRoot, g, _ := heavyDeltaFixture(t)
+	ms := newMarkerStore(g)
+
+	server := newFakeLSPServer()
+	reached := make(chan struct{})
+	var reachedOnce sync.Once
+	server.handle("textDocument/references", func(json.RawMessage) (any, *jsonRPCError) {
+		reachedOnce.Do(func() { close(reached) })
+		select {} // wedged: never answers
+	})
+	lane, cleanup := providerWithFakeServer(t, server, []string{"go"})
+	defer cleanup()
+	lane.heavyDelta = true
+	lane.noHeavyRequests = false // as newLaneProvider wires a real lane
+	lane.client.SetCallTimeout(0) // "off": the historical unbounded behaviour
+
+	p := NewProvider("fake-lsp", nil, []string{"go"}, false, 2, nil)
+	p.laneProviderFactory = func() (*Provider, error) { return lane, nil }
+	require.NoError(t, ms.SetEnrichmentState(graph.EnrichmentState{
+		RepoPrefix: "", Provider: p.Name(), IndexedSHA: "sha-fast"}))
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	var result *semantic.EnrichResult
+	done := make(chan error, 1)
+	go func() {
+		r, err := p.EnrichBackground(ctx, ms, "", repoRoot)
+		result = r
+		done <- err
+	}()
+
+	select {
+	case <-reached:
+	case <-time.After(2 * time.Second):
+		t.Fatal("the drain never reached the wedged request")
+	}
+	cancel()
+
+	select {
+	case err := <-done:
+		// The interruption surfaces either as a drain error or as an
+		// honest partial (the failed calls land in the drain ledger) —
+		// never as a clean completion.
+		if err == nil {
+			require.NotNil(t, result)
+			assert.True(t, result.Partial, "an interrupted drain must not report clean")
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("cancellation did not interrupt the in-flight LSP call")
+	}
+	_, found, _ := ms.GetEnrichmentState("", p.Name()+backgroundMarkerSuffix)
+	assert.False(t, found, "no marker for an interrupted drain")
 }
 
 // A clean, uncancelled drain records the lane marker at the fast tier's

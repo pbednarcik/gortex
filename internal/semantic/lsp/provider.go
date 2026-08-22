@@ -3,6 +3,7 @@ package lsp
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io/fs"
 	"os"
@@ -86,6 +87,18 @@ type Provider struct {
 	altInitOptionsFunc func(repoRoot string) json.RawMessage
 
 	client *Client
+
+	// clientMu guards the client lifecycle handoff: between dialOrSpawn
+	// and the p.client publication the live server process is otherwise
+	// held only on the initializing goroutine's stack, where an external
+	// Close (the lane's readiness-budget teardown above all) cannot reach
+	// it. pendingClient is that in-flight handle; closeGen counts Close
+	// calls so a publication can detect a teardown that ran between its
+	// spawn and its publish and reap instead of publishing. See
+	// registerPendingClient / publishClient / Close.
+	clientMu      sync.Mutex
+	pendingClient *Client
+	closeGen      uint64
 
 	// sourceCache holds file contents read by openDocument so the
 	// per-symbol column-resolution lookups don't reread the file for
@@ -345,11 +358,68 @@ func (p *Provider) Available() bool {
 	return err == nil
 }
 
+// Close shuts down the published client AND any client still in the
+// spawn-to-publish window. Bumping closeGen makes a racing publication
+// observe this teardown (publishClient refuses and reaps), so no spawned
+// server can survive a Close unowned. The published pointer is left in
+// place — ensureClient's liveness probe sees its closed done channel and
+// reconnects through the normal reset path.
 func (p *Provider) Close() error {
-	if p.client != nil {
-		return p.client.Shutdown()
+	p.clientMu.Lock()
+	p.closeGen++
+	c := p.client
+	pending := p.pendingClient
+	p.pendingClient = nil
+	p.clientMu.Unlock()
+
+	var err error
+	if c != nil {
+		err = c.Shutdown()
 	}
-	return nil
+	if pending != nil && pending != c {
+		_ = pending.Shutdown()
+	}
+	return err
+}
+
+// registerPendingClient records a freshly spawned client as owned-but-
+// unpublished, returning the close generation the eventual publication
+// must present. From this call on, Close reaps the client even though
+// p.client does not reference it yet.
+func (p *Provider) registerPendingClient(c *Client) uint64 {
+	p.clientMu.Lock()
+	defer p.clientMu.Unlock()
+	p.pendingClient = c
+	return p.closeGen
+}
+
+// publishClient promotes a pending client to p.client — unless a Close ran
+// since the client registered (gen mismatch), in which case the client is
+// shut down and false is returned: the provider's owner already tore it
+// down and will never Close again, so publishing would orphan the server.
+func (p *Provider) publishClient(c *Client, gen uint64) bool {
+	p.clientMu.Lock()
+	if p.pendingClient == c {
+		p.pendingClient = nil
+	}
+	if p.closeGen != gen {
+		p.clientMu.Unlock()
+		_ = c.Shutdown()
+		return false
+	}
+	p.client = c
+	p.clientMu.Unlock()
+	return true
+}
+
+// releasePendingClient disowns a pending client whose initialization
+// failed — the caller shuts it down itself and returns the real error.
+func (p *Provider) releasePendingClient(c *Client) {
+	p.clientMu.Lock()
+	if p.pendingClient == c {
+		p.pendingClient = nil
+	}
+	p.clientMu.Unlock()
 }
 
 // nodeRelPath strips a node's own RepoPrefix from its FilePath so the
@@ -2606,6 +2676,12 @@ func (p *Provider) ensureClient(workspaceRoot string) error {
 	if err != nil {
 		return err
 	}
+	// Own the process from the instant it exists: until the publication at
+	// the end of this function, an external Close (readiness-budget
+	// teardown, provider shutdown) can only reach it through this
+	// registration — and the initialize Call below is unbounded, so this
+	// window is where a wedged server would otherwise be orphaned.
+	spawnGen := p.registerPendingClient(client)
 
 	// Wire diagnostic + reverse-RPC handlers before initialize so we
 	// don't lose the first publishDiagnostics burst that some servers
@@ -2743,6 +2819,7 @@ func (p *Provider) ensureClient(workspaceRoot string) error {
 
 	var initResult InitializeResult
 	if err := client.Call("initialize", initParams, &initResult); err != nil {
+		p.releasePendingClient(client)
 		_ = client.Shutdown()
 		return fmt.Errorf("initialize: %w", err)
 	}
@@ -2756,6 +2833,7 @@ func (p *Provider) ensureClient(workspaceRoot string) error {
 
 	// Send initialized notification.
 	if err := client.Notify("initialized", struct{}{}); err != nil {
+		p.releasePendingClient(client)
 		_ = client.Shutdown()
 		return fmt.Errorf("initialized: %w", err)
 	}
@@ -2765,7 +2843,13 @@ func (p *Provider) ensureClient(workspaceRoot string) error {
 	// longer block an enrichment Call forever. See lspCallTimeout.
 	client.SetCallTimeout(lspCallTimeout())
 
-	p.client = client
+	if !p.publishClient(client, spawnGen) {
+		// A Close ran while this goroutine initialized: the provider's
+		// owner already tore the instance down and will never Close it
+		// again — publishing would orphan the server (publishClient reaped
+		// it instead).
+		return errors.New("lsp: provider closed during initialization; server reaped")
+	}
 	return nil
 }
 

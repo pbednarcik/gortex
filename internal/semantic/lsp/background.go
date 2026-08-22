@@ -137,6 +137,16 @@ func (p *Provider) EnrichBackground(ctx context.Context, g graph.Store, repoPref
 		}
 	}
 
+	// Client.Call takes no context: a cancel is otherwise noticed only
+	// BETWEEN requests, and with the call timeout disabled (a supported
+	// GORTEX_LSP_CALL_TIMEOUT=off) a wedged server blocks the drain — and
+	// the cancelRepo waiter, repository mutation, or daemon shutdown
+	// behind it — unboundedly. Closing the lane on ctx death unblocks any
+	// in-flight Call through the client's done channel and reaps the
+	// server; the drain then surfaces the failure and stays undrained.
+	stopWatchdog := context.AfterFunc(ctx, func() { _ = lane.Close() })
+	defer stopWatchdog()
+
 	result, err := lane.EnrichRepoContext(ctx, g, repoPrefix, repoRoot, nil)
 	// A drain that saw zero symbols for its languages proves nothing about
 	// the tier — the store held no rows for the repo (typically a live
