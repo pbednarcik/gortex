@@ -114,8 +114,7 @@ func (s *lspFrontierCountingStore) observeFiles(files []string) {
 // The semantic_heavy stamp lives in the opaque Meta blob, so the light
 // location projection cannot see it — only the full-node re-fetch can. A
 // heavyDelta frontier must therefore recheck the stamp on the full nodes,
-// or every drain re-issues the deferred tier for the whole repo (SQLite
-// resume regression reported against the lane branch).
+// or every drain re-issues the deferred tier for the whole repo.
 func TestReadLSPRepoProjectionHeavyDeltaSkipsHeavyStampedNodes(t *testing.T) {
 	store, err := store_sqlite.Open(filepath.Join(t.TempDir(), "lsp-frontier-heavy.sqlite"))
 	if err != nil {

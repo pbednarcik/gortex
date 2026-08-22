@@ -339,43 +339,73 @@ repo rather than being claimed by a marker for state the drain never
 visited. A drain cancelled by daemon shutdown resumes from the stamps at the
 next trigger (a fast pass completing, or the restart census in
 `StartBackgroundLane`, which re-enqueues repos whose fast tier is current
-but whose deep tier never finished). An **errored or partial drain retries
-on its own** with bounded exponential backoff (1 min doubling to a 30 min
-cap, reset by a clean drain or any fresh trigger) — a server that was
-briefly unavailable or still loading recovers without waiting for the next
-mutation or restart, and a persistently failing one becomes a slow
-heartbeat, never a spin. The lane obeys the same **admission floor** as
-index-time enrichment (`GORTEX_ENRICH_MIN_NODES`, default 16): a language
-too small for a fast pass is never census-enqueued or mutation-requeued —
-with no fast marker its drain could never record completion and would
-re-spawn a server for the same incidental subtree on every restart. The
-drain waits for a readiness-probing server's workspace load before
-starting, exactly like the foreground pass — a still-loading server answers
-heavy requests empty, which must not be recorded as a drained tier. Lane
-progress is surfaced in the daemon health snapshot under `background_lane`
-(including a `retries` counter) and in the `background enrichment
-complete` / `partial` / `failed` log lines.
+but whose deep tier never finished). A drain that saw **zero symbols** for
+its languages proves nothing about the tier — the store simply held no rows
+yet — so it records no marker and defers as partial; an all-stamped repo is
+different and completes as a clean no-op. An **errored or partial drain
+retries on its own** with bounded exponential backoff (1 min doubling to a
+30 min cap, reset by a clean drain or any fresh trigger) — a server that
+was briefly unavailable or still loading recovers without waiting for the
+next mutation or restart. Retries are not unconditional: an attempt that
+yielded no edges AND shrank no frontier made no progress, and after five
+consecutive stuck attempts the task is **abandoned** until the next
+external trigger — a server with a persistent per-target error must not
+re-run an identical drain every backoff interval for the daemon's
+lifetime, while a converging drain (its per-node stamps shrink each next
+attempt) always keeps its heartbeat. The lane obeys the same **admission
+floor** as index-time enrichment (`GORTEX_ENRICH_MIN_NODES`, default 16): a
+language too small for a fast pass is never census-enqueued or
+mutation-requeued — with no fast marker its drain could never record
+completion and would re-spawn a server for the same incidental subtree on
+every restart. The drain waits for a readiness-probing server's workspace
+load before starting, exactly like the foreground pass — a still-loading
+server answers heavy requests empty, which must not be recorded as a
+drained tier. Lane progress is surfaced in the daemon health snapshot under
+`background_lane` (including `retries`, `abandoned`, and
+`last_abandoned_repo`) and in the `background enrichment complete` /
+`partial` / `failed` / `abandoned` log lines.
 
-A repository mutation — a watcher batch, a branch switch, a full re-index —
-never overlaps a drain of the languages it touches. The mutation first
-parks the repo's lane queue for its whole duration (so even the trigger
-its own enrichment pass creates cannot start a drain mid-mutation), then
+The drain runs under its own per-request budget: nobody waits on the lane,
+and the expensive tail — solution-wide references on the highest-fan-in
+members — converts at a larger bound where the 30s foreground default
+times out. `GORTEX_LSP_LANE_CALL_TIMEOUT` sets it (default `3m`; same
+syntax as `GORTEX_LSP_CALL_TIMEOUT`, `0`/`off`/`none` disables); when the
+lane variable is unset but the global `GORTEX_LSP_CALL_TIMEOUT` is set
+explicitly, the global bound applies to the lane too. One target class is
+never asked at all: C# object-override members (`ToString`, `GetHashCode`,
+`Equals`), whose references request degenerates into a solution-wide
+implicit-call search no finite budget converts. The drain skips them as
+**terminal-unconfirmable** — their edges keep their static confidence, the
+skip is not an error, the completion marker may land over them, and the
+completion log counts them as `drain_skipped_terminal`.
+
+A repository mutation — a watcher batch, a branch switch, a full re-index,
+tracking a new repository — never overlaps a drain of the languages it
+touches. The mutation first parks the repo's lane queue for its whole
+duration (so even the trigger its own enrichment pass creates cannot start
+a drain mid-mutation — for a fresh track that also means the first drain
+waits until the repo's rows are durable and the repo is installed), then
 cancels the in-flight drain and waits it out before its first store
 write, revokes the lane's completion claim for the mutated languages, and
 re-enqueues the repo once the batch and its incremental enrichment
-settle. The languages come from the files that actually changed — a
+settle. A revocation whose marker write fails is not trusted: the repo is
+enqueued anyway, bypassing the (now stale) completion claim, since a
+redundant drain is request-free for files whose stamps survived. The languages come from the files that actually changed — a
 directory scope or a full-root reconcile resolves them after
 classification, and a reconcile that finds nothing changed touches the
 lane not at all: no cancel, no claim revoked, the active drain just keeps
 running. The fast path always wins; the lane drains the delta afterwards,
-resuming from the per-file stamps so untouched files cost no requests.
+resuming from the per-node stamps so untouched files cost no requests.
 Drains of unrelated languages keep running — they write disjoint rows,
 and cancelling them would only re-pay their server spawn on every edit. A
 mutation-requeued drain waits out a quiet period first (60s, slid forward
 by every further mutation), so an editing session coalesces into one
 drain after its last save instead of spawning and cancelling a server per
 batch. Untracking a repository cancels and discards its lane work
-outright.
+outright — and every task is additionally validated against the live
+repository registry immediately before it drains, so a task for a repo
+that was untracked (or re-tracked at a different checkout) after the task
+was queued is dropped instead of spawning a server at an abandoned root.
 
 On-demand confirmation stays disabled under `background`, exactly as under
 `off`: `find_usages` / `get_callers` answer from the stored graph tiers,

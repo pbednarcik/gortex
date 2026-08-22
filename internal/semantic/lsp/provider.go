@@ -2469,12 +2469,12 @@ func (p *Provider) dialOrSpawn(workspaceRoot string) (*Client, error) {
 
 // laneCallTimeoutEnv / laneCallTimeoutDefault bound a single lane-drain
 // request. The lane has nobody waiting, and the measured whale tail —
-// solution-wide references on the highest-fan-in members — converts at a
-// 3-minute budget where the 30s foreground default times out (+127 edges
-// on the most-queried symbols of a 118k-node solution in the A/B run).
-// Resolution order: the lane env, then the global GORTEX_LSP_CALL_TIMEOUT
-// (an explicit operator bound applies to the lane too), then the lane
-// default. Same syntax as the global env ("0"/"off"/"none" disables).
+// solution-wide references on the highest-fan-in members of a 118k-node
+// solution — converts at a 3-minute budget where the 30s foreground
+// default times out. Resolution order: the lane env, then the global
+// GORTEX_LSP_CALL_TIMEOUT (an explicit operator bound applies to the lane
+// too), then the lane default. Same syntax as the global env
+// ("0"/"off"/"none" disables).
 const laneCallTimeoutEnv = "GORTEX_LSP_LANE_CALL_TIMEOUT"
 
 const laneCallTimeoutDefault = 3 * time.Minute
