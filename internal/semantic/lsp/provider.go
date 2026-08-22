@@ -627,7 +627,11 @@ func markNodeHeavyStamped(n *graph.Node) {
 // They are identifiable up front, so a heavyDelta drain never asks:
 // their edges stay at the static tier, no drain error is recorded, and
 // the completion marker may land over them — a retry would never
-// converge, only re-pay the timeout.
+// converge, only re-pay the timeout. Matching is deliberately by name +
+// kind + language, wider than a strict override check: a custom
+// Equals(T) or ToString(format) overload on a hot type draws the same
+// solution-wide fan-in, and the cost of a false positive is one edge
+// left at its static confidence, not lost work.
 func terminalUnconfirmable(n *graph.Node) bool {
 	if n == nil || n.Kind != graph.KindMethod || n.Language != "csharp" {
 		return false
