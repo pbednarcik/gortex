@@ -32,10 +32,14 @@ type mockBackgroundProvider struct {
 	// counter) — for fail-then-succeed retry tests. Overrides partial/drainErr.
 	drainFunc func(attempt int) (*EnrichResult, error)
 	attempts  atomic.Int32
+	// invalidateErr, when set, is returned by InvalidateBackground — the
+	// stale-marker world where the blanking write failed.
+	invalidateErr error
 }
 
-func (m *mockBackgroundProvider) InvalidateBackground(_ graph.Store, repo string) {
+func (m *mockBackgroundProvider) InvalidateBackground(_ graph.Store, repo string) error {
 	m.invalidated = append(m.invalidated, repo)
+	return m.invalidateErr
 }
 
 func (m *mockBackgroundProvider) HasBackgroundWork(_ graph.Store, repo string) bool {

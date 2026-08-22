@@ -1,6 +1,7 @@
 package semantic
 
 import (
+	"errors"
 	"context"
 	"fmt"
 	"testing"
@@ -407,6 +408,39 @@ func TestManagerBackgroundLane_RequeueAppliesAdmissionFloor(t *testing.T) {
 	mgr.RequeueBackgroundForRepo(g, "default", roots["default"], []string{"go"})
 	assert.Zero(t, mgr.BackgroundLaneStatus().Pending, "a below-floor language must not re-enter the lane")
 	assert.Empty(t, p.invalidated, "the floor gates the whole lane pipeline, invalidation included")
+}
+
+// A failed marker invalidation must fail OPEN. The blanking write failed,
+// so the durable marker still claims the tier is drained — trusting
+// HasBackgroundWork there would suppress the requeue now AND on every
+// restart (census reads the same stale row). On error the repo is
+// enqueued unconditionally; a redundant drain is request-free for files
+// whose stamps survived, so the conservative path costs one server spawn.
+func TestManagerBackgroundLane_RequeueEnqueuesWhenInvalidationFails(t *testing.T) {
+	p := &mockBackgroundProvider{
+		mockProvider:  mockProvider{name: "go", languages: []string{"go"}, available: true},
+		drained:       make(chan string, 1),
+		invalidateErr: errors.New("injected marker write failure"),
+		// The stale marker still claims drained — exactly the state a
+		// failed blanking leaves behind.
+		hasWork: func(string) bool { return false },
+	}
+	mgr, g, roots := backgroundLaneManager(t, p)
+	defer func() { require.NoError(t, mgr.Close()) }()
+
+	mgr.StartBackgroundLane(context.Background(), g, roots)
+
+	prevCooldown := laneMutationCooldown
+	laneMutationCooldown = 50 * time.Millisecond
+	defer func() { laneMutationCooldown = prevCooldown }()
+
+	mgr.RequeueBackgroundForRepo(g, "default", roots["default"], []string{"go"})
+	select {
+	case repo := <-p.drained:
+		require.Equal(t, "default", repo)
+	case <-time.After(2 * time.Second):
+		t.Fatal("a failed invalidation suppressed the requeue — the stale marker was trusted")
+	}
 }
 
 // Census admission is PER REPO, matching production foreground enrichment

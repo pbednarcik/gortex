@@ -260,8 +260,22 @@ func (m *Manager) RequeueBackgroundForRepo(g graph.Store, repoName, repoRoot str
 		if !anyLangPresent(provider.Languages(), set) {
 			return
 		}
-		be.InvalidateBackground(g, repoName)
-		if !be.HasBackgroundWork(g, repoName) {
+		// Fail OPEN on a failed revocation: the durable marker still claims
+		// the tier is drained, so HasBackgroundWork would suppress this
+		// requeue — and every restart's census after it. A conservative
+		// enqueue costs one request-free drain for files whose stamps
+		// survived; the suppressed alternative loses the mutated files'
+		// deep tier until the next commit moves the fast marker.
+		forced := false
+		if err := be.InvalidateBackground(g, repoName); err != nil {
+			m.logger.Warn("background lane: marker invalidation failed; enqueuing conservatively",
+				zap.String("provider", provider.Name()),
+				zap.String("repo", repoName),
+				zap.Error(err))
+			// The stale claim also answers the dequeue-time re-check, so the
+			// task must carry the bypass or the scheduler drops it there.
+			forced = true
+		} else if !be.HasBackgroundWork(g, repoName) {
 			return
 		}
 		lang := ""
@@ -270,7 +284,7 @@ func (m *Manager) RequeueBackgroundForRepo(g graph.Store, repoName, repoRoot str
 		}
 		if m.background.enqueue(backgroundTask{
 			repoName: repoName, repoRoot: repoRoot, provider: provider, lang: lang,
-			notBefore: time.Now().Add(laneMutationCooldown),
+			notBefore: time.Now().Add(laneMutationCooldown), force: forced,
 		}) {
 			m.logger.Info("background lane: repository mutation requeued repo",
 				zap.String("provider", provider.Name()),
