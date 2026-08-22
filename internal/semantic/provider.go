@@ -112,8 +112,11 @@ type BackgroundEnricher interface {
 	// provider's languages: the re-parse discarded those files' progress
 	// stamps, so HasBackgroundWork must answer true again until a fresh
 	// drain completes — the drain itself stays cheap for untouched files,
-	// whose stamps survive.
-	InvalidateBackground(g graph.Store, repoPrefix string)
+	// whose stamps survive. A non-nil error means the claim may STILL
+	// stand (the revoking write or its read failed) — the caller must not
+	// trust HasBackgroundWork afterwards and should enqueue conservatively,
+	// or the stale claim suppresses the repo's work across restarts.
+	InvalidateBackground(g graph.Store, repoPrefix string) error
 }
 
 // PreselectionDeadlineEnricher marks a ContextEnricher whose expensive work

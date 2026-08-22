@@ -206,21 +206,39 @@ func (p *Provider) newLaneProvider() (*Provider, error) {
 // deleting the row) is enough: backgroundMarkerCurrent requires it to equal
 // the fast tier's non-empty sha. The fast marker is the fast tier's claim,
 // not the lane's to revoke. Writes only when a claim exists — an idle or
-// never-drained repo pays one read, no write.
-func (p *Provider) InvalidateBackground(g graph.Store, repoPrefix string) {
+// never-drained repo pays one read, no write. A returned error means the
+// claim may still stand: the caller must not trust HasBackgroundWork and
+// should enqueue conservatively.
+func (p *Provider) InvalidateBackground(g graph.Store, repoPrefix string) error {
 	store, ok := g.(graph.EnrichmentStateStore)
 	if !ok {
-		return
+		return nil
 	}
 	lane, found, err := store.GetEnrichmentState(repoPrefix, p.Name()+backgroundMarkerSuffix)
-	if err != nil || !found || lane.IndexedSHA == "" {
-		return
+	if err != nil {
+		if p.logger != nil {
+			p.logger.Warn("invalidate background lane marker: read failed",
+				zap.String("provider", p.Name()),
+				zap.String("repo_prefix", repoPrefix),
+				zap.Error(err))
+		}
+		return fmt.Errorf("lsp: read background lane marker: %w", err)
+	}
+	if !found || lane.IndexedSHA == "" {
+		return nil
 	}
 	lane.IndexedSHA = ""
 	lane.CompletedAt = time.Now().Unix()
-	if err := store.SetEnrichmentState(lane); err != nil && p.logger != nil {
-		p.logger.Warn("invalidate background lane marker failed")
+	if err := store.SetEnrichmentState(lane); err != nil {
+		if p.logger != nil {
+			p.logger.Warn("invalidate background lane marker: write failed",
+				zap.String("provider", p.Name()),
+				zap.String("repo_prefix", repoPrefix),
+				zap.Error(err))
+		}
+		return fmt.Errorf("lsp: blank background lane marker: %w", err)
 	}
+	return nil
 }
 
 // backgroundMarkerCurrent reports whether the lane marker exists and sits at

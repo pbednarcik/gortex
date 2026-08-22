@@ -30,6 +30,11 @@ type backgroundTask struct {
 	// earlier one — because a fresh trigger is new signal, not a repeat of
 	// the failure.
 	retry bool
+	// force skips the dequeue-time HasBackgroundWork re-check: the enqueuer
+	// knows the completion marker is untrustworthy (a failed invalidation
+	// left a stale claim standing), so consulting it would silently drop
+	// exactly the task that exists to compensate for it.
+	force bool
 }
 
 func (t backgroundTask) key() string { return t.repoName + "\x00" + t.provider.Name() }
@@ -239,6 +244,9 @@ func (s *backgroundScheduler) enqueue(t backgroundTask) bool {
 				pulled = true
 			} else if t.notBefore.After(s.pending[i].notBefore) {
 				s.pending[i].notBefore = t.notBefore
+			}
+			if t.force {
+				s.pending[i].force = true
 			}
 		}
 		if pulled {
@@ -531,8 +539,9 @@ func (s *backgroundScheduler) drain(ctx context.Context, g graph.Store, t backgr
 		return
 	}
 	// Re-check at dequeue: the tier may have drained (or the mode changed)
-	// while the task sat in the queue.
-	if !be.HasBackgroundWork(g, t.repoName) {
+	// while the task sat in the queue. A forced task skips the check — its
+	// enqueuer knows the marker behind HasBackgroundWork is stale.
+	if !t.force && !be.HasBackgroundWork(g, t.repoName) {
 		return
 	}
 	s.logger.Info("background enrichment starting",

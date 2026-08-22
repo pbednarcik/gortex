@@ -446,6 +446,54 @@ func TestLSPProvider_EnrichBackground_MarkerUsesDrainStartSHA(t *testing.T) {
 		"the marker claims only the state the drain actually visited")
 }
 
+// failingMarkerStore injects marker-table failures around markerStore.
+type failingMarkerStore struct {
+	*markerStore
+	setErr error
+	getErr error
+}
+
+func (s *failingMarkerStore) SetEnrichmentState(st graph.EnrichmentState) error {
+	if s.setErr != nil {
+		return s.setErr
+	}
+	return s.markerStore.SetEnrichmentState(st)
+}
+
+func (s *failingMarkerStore) GetEnrichmentState(repoPrefix, provider string) (graph.EnrichmentState, bool, error) {
+	if s.getErr != nil {
+		return graph.EnrichmentState{}, false, s.getErr
+	}
+	return s.markerStore.GetEnrichmentState(repoPrefix, provider)
+}
+
+// A failed invalidation leaves the stale completion marker in place — the
+// caller then re-reads it, concludes there is no work, and the suppression
+// survives restarts (the marker is durable). The failure must reach the
+// caller so it can enqueue conservatively; only "no claim exists" is a
+// clean no-op.
+func TestLSPProvider_InvalidateBackground_PropagatesStoreFailures(t *testing.T) {
+	p := NewProvider("fake-lsp", nil, []string{"go"}, false, 2, nil)
+	laneKey := p.Name() + backgroundMarkerSuffix
+
+	t.Run("write failure surfaces", func(t *testing.T) {
+		ms := newMarkerStore(graph.New())
+		require.NoError(t, ms.SetEnrichmentState(graph.EnrichmentState{
+			RepoPrefix: "", Provider: laneKey, IndexedSHA: "sha-1"}))
+		fs := &failingMarkerStore{markerStore: ms, setErr: assert.AnError}
+		require.ErrorIs(t, p.InvalidateBackground(fs, ""), assert.AnError)
+	})
+
+	t.Run("read failure surfaces", func(t *testing.T) {
+		fs := &failingMarkerStore{markerStore: newMarkerStore(graph.New()), getErr: assert.AnError}
+		require.ErrorIs(t, p.InvalidateBackground(fs, ""), assert.AnError)
+	})
+
+	t.Run("no claim is a clean no-op", func(t *testing.T) {
+		require.NoError(t, p.InvalidateBackground(newMarkerStore(graph.New()), ""))
+	})
+}
+
 // A drain that saw ZERO symbols for its language proves nothing about the
 // tier: the store simply held no rows for the repo yet. The live-track
 // pass-end enqueue can fire while the repo's nodes still sit in the
