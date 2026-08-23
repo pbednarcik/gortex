@@ -45,8 +45,7 @@ func TestLSPProvider_BackgroundDrain_SurvivesReopenAndRestartsAreNoOps(t *testin
 		store.AddNode(n)
 	}
 	for _, e := range mem.AllEdges() {
-		e.From, e.To = e.From, e.To // ids unchanged; file anchor moves with the node
-		e.FilePath = "repo/" + e.FilePath
+		e.FilePath = "repo/" + e.FilePath // ids unchanged; the file anchor moves with the node
 		store.AddEdge(e)
 	}
 	baseNodes := len(store.GetRepoNodes("repo"))

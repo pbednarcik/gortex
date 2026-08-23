@@ -2796,6 +2796,18 @@ func (p *Provider) ensureClient(workspaceRoot string) error {
 		}
 	}
 
+	// A sealed provider builds no new clients — refuse BEFORE the
+	// restore / spawn spend: reconnectWithBackoff retries this function
+	// with backoff, and a drain sealed mid-reconnect must unwind
+	// immediately instead of paying spawn cycles that registration would
+	// only reap again.
+	p.clientMu.Lock()
+	sealed := p.clientsSealed
+	p.clientMu.Unlock()
+	if sealed {
+		return errors.New("lsp: provider sealed; not building a new client")
+	}
+
 	// Reset the dynamic capability table — a fresh subprocess (or a
 	// fresh dialed connection) has no dynamic registrations until it
 	// re-announces them. Reset under the lock so any racing

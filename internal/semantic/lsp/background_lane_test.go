@@ -643,7 +643,7 @@ func TestLSPProvider_EnrichBackground_CancelInterruptsInFlightCall(t *testing.T)
 	lane, cleanup := providerWithFakeServer(t, server, []string{"go"})
 	defer cleanup()
 	lane.heavyDelta = true
-	lane.noHeavyRequests = false // as newLaneProvider wires a real lane
+	lane.noHeavyRequests = false  // as newLaneProvider wires a real lane
 	lane.client.SetCallTimeout(0) // "off": the historical unbounded behaviour
 
 	p := NewProvider("fake-lsp", nil, []string{"go"}, false, 2, nil)

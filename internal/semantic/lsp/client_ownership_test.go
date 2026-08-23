@@ -80,6 +80,19 @@ func TestLSPProvider_SealRefusesLateSpawn(t *testing.T) {
 	assert.Nil(t, p.client)
 }
 
+// ensureClient must refuse a sealed provider BEFORE paying the restore /
+// spawn spend: reconnectWithBackoff retries it with backoff, and a drain
+// sealed mid-reconnect would otherwise burn spawn cycles (each
+// immediately reaped at registration) before unwinding.
+func TestLSPProvider_EnsureClientRefusesSealedProviderFast(t *testing.T) {
+	p := NewProvider("definitely-missing-lsp", nil, []string{"go"}, false, 0, zap.NewNop())
+	p.sealClients()
+	err := p.ensureClient(t.TempDir())
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "sealed",
+		"the refusal must come from the seal, not from a spawn attempt")
+}
+
 // The undisturbed path publishes normally.
 func TestLSPProvider_PublishClientHappyPath(t *testing.T) {
 	c, serverIn, serverOut, cleanup := newPipedClient(t)
