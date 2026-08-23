@@ -18,6 +18,7 @@ import (
 	"go.uber.org/zap/zaptest/observer"
 
 	"github.com/zzet/gortex/internal/graph"
+	"github.com/zzet/gortex/internal/graph/store_sqlite"
 )
 
 // nodeHeavyStamped mirrors nodeAlreadyStamped for the deferred tier's own
@@ -723,6 +724,67 @@ func TestLSP_Enrich_HeavyDelta_CleanlyUnconfirmedTargetsNotReAskedOnResume(t *te
 	assert.Zero(t, rig2.references.Load(),
 		"a resumed drain re-asked references a prior clean drain already adjudicated")
 	assert.Equal(t, 0.7, edge.Confidence, "the resume must not invent a confirmation")
+}
+
+// The refs verdict must persist through the store WITHOUT destroying the
+// node's other blob stamps. Confirm targets resolve through the light
+// location projection (only frontier candidates are re-fetched in full),
+// so flushing the view node replaces the full Meta blob on a disk
+// backend — an already-swept target loses semantic_heavy and re-enters
+// the frontier, and annotation stamps like is_test are destroyed. The
+// flush must round-trip the FULL node, exactly like the frontier
+// recheck. Memory stores share the node object and cannot catch this.
+func TestLSP_Enrich_HeavyDelta_RefsVerdictFlushPreservesBlobMetaOnSQLite(t *testing.T) {
+	t.Setenv(SweepEnv, "")
+	t.Setenv(HeavyRequestsEnv, "background")
+
+	store, err := store_sqlite.Open(filepath.Join(t.TempDir(), "refsverdict.sqlite"))
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = store.Close() })
+
+	repoRoot, mem, _ := heavyDeltaFixture(t)
+	for _, n := range mem.AllNodes() {
+		n.RepoPrefix = "repo"
+		n.FilePath = "repo/" + n.FilePath
+		if n.ID == "svc.go::target" {
+			if n.Meta == nil {
+				n.Meta = map[string]any{}
+			}
+			// A prior sweep stamped the target; its inbound candidate
+			// edge stayed unconfirmed, so it is a confirm target anyway.
+			n.Meta["semantic_heavy"] = "1"
+			n.Meta["is_test"] = true
+		}
+		store.AddNode(n)
+	}
+	for _, e := range mem.AllEdges() {
+		e.FilePath = "repo/" + e.FilePath
+		store.AddEdge(e)
+	}
+
+	server := newFakeLSPServer()
+	rig := newHeavyDeltaRig(server.handle, repoRoot)
+	rig.refsResult = []Location{} // clean answer, nothing corroborated
+	p, cleanup := providerWithFakeServer(t, server, []string{"go"})
+	defer cleanup()
+	p.heavyDelta = true
+	p.noHeavyRequests = false
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	_, err = p.EnrichRepoContext(ctx, store, "repo", repoRoot, nil)
+	require.NoError(t, err)
+	require.Positive(t, rig.references.Load(), "the target must have been asked")
+
+	got := store.GetNodesByIDs([]string{"svc.go::target"})["svc.go::target"]
+	require.NotNil(t, got)
+	require.NotNil(t, got.Meta)
+	assert.Equal(t, "1", got.Meta["semantic_heavy"],
+		"the refs-verdict flush must not wipe the heavy stamp off an already-swept target")
+	assert.Equal(t, true, got.Meta["is_test"],
+		"the refs-verdict flush must not wipe unrelated blob stamps")
+	assert.Equal(t, "1", got.Meta["semantic_heavy_refs"],
+		"the verdict itself must land")
 }
 
 // The refs verdict is earned only by a CLEAN answer: a target whose
