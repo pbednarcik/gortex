@@ -95,6 +95,12 @@ type MultiIndexer struct {
 	// derived-contract cleanup have all succeeded.
 	pendingRepositoryUntracks map[string]*repositoryUntrackState
 
+	// untrackLaneWindowHook, when non-nil, runs inside UntrackRepo between the
+	// background-lane cancellation and the registry detach — the window where a
+	// concurrent census holding a pre-teardown roots snapshot can land its
+	// enqueue. Lifecycle tests use it to pin the hold-across-detach contract.
+	untrackLaneWindowHook func()
+
 	// repositoryMutations owns one stable mutation lane per repository prefix.
 	// The slot survives Indexer replacement so an explicit re-index cannot race
 	// an old watcher instance on a second lane.
