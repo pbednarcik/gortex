@@ -785,6 +785,25 @@ func TestLSP_Enrich_HeavyDelta_RefsVerdictFlushPreservesBlobMetaOnSQLite(t *test
 		"the refs-verdict flush must not wipe unrelated blob stamps")
 	assert.Equal(t, "1", got.Meta["semantic_heavy_refs"],
 		"the verdict itself must land")
+
+	// Resume leg, same store: a heavy-stamped target sits OUTSIDE the
+	// frontier, so its node reaches the confirm pass through the light
+	// location projection — which is blob-blind. The verdict check must
+	// read a full row, or the banked verdict is invisible and the target
+	// is re-asked on every restart exactly as if the stamp did not exist.
+	server2 := newFakeLSPServer()
+	rig2 := newHeavyDeltaRig(server2.handle, repoRoot)
+	rig2.refsResult = []Location{}
+	p2, cleanup2 := providerWithFakeServer(t, server2, []string{"go"})
+	defer cleanup2()
+	p2.heavyDelta = true
+	p2.noHeavyRequests = false
+	ctx2, cancel2 := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel2()
+	_, err = p2.EnrichRepoContext(ctx2, store, "repo", repoRoot, nil)
+	require.NoError(t, err)
+	assert.Zero(t, rig2.references.Load(),
+		"a banked verdict on a heavy-stamped (non-frontier) target must be visible through the store, never re-asked")
 }
 
 // The refs verdict is earned only by a CLEAN answer: a target whose
