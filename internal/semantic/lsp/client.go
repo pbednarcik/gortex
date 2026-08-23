@@ -3,6 +3,7 @@ package lsp
 import (
 	"bufio"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -355,6 +356,15 @@ func (c *Client) Done() <-chan struct{} { return c.done }
 // completed, leaving the (possibly slow) cold-workspace load unbounded.
 func (c *Client) SetCallTimeout(d time.Duration) { c.callTimeout.Store(int64(d)) }
 
+// errCallTimeout marks a Call that burned its whole per-request budget
+// with no reply — the failure class the timeout-streak breaker counts,
+// distinct from a server that answers with an error.
+var errCallTimeout = errors.New("timeout")
+
+// isCallTimeout reports whether err is a Call that exhausted its
+// per-request budget (Client.Call's timeout arm), through any wrapping.
+func isCallTimeout(err error) bool { return errors.Is(err, errCallTimeout) }
+
 // Call sends a request and waits for the response.
 func (c *Client) Call(method string, params any, result any) error {
 	id := c.reqID.Add(1)
@@ -397,7 +407,7 @@ func (c *Client) Call(method string, params any, result any) error {
 	case <-c.done:
 		return fmt.Errorf("LSP server exited")
 	case <-timeout:
-		return fmt.Errorf("LSP call %s: timeout after %s", method, time.Duration(c.callTimeout.Load()))
+		return fmt.Errorf("LSP call %s: %w after %s", method, errCallTimeout, time.Duration(c.callTimeout.Load()))
 	}
 }
 

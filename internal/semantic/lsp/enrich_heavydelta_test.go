@@ -806,6 +806,72 @@ func TestLSP_Enrich_HeavyDelta_RefsVerdictFlushPreservesBlobMetaOnSQLite(t *test
 		"a banked verdict on a heavy-stamped (non-frontier) target must be visible through the store, never re-asked")
 }
 
+// A server that wedges MID-pass — every call after its first success
+// burning the full budget with no reply (observed live: a Roslyn
+// references up-symbol cascade spinning forever on an interface-member
+// whale while cancellation is ignored, saturating every server slot) —
+// must fail the drain fast and honestly. The zero-yield breaker is
+// disarmed by the first success by design, so consecutive full-budget
+// timeouts arm their own trip: the drain settles Partial after a small
+// streak instead of grinding every remaining target through a timeout.
+func TestLSP_Enrich_HeavyDelta_WedgedServerTripsTimeoutBreaker(t *testing.T) {
+	t.Setenv(SweepEnv, "")
+	t.Setenv(HeavyRequestsEnv, "background")
+
+	repoRoot := t.TempDir()
+	// One file (one confirm group), enough distinct targets that
+	// grinding them all is clearly distinguishable from a fast trip.
+	var src strings.Builder
+	src.WriteString("package p\n\n")
+	g := graph.New()
+	const wedgeTargets = 12
+	line := 3
+	for i := 0; i < wedgeTargets; i++ {
+		fmt.Fprintf(&src, "func target%02d() {}\n\nfunc caller%02d() { target%02d() }\n\n", i, i, i)
+		tid := fmt.Sprintf("svc.go::target%02d", i)
+		cid := fmt.Sprintf("svc.go::caller%02d", i)
+		g.AddNode(&graph.Node{ID: tid, Kind: graph.KindFunction, Name: fmt.Sprintf("target%02d", i),
+			FilePath: "svc.go", StartLine: line, EndLine: line, Language: "go"})
+		g.AddNode(&graph.Node{ID: cid, Kind: graph.KindFunction, Name: fmt.Sprintf("caller%02d", i),
+			FilePath: "svc.go", StartLine: line + 2, EndLine: line + 2, Language: "go"})
+		g.AddEdge(&graph.Edge{From: cid, To: tid, Kind: graph.EdgeCalls, FilePath: "svc.go", Line: line + 2,
+			Confidence: 0.7, ConfidenceLabel: "INFERRED", Origin: graph.OriginTextMatched})
+		line += 4
+	}
+	require.NoError(t, os.WriteFile(filepath.Join(repoRoot, "svc.go"), []byte(src.String()), 0o644))
+
+	server := newFakeLSPServer()
+	newHeavyDeltaRig(server.handle, repoRoot)
+	var refCalls atomic.Int64
+	server.handle("textDocument/references", func(json.RawMessage) (any, *jsonRPCError) {
+		if refCalls.Add(1) == 1 {
+			return []Location{}, nil // first answer succeeds — disarms the zero-yield arm
+		}
+		// Wedged-but-reading: every reply lands far beyond the caller's
+		// budget, so each call times out, while the dispatch loop keeps
+		// consuming stdin (a fully blocked loop would instead wedge the
+		// client's unbounded send on a full pipe).
+		time.Sleep(400 * time.Millisecond)
+		return []Location{}, nil
+	})
+	p, cleanup := providerWithFakeServer(t, server, []string{"go"})
+	defer cleanup()
+	p.heavyDelta = true
+	p.noHeavyRequests = false
+	p.client.SetCallTimeout(80 * time.Millisecond)
+
+	start := time.Now()
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	res, err := p.EnrichRepoContext(ctx, g, "", repoRoot, nil)
+	require.NoError(t, err)
+	require.NotNil(t, res)
+	require.True(t, res.Partial, "a wedged server must never yield a clean drain")
+	require.Less(t, refCalls.Load(), int64(wedgeTargets),
+		"the timeout streak must abandon the pass instead of grinding every target through the budget")
+	require.Less(t, time.Since(start), 10*time.Second, "the trip must be fast")
+}
+
 // The refs verdict is earned only by a CLEAN answer: a target whose
 // references request errored keeps retrying on later drains — stamping it
 // would convert a transient server failure into a permanent skip.
