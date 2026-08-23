@@ -209,6 +209,7 @@ func TestLSP_Enrich_HeavyDelta_SkipsTerminalUnconfirmableTargets(t *testing.T) {
 			"    public override string ToString() { return \"\"; }\n"+
 			"    public void Target() { }\n"+
 			"    public void Caller() { this.Target(); }\n"+
+			"    public object GetFieldDeserializers() { return null; }\n"+
 			"}\n"), 0o644))
 
 	g := graph.New()
@@ -218,9 +219,16 @@ func TestLSP_Enrich_HeavyDelta_SkipsTerminalUnconfirmableTargets(t *testing.T) {
 		FilePath: "svc.cs", StartLine: 3, EndLine: 3, Language: "csharp"})
 	g.AddNode(&graph.Node{ID: "svc.cs::C.Caller", Kind: graph.KindMethod, Name: "Caller",
 		FilePath: "svc.cs", StartLine: 4, EndLine: 4, Language: "csharp"})
+	// Kiota-generated serializer member — the second measured terminal
+	// class (every generated model implements it, so the references
+	// up-symbol cascade walks the whole generated client).
+	g.AddNode(&graph.Node{ID: "svc.cs::C.GetFieldDeserializers", Kind: graph.KindMethod, Name: "GetFieldDeserializers",
+		FilePath: "svc.cs", StartLine: 5, EndLine: 5, Language: "csharp"})
 	g.AddEdge(&graph.Edge{From: "svc.cs::C.Caller", To: "svc.cs::C.ToString", Kind: graph.EdgeCalls,
 		FilePath: "svc.cs", Line: 4, Confidence: 0.7, ConfidenceLabel: "INFERRED", Origin: graph.OriginTextMatched})
 	g.AddEdge(&graph.Edge{From: "svc.cs::C.Caller", To: "svc.cs::C.Target", Kind: graph.EdgeCalls,
+		FilePath: "svc.cs", Line: 4, Confidence: 0.7, ConfidenceLabel: "INFERRED", Origin: graph.OriginTextMatched})
+	g.AddEdge(&graph.Edge{From: "svc.cs::C.Caller", To: "svc.cs::C.GetFieldDeserializers", Kind: graph.EdgeCalls,
 		FilePath: "svc.cs", Line: 4, Confidence: 0.7, ConfidenceLabel: "INFERRED", Origin: graph.OriginTextMatched})
 
 	server := newFakeLSPServer()
@@ -255,7 +263,7 @@ func TestLSP_Enrich_HeavyDelta_SkipsTerminalUnconfirmableTargets(t *testing.T) {
 	require.NotNil(t, result)
 
 	assert.EqualValues(t, 1, refCalls.Load(),
-		"only the ordinary target may be asked; the object override is terminal-unconfirmable")
+		"only the ordinary target may be asked; the object override AND the generated serializer member are terminal-unconfirmable")
 	assert.False(t, result.Partial, "a policy skip is not an error — the drain stays clean")
 }
 
