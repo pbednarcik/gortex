@@ -4307,6 +4307,13 @@ func (p *Provider) repoScopedNodes(g graph.Store, repoPrefix string) []*graph.No
 // whether the light path was taken: when true, the returned nodes must not
 // be round-tripped back through AddBatch as-is (see graph.LightNodeReader);
 // the caller re-fetches in full whatever subset it intends to stamp.
+//
+// Invariant for future backends: every LightNodeReader today also serves
+// the LSP repo projection, whose endpoint resolve re-fetches confirmable
+// targets in full (blob verdicts must be visible to the confirm pass). A
+// backend that adds LightNodeReader WITHOUT the projection reader would
+// route light nodes into the non-projected enrich path — give it the
+// projection too, or refetch confirm endpoints there as well.
 func (p *Provider) repoScopedNodesLight(g graph.Store, repoPrefix string) ([]*graph.Node, bool) {
 	if lr, ok := g.(graph.LightNodeReader); ok {
 		return lr.GetRepoNodesLight(repoPrefix), true
