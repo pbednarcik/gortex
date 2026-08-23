@@ -179,20 +179,42 @@ func (p *Provider) readLSPRepoProjection(g graph.Store, repoPrefix string) (*lsp
 			nodesByID[node.ID] = node
 		}
 	}
-	missingIDs := make([]string, 0)
+	// Confirmation reads blob-only node state — the heavy stamp, the
+	// banked references verdict, annotation stamps — and the location
+	// projection is blob-blind: a light endpoint hides a banked verdict,
+	// so the target is re-asked on every drain as if it never earned one.
+	// Resolve EVERY confirmable endpoint in full, not only the ones the
+	// projection omitted; frontier candidates are already full and are
+	// simply refreshed by the same batch.
+	endpointIDs := make([]string, 0, len(endpointSet))
 	for id := range endpointSet {
+		endpointIDs = append(endpointIDs, id)
+	}
+	sort.Strings(endpointIDs)
+	var fullEndpoints map[string]*graph.Node
+	if len(endpointIDs) > 0 {
+		fullEndpoints = g.GetNodesByIDs(endpointIDs)
+	}
+	missingIDs := make([]string, 0)
+	for _, id := range endpointIDs {
 		if nodesByID[id] == nil {
 			missingIDs = append(missingIDs, id)
 		}
 	}
-	sort.Strings(missingIDs)
-	var missing map[string]*graph.Node
-	if len(missingIDs) > 0 {
-		missing = g.GetNodesByIDs(missingIDs)
+	// Swap the full rows into the slice too, not only the map: the enrich
+	// pass rebuilds its own view from projection.repoNodes, so a light
+	// entry left in the slice would resurface there.
+	for i, node := range projection.repoNodes {
+		if node == nil {
+			continue
+		}
+		if full := fullEndpoints[node.ID]; full != nil {
+			projection.repoNodes[i] = full
+		}
 	}
-	projection.repoNodes = append(projection.repoNodes, orderedNodes(missingIDs, missing)...)
-	for _, id := range missingIDs {
-		if node := missing[id]; node != nil {
+	projection.repoNodes = append(projection.repoNodes, orderedNodes(missingIDs, fullEndpoints)...)
+	for _, id := range endpointIDs {
+		if node := fullEndpoints[id]; node != nil {
 			nodesByID[id] = node
 		}
 	}

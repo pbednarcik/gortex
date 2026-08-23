@@ -220,8 +220,12 @@ func TestReadLSPRepoProjectionBoundsFrontiersAndMatchesLegacyDecisions(t *testin
 			counting.fileCountCalls, counting.nodePageCalls, counting.confirmPageCalls, counting.kindPageCalls,
 			wantPages, wantPages, wantPages)
 	}
-	if counting.nodeBatchCalls != wantPages {
-		t.Fatalf("full-node batch calls=%d, want one candidate batch per frontier (%d)", counting.nodeBatchCalls, wantPages)
+	// One candidate batch per frontier page, plus ONE endpoint batch: the
+	// confirm pass reads blob-only state (heavy stamp, references verdict)
+	// on its targets, so every confirmable endpoint is resolved in full in
+	// a single extra batch — a light endpoint would hide a banked verdict.
+	if counting.nodeBatchCalls != wantPages+1 {
+		t.Fatalf("full-node batch calls=%d, want one candidate batch per frontier plus one endpoint batch (%d)", counting.nodeBatchCalls, wantPages+1)
 	}
 	if counting.fanInCalls != 1 || counting.inboundKindCalls != 1 {
 		t.Fatalf("compact inbound queries fan-in=%d dispatch=%d, want one each", counting.fanInCalls, counting.inboundKindCalls)
