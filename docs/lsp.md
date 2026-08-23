@@ -379,6 +379,17 @@ implicit-call search no finite budget converts. The drain skips them as
 skip is not an error, the completion marker may land over them, and the
 completion log counts them as `drain_skipped_terminal`.
 
+The references-confirm leg records a per-node verdict: a confirm target
+whose reference list came back cleanly (or that is statically terminal) is
+stamped `semantic_heavy_refs`, and later drains never re-ask it — the
+identical question buys nothing until the file reparses and drops the
+stamp with the node. This is what keeps restart re-drains cheap on a
+dirty working tree, where no completion marker can land and the census
+re-enqueues the repo every startup: without the verdict, the whole
+never-confirmable candidate set re-paid its references on every restart.
+An errored fetch earns no verdict and retries on the next drain; the
+completion log counts fresh verdicts as `drain_refs_stamped`.
+
 A repository mutation — a watcher batch, a branch switch, a full re-index,
 tracking a new repository — never overlaps a drain of the languages it
 touches. The mutation first parks the repo's lane queue for its whole

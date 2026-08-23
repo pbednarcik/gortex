@@ -657,6 +657,35 @@ func markNodeHeavyStamped(n *graph.Node) {
 	n.Meta["semantic_heavy"] = "1"
 }
 
+// nodeRefsStamped reports whether the heavy tier's references-confirm leg
+// already adjudicated this confirm target: its reference list came back
+// cleanly (or the target is statically terminal-unconfirmable) and every
+// edge it could corroborate was confirmed. Re-asking buys nothing — the
+// answer is deterministic until the file reparses, which replaces the node
+// and drops the stamp. Without this verdict a dirty-tree repo (where no
+// completion marker can land) re-pays its whole unconfirmable-candidate
+// set on every restart re-drain.
+func nodeRefsStamped(n *graph.Node) bool {
+	if n == nil || n.Meta == nil {
+		return false
+	}
+	s, ok := n.Meta["semantic_heavy_refs"].(string)
+	return ok && s != ""
+}
+
+// markNodeRefsStamped records a completed references adjudication on the
+// confirm target. Like every Meta stamp it must round-trip through the
+// store (the caller flushes the node) or a disk backend discards it.
+func markNodeRefsStamped(n *graph.Node) {
+	if n == nil {
+		return
+	}
+	if n.Meta == nil {
+		n.Meta = map[string]any{}
+	}
+	n.Meta["semantic_heavy_refs"] = "1"
+}
+
 // terminalUnconfirmable identifies confirm targets no finite references
 // budget can adjudicate: C# object-override members (ToString /
 // GetHashCode / Equals). textDocument/references on a System.Object
@@ -1409,10 +1438,14 @@ func (p *Provider) EnrichRepoContext(ctx context.Context, g graph.Store, repoPre
 	// same document.
 	var confirmMu sync.Mutex
 	confirmPromotions := make(map[*graph.Edge]struct{})
+	// Confirm targets whose references verdict completed this pass — flushed
+	// with the promotions so the next drain's grouping skips them.
+	var refsStamped []*graph.Node
 	// Confirm targets skipped by the terminal-unconfirmable policy (see
 	// terminalUnconfirmable) — surfaced on the completion log so a drain
 	// that leaves edges at the static tier says so.
 	var diagTerminalSkipped atomic.Int64
+	var diagRefsStamped atomic.Int64
 	var fallback []enrichTarget
 	if p.noHeavyRequests {
 		// This server leaks per references request (ServerSpec.NoHeavyRequests)
@@ -1481,6 +1514,9 @@ func (p *Provider) EnrichRepoContext(ctx context.Context, g graph.Store, repoPre
 					ok   bool
 				}
 				refsByTarget := make(map[string]cachedRefs, len(grp.targets))
+				// Terminal targets adjudicated by policy this pass — they earn
+				// the refs verdict without a request.
+				terminalDone := map[string]*graph.Node{}
 				for _, t := range grp.targets {
 					if targetedCtx.Err() != nil || targetedBreaker.isTripped() {
 						return
@@ -1495,6 +1531,7 @@ func (p *Provider) EnrichRepoContext(ctx context.Context, g graph.Store, repoPre
 					// stays clean.
 					if p.heavyDelta && terminalUnconfirmable(toNode) {
 						diagTerminalSkipped.Add(1)
+						terminalDone[t.edge.To] = toNode
 						continue
 					}
 					line, ok := lspLine(toNode)
@@ -1535,11 +1572,40 @@ func (p *Provider) EnrichRepoContext(ctx context.Context, g graph.Store, repoPre
 						confirmMu.Unlock()
 					}
 				}
+				// Record the group's references verdicts only after every
+				// target was visited: a mid-group cancellation or breaker trip
+				// returns above and must not stamp a node whose remaining
+				// edges never got their share of the cached answer. An errored
+				// fetch (cr.ok false) earns no verdict — it retries next drain.
+				if p.heavyDelta {
+					var done []*graph.Node
+					for id, cr := range refsByTarget {
+						if !cr.ok {
+							continue
+						}
+						if n := view.nodesByID[id]; n != nil && !nodeRefsStamped(n) {
+							markNodeRefsStamped(n)
+							done = append(done, n)
+						}
+					}
+					for _, n := range terminalDone {
+						if !nodeRefsStamped(n) {
+							markNodeRefsStamped(n)
+							done = append(done, n)
+						}
+					}
+					if len(done) > 0 {
+						diagRefsStamped.Add(int64(len(done)))
+						confirmMu.Lock()
+						refsStamped = append(refsStamped, done...)
+						confirmMu.Unlock()
+					}
+				}
 			}(grp)
 		}
 		wg.Wait()
 	}
-	if len(confirmPromotions) > 0 {
+	if len(confirmPromotions) > 0 || len(refsStamped) > 0 {
 		mutations := newLSPMutationBatch()
 		rmu.Lock()
 		for edge := range confirmPromotions {
@@ -1547,7 +1613,10 @@ func (p *Provider) EnrichRepoContext(ctx context.Context, g graph.Store, repoPre
 			mutations.stagePersist(edge)
 			result.EdgesConfirmed++
 		}
-		mutations.apply(g, nil)
+		// The refs verdicts round-trip with the promotions: on a disk
+		// backend the node is a per-call reconstruction, so an unflushed
+		// stamp is a discarded one.
+		mutations.apply(g, refsStamped)
 		rmu.Unlock()
 	}
 	confirmDone := time.Now()
@@ -2329,6 +2398,7 @@ func (p *Provider) EnrichRepoContext(ctx context.Context, g graph.Store, repoPre
 		zap.Bool("targeted_breaker_tripped", targetedBreaker.isTripped()),
 		zap.Bool("hover_breaker_tripped", hoverBreaker.isTripped()),
 		zap.Int64("drain_skipped_terminal", diagTerminalSkipped.Load()),
+		zap.Int64("drain_refs_stamped", diagRefsStamped.Load()),
 		zap.Int64("drain_errored", drainErrs.total()),
 		zap.Int64("drain_errored_confirm_acquire", drainErrs.confirmAcquire.Load()),
 		zap.Int64("drain_errored_references", drainErrs.references.Load()),
