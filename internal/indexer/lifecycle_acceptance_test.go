@@ -140,7 +140,7 @@ func (p *laneUntrackProvider) Enrich(graph.Store, string) (*semantic.EnrichResul
 func (p *laneUntrackProvider) EnrichFile(graph.Store, string, string) (*semantic.EnrichResult, error) {
 	return nil, nil
 }
-func (p *laneUntrackProvider) HasBackgroundWork(graph.Store, string) bool { return true }
+func (p *laneUntrackProvider) HasBackgroundWork(graph.Store, string) bool     { return true }
 func (p *laneUntrackProvider) InvalidateBackground(graph.Store, string) error { return nil }
 func (p *laneUntrackProvider) EnrichBackground(ctx context.Context, _ graph.Store, repo, _ string) (*semantic.EnrichResult, error) {
 	p.drained <- repo
@@ -224,7 +224,7 @@ func (p *laneTrackProbeProvider) Enrich(graph.Store, string) (*semantic.EnrichRe
 func (p *laneTrackProbeProvider) EnrichFile(graph.Store, string, string) (*semantic.EnrichResult, error) {
 	return nil, nil
 }
-func (p *laneTrackProbeProvider) HasBackgroundWork(graph.Store, string) bool { return true }
+func (p *laneTrackProbeProvider) HasBackgroundWork(graph.Store, string) bool     { return true }
 func (p *laneTrackProbeProvider) InvalidateBackground(graph.Store, string) error { return nil }
 func (p *laneTrackProbeProvider) EnrichBackground(_ context.Context, g graph.Store, _, _ string) (*semantic.EnrichResult, error) {
 	p.probe(g)
@@ -627,4 +627,59 @@ func TestLifecycleDirectoryScopeReindexCancelsLaneDrain(t *testing.T) {
 	require.NotContains(t, events, "cancelled-after-write", "events: %v", events)
 	require.Contains(t, events, "invalidate",
 		"the mutated language's drained claim must be revoked: %v", events)
+}
+
+// Cancelling the lane is not enough while the repo is still registered: a
+// startup census holding a pre-teardown roots snapshot can enqueue AFTER
+// UntrackRepo's cancellation purge, pass the drain-time live-root check
+// (the registry entry is not yet detached), and drain into the purged
+// namespace. The untrack must park the lane before cancelling and release
+// only after the registry entry is gone — the stale enqueue then waits at
+// the dequeue gate and drops at the resolver instead of draining.
+func TestLifecycleUntrackHoldsStaleCensusEnqueueAcrossDetach(t *testing.T) {
+	t.Setenv("GORTEX_ENRICH_MIN_NODES", "0")
+	repo := setupRepoDir(t, "repo")
+	mi := newLifecycleTestMultiIndexer(t)
+	t.Cleanup(func() { closeLifecycleTestMultiIndexer(t, mi) })
+
+	_, err := mi.TrackRepo(config.RepoEntry{Path: repo, Name: "repo"})
+	require.NoError(t, err)
+
+	drainStarted := make(chan struct{}, 4)
+	bg := &laneTrackProbeProvider{probe: func(graph.Store) { drainStarted <- struct{}{} }}
+	mgr := semantic.NewManager(semantic.Config{Enabled: true}, zap.NewNop())
+	mgr.RegisterProvider(bg)
+	t.Cleanup(func() { require.NoError(t, mgr.Close()) })
+	mi.SetSemanticManager(mgr)
+
+	// Start the lane with an empty snapshot: the drain under test is the
+	// stale census enqueue injected inside the untrack window below, not a
+	// pre-untrack census drain.
+	mgr.StartBackgroundLane(context.Background(), mi.Graph(), map[string]string{})
+
+	drainedInWindow := false
+	mi.untrackLaneWindowHook = func() {
+		// A concurrent startup census with a pre-teardown roots snapshot:
+		// the repo is still in the registry here, so the drain-time
+		// live-root check alone cannot stop this task — only the hold can
+		// park it until the registry entry is gone.
+		mgr.StartBackgroundLane(context.Background(), mi.Graph(), map[string]string{"repo": repo})
+		select {
+		case <-drainStarted:
+			drainedInWindow = true
+		case <-time.After(750 * time.Millisecond):
+			// Held: the enqueue parked at the dequeue gate.
+		}
+	}
+
+	_, _ = mi.UntrackRepo("repo")
+	require.False(t, drainedInWindow,
+		"a stale census enqueue drained inside the untrack window — the lane was not parked across the registry detach")
+
+	// After the release the parked task must drop at the resolver, not drain.
+	select {
+	case <-drainStarted:
+		t.Fatal("the parked stale task drained after untrack released the lane")
+	case <-time.After(500 * time.Millisecond):
+	}
 }
