@@ -3,7 +3,7 @@ package lsp
 import "testing"
 
 func TestPhaseBreakerTripsOnlyOnUnbrokenZeroYieldStreak(t *testing.T) {
-	b := newPhaseBreaker(3, nil, "targeted", "repo")
+	b := newPhaseBreaker(3, 0, nil, "targeted", "repo")
 	b.observe(false)
 	b.observe(false)
 	if b.isTripped() {
@@ -16,7 +16,7 @@ func TestPhaseBreakerTripsOnlyOnUnbrokenZeroYieldStreak(t *testing.T) {
 }
 
 func TestPhaseBreakerAnySuccessDisarmsPermanently(t *testing.T) {
-	b := newPhaseBreaker(3, nil, "hover", "repo")
+	b := newPhaseBreaker(3, 0, nil, "hover", "repo")
 	b.observe(false)
 	b.observe(true) // the server answered once — it works for this workspace
 	for i := 0; i < 100; i++ {
@@ -28,7 +28,7 @@ func TestPhaseBreakerAnySuccessDisarmsPermanently(t *testing.T) {
 }
 
 func TestPhaseBreakerDisabled(t *testing.T) {
-	b := newPhaseBreaker(0, nil, "targeted", "repo")
+	b := newPhaseBreaker(0, 0, nil, "targeted", "repo")
 	for i := 0; i < 100; i++ {
 		b.observe(false)
 	}
@@ -86,5 +86,62 @@ func TestRequestStatsTotalSumsIssuedRequests(t *testing.T) {
 	s.incomingSkipped.Add(100)
 	if got := s.total(); got != 9 {
 		t.Fatalf("total = %d, want 9", got)
+	}
+}
+
+// The timeout arm answers "is anyone answering NOW": prior successes must
+// not forgive a streak of full-budget timeouts (the zero-yield arm is
+// permanently disarmed by them, which is exactly how a mid-pass wedge
+// escaped both breakers in production).
+func TestPhaseBreakerTimeoutStreakTripsDespitePriorSuccess(t *testing.T) {
+	b := newPhaseBreaker(32, 3, nil, "targeted", "repo")
+	b.observe(true) // disarms the zero-yield arm
+	b.observeTimeout()
+	b.observeTimeout()
+	if b.isTripped() {
+		t.Fatal("below the streak limit the breaker must stay closed")
+	}
+	b.observeTimeout()
+	if !b.isTripped() {
+		t.Fatal("three consecutive full-budget timeouts must trip regardless of past successes")
+	}
+}
+
+func TestPhaseBreakerSuccessResetsTimeoutStreak(t *testing.T) {
+	b := newPhaseBreaker(32, 3, nil, "targeted", "repo")
+	b.observeTimeout()
+	b.observeTimeout()
+	b.observe(true) // an answer arrived — the streak is broken
+	b.observeTimeout()
+	b.observeTimeout()
+	if b.isTripped() {
+		t.Fatal("a success must reset the timeout streak")
+	}
+	b.observeTimeout()
+	if !b.isTripped() {
+		t.Fatal("an unbroken post-reset streak must still trip")
+	}
+}
+
+// Ordinary errors (a server that ANSWERS with failures) must not feed the
+// timeout arm — they are cheap and the zero-yield arm owns them.
+func TestPhaseBreakerNonTimeoutFailuresDoNotFeedTimeoutArm(t *testing.T) {
+	b := newPhaseBreaker(32, 2, nil, "targeted", "repo")
+	b.observe(true)
+	for i := 0; i < 10; i++ {
+		b.observe(false)
+	}
+	if b.isTripped() {
+		t.Fatal("fast error answers must not trip the timeout arm")
+	}
+}
+
+func TestPhaseBreakerTimeoutArmDisabled(t *testing.T) {
+	b := newPhaseBreaker(32, 0, nil, "targeted", "repo")
+	for i := 0; i < 50; i++ {
+		b.observeTimeout()
+	}
+	if b.isTripped() {
+		t.Fatal("timeoutLimit <= 0 must disable the timeout arm")
 	}
 }

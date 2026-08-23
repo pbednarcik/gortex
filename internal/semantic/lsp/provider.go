@@ -1322,8 +1322,8 @@ func (p *Provider) EnrichRepoContext(ctx context.Context, g graph.Store, repoPre
 	// nothing for this workspace must not grind through the whole target and
 	// hover corpus at one timeout per request. Any successful answer disarms
 	// the phase's breaker permanently.
-	targetedBreaker := newPhaseBreaker(lspPhaseFailureStreakLimit(), p.logger, "targeted", repoPrefix)
-	hoverBreaker := newPhaseBreaker(lspPhaseFailureStreakLimit(), p.logger, "hover", repoPrefix)
+	targetedBreaker := newPhaseBreaker(lspPhaseFailureStreakLimit(), lspTimeoutFailureStreakLimit(), p.logger, "targeted", repoPrefix)
+	hoverBreaker := newPhaseBreaker(lspPhaseFailureStreakLimit(), lspTimeoutFailureStreakLimit(), p.logger, "hover", repoPrefix)
 	// drainErrs counts heavyDelta work items whose heavy fetch ERRORED
 	// (a node's incoming, a target's references confirm, or a whole file /
 	// confirm group behind a failed acquire) and so stayed undrained — per
@@ -1373,6 +1373,9 @@ func (p *Provider) EnrichRepoContext(ctx context.Context, g graph.Store, repoPre
 		impls, err := p.findImplementations(absRoot, rel, line, col)
 		release()
 		targetedBreaker.observe(err == nil)
+		if isCallTimeout(err) {
+			targetedBreaker.observeTimeout()
+		}
 		if targetedBreaker.isTripped() {
 			break
 		}
@@ -1544,6 +1547,9 @@ func (p *Provider) EnrichRepoContext(ctx context.Context, g graph.Store, repoPre
 						col := identifierColumn(content, toNode.StartLine, toNode.Name)
 						refs, err := p.findReferences(absRoot, grp.rel, line, col)
 						targetedBreaker.observe(err == nil)
+						if isCallTimeout(err) {
+							targetedBreaker.observeTimeout()
+						}
 						if err != nil && p.heavyDelta {
 							// This target's edges stay unconfirmed — counted
 							// once here; repeats skip through the cache.
@@ -2314,6 +2320,9 @@ func (p *Provider) EnrichRepoContext(ctx context.Context, g graph.Store, repoPre
 					}
 					if err != nil {
 						hoverBreaker.observe(false)
+						if isCallTimeout(err) {
+							hoverBreaker.observeTimeout()
+						}
 						diagHoverErr.Add(1)
 						mu.Lock()
 						if diagFirstHoverError == "" {
