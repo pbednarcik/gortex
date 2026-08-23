@@ -684,3 +684,78 @@ func TestLSP_Enrich_HeavyDelta_ErrorsAreClassifiedAndSampled(t *testing.T) {
 	assert.Contains(t, samples[0], "transient",
 		"a sample entry carries the underlying error")
 }
+
+// A restart re-drain must not re-ask references a prior clean drain already
+// adjudicated. An unconfirmed candidate edge whose target answered cleanly —
+// the reference list simply never corroborated the site — buys nothing from
+// the identical question (the heavyDelta fallback comment says as much), yet
+// without a per-node refs verdict the confirm pass re-pays it on every
+// restart of a dirty-tree repo, where no completion marker can land. The
+// verdict rides the node like every other stamp and dies with it on reparse.
+func TestLSP_Enrich_HeavyDelta_CleanlyUnconfirmedTargetsNotReAskedOnResume(t *testing.T) {
+	t.Setenv(SweepEnv, "")
+	t.Setenv(HeavyRequestsEnv, "background")
+
+	repoRoot, g, edge := heavyDeltaFixture(t)
+
+	server1 := newFakeLSPServer()
+	rig1 := newHeavyDeltaRig(server1.handle, repoRoot)
+	// A clean answer that never corroborates the call site: the edge stays
+	// at its static tier and no drain error is recorded.
+	rig1.refsResult = []Location{}
+	p1, cleanup1 := providerWithFakeServer(t, server1, []string{"go"})
+	defer cleanup1()
+	p1.heavyDelta = true
+	p1.noHeavyRequests = false
+	runHeavyDelta(t, p1, g, repoRoot)
+	require.Positive(t, rig1.references.Load(), "the first drain must ask")
+	require.Equal(t, 0.7, edge.Confidence, "an uncorroborated edge keeps its static tier")
+
+	// Restart shape: a fresh provider over the same graph.
+	server2 := newFakeLSPServer()
+	rig2 := newHeavyDeltaRig(server2.handle, repoRoot)
+	rig2.refsResult = []Location{}
+	p2, cleanup2 := providerWithFakeServer(t, server2, []string{"go"})
+	defer cleanup2()
+	p2.heavyDelta = true
+	p2.noHeavyRequests = false
+	runHeavyDelta(t, p2, g, repoRoot)
+	assert.Zero(t, rig2.references.Load(),
+		"a resumed drain re-asked references a prior clean drain already adjudicated")
+	assert.Equal(t, 0.7, edge.Confidence, "the resume must not invent a confirmation")
+}
+
+// The refs verdict is earned only by a CLEAN answer: a target whose
+// references request errored keeps retrying on later drains — stamping it
+// would convert a transient server failure into a permanent skip.
+func TestLSP_Enrich_HeavyDelta_ErroredRefsTargetsRetryOnResume(t *testing.T) {
+	t.Setenv(SweepEnv, "")
+	t.Setenv(HeavyRequestsEnv, "background")
+
+	repoRoot, g, _ := heavyDeltaFixture(t)
+
+	drainOnceWithErroringRefs := func() int64 {
+		server := newFakeLSPServer()
+		newHeavyDeltaRig(server.handle, repoRoot)
+		var refErrs atomic.Int64
+		server.handle("textDocument/references", func(json.RawMessage) (any, *jsonRPCError) {
+			refErrs.Add(1)
+			return nil, &jsonRPCError{Code: -32603, Message: "injected references failure"}
+		})
+		p, cleanup := providerWithFakeServer(t, server, []string{"go"})
+		defer cleanup()
+		p.heavyDelta = true
+		p.noHeavyRequests = false
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		res, err := p.EnrichRepoContext(ctx, g, "", repoRoot, nil)
+		require.NoError(t, err)
+		require.NotNil(t, res)
+		require.True(t, res.Partial, "an errored refs leg must not report a clean drain")
+		return refErrs.Load()
+	}
+
+	require.Positive(t, drainOnceWithErroringRefs(), "the first drain must ask")
+	assert.Positive(t, drainOnceWithErroringRefs(),
+		"an errored target must be re-asked on resume, never stamped")
+}

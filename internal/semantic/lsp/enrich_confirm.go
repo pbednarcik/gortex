@@ -88,6 +88,12 @@ func (p *Provider) groupConfirmTargets(nodesByID map[string]*graph.Node, targets
 		if toNode == nil {
 			continue
 		}
+		if p.heavyDelta && nodeRefsStamped(toNode) {
+			// A prior drain already adjudicated this target's references
+			// (or it is statically terminal-unconfirmable) — the identical
+			// question buys nothing until a reparse drops the stamp.
+			continue
+		}
 		if _, ok := lspLine(toNode); !ok {
 			continue
 		}
