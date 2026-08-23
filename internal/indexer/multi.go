@@ -68,6 +68,12 @@ type MultiIndexer struct {
 	newIndexer func(graph.Store, *parser.Registry, config.IndexConfig, *zap.Logger) *Indexer
 	mu         sync.RWMutex
 
+	// untrackLaneWindowHook, when non-nil, runs inside UntrackRepo between the
+	// background-lane cancellation and the registry detach — the window where a
+	// concurrent census holding a pre-teardown roots snapshot can land its
+	// enqueue. Lifecycle tests use it to pin the hold-across-detach contract.
+	untrackLaneWindowHook func()
+
 	// repositoryMutations owns one stable mutation lane per repository prefix.
 	// The slot survives Indexer replacement so an explicit re-index cannot race
 	// an old watcher instance on a second lane.
@@ -3249,12 +3255,23 @@ func (mi *MultiIndexer) UntrackRepo(repoPrefix string) (int, int) {
 
 	// The background lane must not outlive the repository: a pending or
 	// in-flight drain would spawn a server at the abandoned root and write
-	// the purged repo's nodes back into the store. Cancel waits the drain
-	// out (all languages — the whole repo is going away) and purges its
-	// queued work; the restart census cannot resurrect it, since the repo
-	// leaves AllMetadata with this teardown.
+	// the purged repo's nodes back into the store. Cancellation alone is not
+	// enough — the repo stays registered until the detach below, so a
+	// concurrent census holding a pre-teardown roots snapshot can enqueue
+	// AFTER the purge and still pass the drain-time live-root check. Park
+	// the lane first (the dequeue gate skips held repos), then cancel: the
+	// cancel waits out in-flight drains (all languages — the whole repo is
+	// going away) and purges queued work, while the hold parks stragglers
+	// until this teardown returns with the registry entry detached — a
+	// parked task then drops at the resolver instead of resurrecting the
+	// repo.
 	if semMgr := mi.SemanticManager(); semMgr != nil {
+		release := semMgr.HoldBackgroundMutations(repoPrefix)
+		defer release()
 		semMgr.CancelBackgroundDrains(repoPrefix, nil)
+	}
+	if mi.untrackLaneWindowHook != nil {
+		mi.untrackLaneWindowHook() // test seam: the cancel-to-detach window
 	}
 
 	// The lane is now closed and drained, so no new admission can cross this

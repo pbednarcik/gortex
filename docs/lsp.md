@@ -402,7 +402,10 @@ mutation-requeued drain waits out a quiet period first (60s, slid forward
 by every further mutation), so an editing session coalesces into one
 drain after its last save instead of spawning and cancelling a server per
 batch. Untracking a repository cancels and discards its lane work
-outright — and every task is additionally validated against the live
+outright, and parks the lane for that repo until the teardown has
+detached the registry entry — a census holding a pre-teardown roots
+snapshot can otherwise enqueue after the purge and drain into the removed
+namespace. Every task is additionally validated against the live
 repository registry immediately before it drains, so a task for a repo
 that was untracked (or re-tracked at a different checkout) after the task
 was queued is dropped instead of spawning a server at an abandoned root.
