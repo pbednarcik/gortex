@@ -711,6 +711,16 @@ func terminalUnconfirmable(n *graph.Node) bool {
 	switch n.Name {
 	case "ToString", "GetHashCode", "Equals":
 		return true
+	case "GetFieldDeserializers":
+		// Kiota-generated IParsable member: every generated model class
+		// implements it, so the references up-symbol cascade gathers the
+		// entire generated API client before searching. Measured live on a
+		// generated swagger client: the cascade spun Roslyn for minutes
+		// per target (SymbolEquivalenceComparer recursion) and outlived
+		// the server. Kiota's name, nobody else's — the same
+		// name+kind+language contract as the object overrides above.
+		// Further generated-serializer names join ON MEASUREMENT only.
+		return true
 	}
 	return false
 }

@@ -374,7 +374,9 @@ lane variable is unset but the global `GORTEX_LSP_CALL_TIMEOUT` is set
 explicitly, the global bound applies to the lane too. One target class is
 never asked at all: C# object-override members (`ToString`, `GetHashCode`,
 `Equals`), whose references request degenerates into a solution-wide
-implicit-call search no finite budget converts. The drain skips them as
+implicit-call search no finite budget converts, and the Kiota-generated
+`GetFieldDeserializers` member, where the same cascade walks every
+generated model in an API client. The drain skips them as
 **terminal-unconfirmable** — their edges keep their static confidence, the
 skip is not an error, the completion marker may land over them, and the
 completion log counts them as `drain_skipped_terminal`.
