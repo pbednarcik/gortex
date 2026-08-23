@@ -1438,9 +1438,10 @@ func (p *Provider) EnrichRepoContext(ctx context.Context, g graph.Store, repoPre
 	// same document.
 	var confirmMu sync.Mutex
 	confirmPromotions := make(map[*graph.Edge]struct{})
-	// Confirm targets whose references verdict completed this pass — flushed
-	// with the promotions so the next drain's grouping skips them.
-	var refsStamped []*graph.Node
+	// Confirm targets whose references verdict completed this pass — IDs
+	// only, because the confirm loop resolves targets through the light
+	// location projection; the flush stamps full rows fetched fresh.
+	var refsVerdictIDs []string
 	// Confirm targets skipped by the terminal-unconfirmable policy (see
 	// terminalUnconfirmable) — surfaced on the completion log so a drain
 	// that leaves edges at the static tier says so.
@@ -1516,7 +1517,7 @@ func (p *Provider) EnrichRepoContext(ctx context.Context, g graph.Store, repoPre
 				refsByTarget := make(map[string]cachedRefs, len(grp.targets))
 				// Terminal targets adjudicated by policy this pass — they earn
 				// the refs verdict without a request.
-				terminalDone := map[string]*graph.Node{}
+				terminalDone := map[string]struct{}{}
 				for _, t := range grp.targets {
 					if targetedCtx.Err() != nil || targetedBreaker.isTripped() {
 						return
@@ -1531,7 +1532,7 @@ func (p *Provider) EnrichRepoContext(ctx context.Context, g graph.Store, repoPre
 					// stays clean.
 					if p.heavyDelta && terminalUnconfirmable(toNode) {
 						diagTerminalSkipped.Add(1)
-						terminalDone[t.edge.To] = toNode
+						terminalDone[t.edge.To] = struct{}{}
 						continue
 					}
 					line, ok := lspLine(toNode)
@@ -1578,26 +1579,18 @@ func (p *Provider) EnrichRepoContext(ctx context.Context, g graph.Store, repoPre
 				// edges never got their share of the cached answer. An errored
 				// fetch (cr.ok false) earns no verdict — it retries next drain.
 				if p.heavyDelta {
-					var done []*graph.Node
+					var done []string
 					for id, cr := range refsByTarget {
-						if !cr.ok {
-							continue
-						}
-						if n := view.nodesByID[id]; n != nil && !nodeRefsStamped(n) {
-							markNodeRefsStamped(n)
-							done = append(done, n)
+						if cr.ok {
+							done = append(done, id)
 						}
 					}
-					for _, n := range terminalDone {
-						if !nodeRefsStamped(n) {
-							markNodeRefsStamped(n)
-							done = append(done, n)
-						}
+					for id := range terminalDone {
+						done = append(done, id)
 					}
 					if len(done) > 0 {
-						diagRefsStamped.Add(int64(len(done)))
 						confirmMu.Lock()
-						refsStamped = append(refsStamped, done...)
+						refsVerdictIDs = append(refsVerdictIDs, done...)
 						confirmMu.Unlock()
 					}
 				}
@@ -1605,7 +1598,25 @@ func (p *Provider) EnrichRepoContext(ctx context.Context, g graph.Store, repoPre
 		}
 		wg.Wait()
 	}
-	if len(confirmPromotions) > 0 || len(refsStamped) > 0 {
+	if len(confirmPromotions) > 0 || len(refsVerdictIDs) > 0 {
+		// The confirm loop resolved its targets through the light location
+		// projection — persisting those view nodes would replace the full
+		// Meta blob and destroy every other stamp on the row (an
+		// already-swept target loses semantic_heavy and re-enters the
+		// frontier). Stamp freshly fetched full rows instead, exactly as
+		// the frontier recheck reads them.
+		var refsStamped []*graph.Node
+		if len(refsVerdictIDs) > 0 {
+			sort.Strings(refsVerdictIDs)
+			full := g.GetNodesByIDs(refsVerdictIDs)
+			for _, id := range refsVerdictIDs {
+				if n := full[id]; n != nil && !nodeRefsStamped(n) {
+					markNodeRefsStamped(n)
+					refsStamped = append(refsStamped, n)
+				}
+			}
+			diagRefsStamped.Add(int64(len(refsStamped)))
+		}
 		mutations := newLSPMutationBatch()
 		rmu.Lock()
 		for edge := range confirmPromotions {
