@@ -108,12 +108,20 @@ jobs:
       # filesystem path (filepath.Join / filepath.Clean) or a '/'-keyed store
       # path. ParseDiffGitPaths, ParseDiffLinesNewSide and FeedbackDir all
       # assert on native paths, so they belong here rather than nowhere.
+      # The path-domain contracts belong here for the same reason. A graph
+      # key is "<prefix>/" plus a native-separator remainder, so GraphKey,
+      # JoinFileNodes, the prefix-shadow end-to-end pair and RankFileRisk's
+      # per-domain normalization only diverge once '/' and the native
+      # separator differ — every one of them passes on the linux/macos
+      # matrix whatever the code does. internal/review joins the list
+      # because the file-risk normalizer lives there.
       - name: Test native-separator store path comparisons
         run: >
           go test -timeout=10m -count=1
-          -run 'NativeSeparator|MixedSeparator|ImportAdjacency|ParseDiffGitPaths|ParseDiffLinesNewSide|FeedbackDir'
+          -run 'NativeSeparator|MixedSeparator|ImportAdjacency|ParseDiffGitPaths|ParseDiffLinesNewSide|FeedbackDir|ReviewRulepack|PrefixedGraphReportsRulepack|GraphKey|JoinFileNodes|ChangedSymbolsForFiles|PrefixShadow|IdsOnPrefixedGraph|RankFileRisk|PrefixedDeleteAndRename'
           ./internal/analysis ./internal/graph/store_sqlite
           ./internal/mcp ./internal/resolver ./internal/persistence
+          ./internal/review
 
   build-linux-static:
     # The linux release ships a statically linked binary so it runs on any
