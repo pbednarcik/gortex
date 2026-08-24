@@ -136,6 +136,27 @@ func TestPhaseBreakerNonTimeoutFailuresDoNotFeedTimeoutArm(t *testing.T) {
 	}
 }
 
+// observeAnswered resets ONLY the timeout streak: a reply on an adjacent
+// request family (call-hierarchy legs share the sweep breaker with hover)
+// proves someone is answering NOW, but must not stand in for a success in
+// the zero-yield arm's accounting.
+func TestPhaseBreakerObserveAnsweredResetsTimeoutStreakOnly(t *testing.T) {
+	b := newPhaseBreaker(2, 3, nil, "sweep", "repo")
+	b.observeTimeout()
+	b.observeTimeout()
+	b.observeAnswered() // an answer arrived on an adjacent request family
+	b.observeTimeout()
+	b.observeTimeout()
+	if b.isTripped() {
+		t.Fatal("observeAnswered must reset the timeout streak")
+	}
+	b.observe(false)
+	b.observe(false)
+	if !b.isTripped() {
+		t.Fatal("observeAnswered must not disarm the zero-yield arm")
+	}
+}
+
 func TestPhaseBreakerTimeoutArmDisabled(t *testing.T) {
 	b := newPhaseBreaker(32, 0, nil, "targeted", "repo")
 	for i := 0; i < 50; i++ {

@@ -914,3 +914,109 @@ func TestLSP_Enrich_HeavyDelta_ErroredRefsTargetsRetryOnResume(t *testing.T) {
 	assert.Positive(t, drainOnceWithErroringRefs(),
 		"an errored target must be re-asked on resume, never stamped")
 }
+
+// wedgedDrainFixture builds one file of plain functions and their callers —
+// enough distinct nodes that grinding them all through a wedged server's
+// per-call budget is clearly distinguishable from a fast breaker trip. No
+// INFERRED edges: the confirm pass stays quiet, isolating the leg under test.
+func wedgedDrainFixture(t *testing.T, n int) (string, graph.Store) {
+	t.Helper()
+	repoRoot := t.TempDir()
+	var src strings.Builder
+	src.WriteString("package p\n\n")
+	g := graph.New()
+	line := 3
+	for i := 0; i < n; i++ {
+		fmt.Fprintf(&src, "func target%02d() {}\n\nfunc caller%02d() { target%02d() }\n\n", i, i, i)
+		g.AddNode(&graph.Node{ID: fmt.Sprintf("svc.go::target%02d", i), Kind: graph.KindFunction,
+			Name: fmt.Sprintf("target%02d", i), FilePath: "svc.go", StartLine: line, EndLine: line, Language: "go"})
+		g.AddNode(&graph.Node{ID: fmt.Sprintf("svc.go::caller%02d", i), Kind: graph.KindFunction,
+			Name: fmt.Sprintf("caller%02d", i), FilePath: "svc.go", StartLine: line + 2, EndLine: line + 2, Language: "go"})
+		line += 4
+	}
+	require.NoError(t, os.WriteFile(filepath.Join(repoRoot, "svc.go"), []byte(src.String()), 0o644))
+	return repoRoot, g
+}
+
+// The wedge is not references-specific: the sweep's call-hierarchy legs
+// (prepareCallHierarchy / incomingCalls) burn the same full per-call budget
+// on a wedged server, one node after another, with only the phase deadline
+// as a stop. They must feed the same timeout streak the confirm leg does.
+func TestLSP_Enrich_HeavyDelta_WedgedCallHierarchyTripsTimeoutBreaker(t *testing.T) {
+	t.Setenv(SweepEnv, "full") // every callable wants its incoming side
+	t.Setenv(HeavyRequestsEnv, "background")
+
+	const wedgeNodes = 12
+	repoRoot, g := wedgedDrainFixture(t, wedgeNodes)
+
+	server := newFakeLSPServer()
+	newHeavyDeltaRig(server.handle, repoRoot)
+	var prepCalls atomic.Int64
+	server.handle("textDocument/prepareCallHierarchy", func(json.RawMessage) (any, *jsonRPCError) {
+		if prepCalls.Add(1) == 1 {
+			return []CallHierarchyItem{}, nil // one clean answer, then the wedge
+		}
+		// Wedged-but-reading: replies land far beyond the caller's budget
+		// while the dispatch loop keeps consuming stdin.
+		time.Sleep(400 * time.Millisecond)
+		return []CallHierarchyItem{}, nil
+	})
+	p, cleanup := providerWithFakeServer(t, server, []string{"go"})
+	defer cleanup()
+	p.heavyDelta = true
+	p.noHeavyRequests = false
+	p.client.SetCallTimeout(80 * time.Millisecond)
+
+	start := time.Now()
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	res, err := p.EnrichRepoContext(ctx, g, "", repoRoot, nil)
+	require.NoError(t, err)
+	require.NotNil(t, res)
+	require.True(t, res.Partial, "a wedged call-hierarchy leg must never yield a clean drain")
+	require.Less(t, prepCalls.Load(), int64(wedgeNodes),
+		"the timeout streak must abandon the sweep instead of grinding every node through the budget")
+	require.Less(t, time.Since(start), 15*time.Second, "the trip must be fast")
+}
+
+// A references-capable server WITHOUT call hierarchy (e.g. intelephense)
+// takes referencesAddPass instead of the sweep's hierarchy legs — the same
+// exposure, one full budget per declaration, so the pass must ride the
+// targeted breaker's timeout arm.
+func TestLSP_Enrich_HeavyDelta_WedgedReferencesOnlyServerTripsTimeoutBreaker(t *testing.T) {
+	t.Setenv(SweepEnv, "")
+	t.Setenv(HeavyRequestsEnv, "background")
+
+	const wedgeNodes = 12
+	repoRoot, g := wedgedDrainFixture(t, wedgeNodes)
+
+	server := newFakeLSPServer()
+	newHeavyDeltaRig(server.handle, repoRoot)
+	var refCalls atomic.Int64
+	server.handle("textDocument/references", func(json.RawMessage) (any, *jsonRPCError) {
+		if refCalls.Add(1) == 1 {
+			return []Location{}, nil // one clean answer, then the wedge
+		}
+		time.Sleep(400 * time.Millisecond)
+		return []Location{}, nil
+	})
+	p, cleanup := providerWithFakeServer(t, server, []string{"go"})
+	defer cleanup()
+	// References only: no call-hierarchy capability routes the pass through
+	// referencesAddPass instead of the per-file sweep's hierarchy legs.
+	p.caps = ServerCapabilities{ReferencesProvider: true}
+	p.heavyDelta = true
+	p.noHeavyRequests = false
+	p.client.SetCallTimeout(80 * time.Millisecond)
+
+	start := time.Now()
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	res, err := p.EnrichRepoContext(ctx, g, "", repoRoot, nil)
+	require.NoError(t, err)
+	require.NotNil(t, res)
+	require.True(t, res.Partial, "a wedged references-add pass must never yield a clean drain")
+	require.Less(t, refCalls.Load(), int64(wedgeNodes),
+		"the timeout streak must abandon the pass instead of grinding every declaration through the budget")
+	require.Less(t, time.Since(start), 15*time.Second, "the trip must be fast")
+}
