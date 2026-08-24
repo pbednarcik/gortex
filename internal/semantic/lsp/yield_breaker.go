@@ -114,9 +114,11 @@ func (b *phaseBreaker) observe(success bool) {
 // streak, prior successes do NOT forgive here: this arm answers "is
 // anyone answering NOW". The failure mode it guards is a server that
 // worked and then wedged mid-pass — observed live as a Roslyn references
-// up-symbol cascade spinning forever on a generated-code whale while
-// $/cancelRequest was ignored, so every timed-out request left a zombie
-// computation and every server slot saturated. Each timeout costs a full
+// up-symbol cascade spinning forever on a generated-code whale, every
+// timed-out request leaving a zombie computation and every server slot
+// saturated. The client sends $/cancelRequest when a call burns its budget,
+// but whether a server actually aborts the work varies → the breaker still
+// guards the saturation case. Each timeout costs a full
 // per-call budget (minutes), so a small unbroken streak is proof enough;
 // any success (observe(true)) resets the streak.
 func (b *phaseBreaker) observeTimeout() {

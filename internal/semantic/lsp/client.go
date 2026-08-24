@@ -407,6 +407,17 @@ func (c *Client) Call(method string, params any, result any) error {
 	case <-c.done:
 		return fmt.Errorf("LSP server exited")
 	case <-timeout:
+		// Best-effort cancel: tell the server to stop computing the
+		// abandoned request ($/cancelRequest is base protocol — every
+		// server must tolerate it, though whether it aborts the work
+		// varies). Without it a slow server keeps burning CPU on an
+		// answer nobody will read, saturating its slots for minutes.
+		// Fire-and-forget on a goroutine: a server wedged hard enough
+		// to stop draining stdin must not turn the notify's blocking
+		// write into a second hang of the Call we are unblocking. The
+		// send error is ignored — the call is already failing with
+		// timeout, and a dead pipe must not mask that.
+		go func() { _ = c.Notify("$/cancelRequest", map[string]any{"id": id}) }()
 		return fmt.Errorf("LSP call %s: %w after %s", method, errCallTimeout, time.Duration(c.callTimeout.Load()))
 	}
 }
