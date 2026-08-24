@@ -134,6 +134,18 @@ func (b *phaseBreaker) observeTimeout() {
 	}
 }
 
+// observeAnswered resets ONLY the timeout streak: the caller saw a reply
+// on a request family whose successes do not belong to this phase's yield
+// accounting (the call-hierarchy legs share the sweep breaker with hover),
+// so it proves the server is answering NOW without standing in for a
+// success in the zero-yield arm.
+func (b *phaseBreaker) observeAnswered() {
+	if b == nil || b.tripped.Load() {
+		return
+	}
+	b.timeoutFails.Store(0)
+}
+
 func (b *phaseBreaker) isTripped() bool {
 	return b != nil && b.tripped.Load()
 }

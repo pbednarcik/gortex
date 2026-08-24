@@ -1845,7 +1845,7 @@ func (p *Provider) EnrichRepoContext(ctx context.Context, g graph.Store, repoPre
 	// a deadline cut sheds hover work, not the recall-bearing add.
 	if !p.noHeavyRequests &&
 		p.Supports("textDocument/references") && !p.Supports("textDocument/prepareCallHierarchy") {
-		p.referencesAddPass(targetedCtx, g, view, repoPrefix, absRoot, langNodes, rmu, session, result, drainErrs)
+		p.referencesAddPass(targetedCtx, g, view, repoPrefix, absRoot, langNodes, rmu, session, result, drainErrs, targetedBreaker)
 	}
 	refsAddDone := time.Now()
 
@@ -2133,7 +2133,7 @@ func (p *Provider) EnrichRepoContext(ctx context.Context, g graph.Store, repoPre
 			// preserves exactly one didOpen per file.
 			if callHierOK || typeHierOK {
 				for _, n := range ft.nodes {
-					if aborted.Load() || ctx.Err() != nil {
+					if aborted.Load() || ctx.Err() != nil || hoverBreaker.isTripped() {
 						break
 					}
 					line, ok := lspLine(n)
@@ -2175,6 +2175,9 @@ func (p *Provider) EnrichRepoContext(ctx context.Context, g graph.Store, repoPre
 						}
 						items, err := p.prepareCallHierarchy(absRoot, ft.rel, line, col)
 						if err != nil {
+							if isCallTimeout(err) {
+								hoverBreaker.observeTimeout()
+							}
 							if p.heavyDelta {
 								// Reaching here under heavyDelta means the
 								// incoming side was wanted — an errored
@@ -2183,6 +2186,7 @@ func (p *Provider) EnrichRepoContext(ctx context.Context, g graph.Store, repoPre
 							}
 							continue
 						}
+						hoverBreaker.observeAnswered()
 						for _, item := range items {
 							if !p.heavyDelta {
 								// heavyDelta: outgoing hops already ran in the
@@ -2198,6 +2202,7 @@ func (p *Provider) EnrichRepoContext(ctx context.Context, g graph.Store, repoPre
 								continue
 							}
 							if ins, ierr := p.incomingCalls(item); ierr == nil {
+								hoverBreaker.observeAnswered()
 								for _, ic := range ins {
 									cHops = append(cHops, callHop{n: n, other: ic.From, asOutgoing: false, fromRanges: ic.FromRanges})
 								}
@@ -2205,6 +2210,9 @@ func (p *Provider) EnrichRepoContext(ctx context.Context, g graph.Store, repoPre
 								// The node's incoming edges are still missing —
 								// a heavyDelta pass must not stamp it drained.
 								drainFailed = true
+								if isCallTimeout(ierr) {
+									hoverBreaker.observeTimeout()
+								}
 								if p.heavyDelta {
 									drainErrs.record(&drainErrs.incoming, "incoming", n.ID, ierr)
 								}
