@@ -453,7 +453,7 @@ func (e *Engine) FindUsagesScoped(nodeID string, opts QueryOptions) *SubGraph {
 			if opts.hasScopeFilter() && (from == nil || !opts.ScopeAllows(from)) {
 				continue
 			}
-			if opts.ExcludeTests && isTestSource(from) {
+			if opts.ExcludeTests && e.isTestSource(from) {
 				continue
 			}
 			filtered = append(filtered, edge)
@@ -1340,7 +1340,7 @@ func (e *Engine) bfs(nodeID string, opts QueryOptions, forward bool, edgeKinds [
 		}
 		// ExcludeTests drops neighbours flagged as tests during a reverse
 		// traversal — a no-op for forward/bidirectional walks.
-		if opts.ExcludeTests && !forward && !bidir && isTestSource(neighbor) {
+		if opts.ExcludeTests && !forward && !bidir && e.isTestSource(neighbor) {
 			return ""
 		}
 		// Workspace/project scope: neighbours outside the bound scope are
@@ -1365,8 +1365,17 @@ func (e *Engine) bfs(nodeID string, opts QueryOptions, forward bool, edgeKinds [
 	// round-trip — no GetNode per edge, no meta decode. Bidirectional
 	// (cluster) walks and capability-less backends (the in-memory graph,
 	// whose reads are already O(1)) keep the per-node path.
+	//
+	// Post-fetch filters also force the per-node path: the expander caps
+	// RAW rows per call, so a filter (test exclusion, workspace scope)
+	// could discard an entire raw page while eligible rows sit beyond
+	// the cap — starving the result and reporting it untruncated. The
+	// per-node walk filters before any cap and fetches to true
+	// exhaustion; it is the correctness oracle, same as the
+	// BFSCapable gate above.
 	expander, batched := e.g.(graph.FrontierExpander)
-	batched = batched && !bidir && len(edgeKinds) > 0
+	batched = batched && !bidir && len(edgeKinds) > 0 &&
+		!opts.ExcludeTests && !opts.hasScopeFilter()
 
 	frontier := []string{nodeID}
 	for depth := 0; depth < opts.Depth && len(frontier) > 0 && len(allNodes) < opts.Limit; depth++ {
@@ -1398,6 +1407,23 @@ func (e *Engine) bfs(nodeID string, opts QueryOptions, forward bool, edgeKinds [
 					edges = e.g.GetOutEdges(cur)
 				default:
 					edges = e.g.GetInEdges(cur)
+				}
+				// One deterministic admission order before the cap: the
+				// backends hand back raw edges in storage order (insertion
+				// vs kind-grouped), so without this sort a capped page's
+				// membership would depend on the storage engine and the
+				// graph's write history. Strongest evidence first — the
+				// same order the usage page cap consumes. Sorted only
+				// when this expansion can reach the cap: an uncapped
+				// expansion admits every eligible edge, so order cannot
+				// change membership and a hub's edge list is not worth
+				// E·log E comparator calls. Scope: this per-node path —
+				// the one post-fetch filters force onto every backend;
+				// the batched expander and BFSCapable fast paths keep
+				// their own store order. The backends return fresh
+				// slices, so the in-place sort is safe.
+				if opts.Limit > 0 && len(allNodes)+len(edges) >= opts.Limit {
+					SortEdgesForPage(edges)
 				}
 				for _, edge := range edges {
 					if !bidir && !kindSet[edge.Kind] {
@@ -1801,15 +1827,13 @@ func isCodeSymbolKind(n *graph.Node) bool {
 	return n != nil && (n.Kind == graph.KindFunction || n.Kind == graph.KindMethod)
 }
 
-// isTestSource reports whether a node was flagged as a test by the
-// indexer's test-edge pass. Used by QueryOptions.ExcludeTests to drop
-// callers/users that originate in tests, leaving production callers.
-func isTestSource(n *graph.Node) bool {
-	if n == nil || n.Meta == nil {
-		return false
-	}
-	v, _ := n.Meta["is_test"].(bool)
-	return v
+// isTestSource reports whether a node originates in test code. Used by
+// QueryOptions.ExcludeTests to drop callers/users that originate in
+// tests, leaving production callers. Delegates to the shared classifier
+// (see graph.NodeIsTest for the stamp → owner → path authority order),
+// so the filter and the output metadata can never disagree.
+func (e *Engine) isTestSource(n *graph.Node) bool {
+	return graph.NodeIsTest(e.g, n)
 }
 
 func dedup(edges []*graph.Edge) []*graph.Edge {
