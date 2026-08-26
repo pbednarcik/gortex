@@ -19,7 +19,6 @@ func (g *Graph) EvictFiles(filePaths []string) (nodesRemoved, edgesRemoved int) 
 	if receiptActive {
 		defer g.endReceiptMutation()
 	}
-	g.markMutationReceiptsIncomplete()
 	g.lockAllWrite()
 	defer g.unlockAllWrite()
 
@@ -32,6 +31,7 @@ func (g *Graph) EvictFiles(filePaths []string) (nodesRemoved, edgesRemoved int) 
 	if len(nodes) == 0 {
 		return 0, 0
 	}
+	g.recordEvictedNodesForReceipts(nodes)
 
 	evictedIDs := make(map[string]string, len(nodes))
 	for _, node := range nodes {

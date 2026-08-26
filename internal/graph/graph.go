@@ -3213,7 +3213,6 @@ func (g *Graph) EvictFile(filePath string) (nodesRemoved, edgesRemoved int) {
 	if receiptActive {
 		defer g.endReceiptMutation()
 	}
-	g.markMutationReceiptsIncomplete()
 	g.lockAllWrite()
 	defer g.unlockAllWrite()
 
@@ -3225,6 +3224,7 @@ func (g *Graph) EvictFile(filePath string) (nodesRemoved, edgesRemoved int) {
 	if len(nodes) == 0 {
 		return 0, 0
 	}
+	g.recordEvictedNodesForReceipts(nodes)
 	// id → source-repo captured BEFORE we delete the node from
 	// s.nodes; evictEdgesLocked needs the repo to debit per-repo
 	// edge counters and the live node would already be gone.

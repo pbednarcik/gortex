@@ -858,6 +858,10 @@ func (mi *MultiIndexer) resolveDeferredMutations(receipt *graph.MutationReceipt,
 
 		if receipt.ResolutionRelevant {
 			mi.runMasterResolveFiles(resolutionFiles, false)
+			// Evicted definitions' pending references live outside the file
+			// frontier (their name is no longer declared in any frontier
+			// file); rebind them by the names the receipt recorded.
+			mi.runMasterResolveNames(receipt.TargetNames)
 		}
 		// Resolve only files that can create or bind unresolved edges. Resolved
 		// edge sources still materialise their cross_repo_* generation without
@@ -968,6 +972,34 @@ func (mi *MultiIndexer) runMasterResolveFiles(files []string, useLSP bool) {
 		zap.Int("files", len(files)),
 		zap.Int("pending_scanned", stats.PendingBefore),
 		zap.Int("pending_admitted", stats.PendingAfter))
+}
+
+// runMasterResolveNames rebinds pending references parked under the given
+// symbol names' unresolved stubs, across every tracked repo prefix plus the
+// bare single-repo form. Companion to runMasterResolveFiles for the
+// receipt-exact path: an evicted definition's pending references are reachable
+// by name only, never by file frontier.
+func (mi *MultiIndexer) runMasterResolveNames(names []string) {
+	if len(names) == 0 {
+		return
+	}
+	master := mi.newMasterResolver(false)
+	if master == nil {
+		return
+	}
+	prefixes := make([]string, 0, len(mi.indexers))
+	for prefix := range mi.indexers {
+		if prefix != "" {
+			prefixes = append(prefixes, prefix)
+		}
+	}
+	sort.Strings(prefixes)
+	mt := time.Now()
+	stats := master.ResolveIncomingForNames(names, prefixes)
+	mi.logger.Info("DEFERRED-TIMING master.ResolveIncomingForNames",
+		zap.Duration("elapsed", time.Since(mt)),
+		zap.Int("names", len(names)),
+		zap.Int("resolved", stats.Resolved))
 }
 
 // RunPreEnrichResolve runs the resolution stage that makes references queryable

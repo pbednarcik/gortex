@@ -2896,6 +2896,54 @@ func (r *Resolver) ResolveIncomingForFile(filePath string) *ResolveStats {
 	return stats
 }
 
+// ResolveIncomingForNames rebinds the pending references parked under the
+// given symbol names' unresolved stubs, probing the bare and the
+// `<repoPrefix>::` multi-repo stub forms for every supplied prefix. The
+// receipt-exact eviction path records the names whose definitions were
+// removed; their pending references live OUTSIDE any file frontier (the
+// definition's file no longer declares the name, so a file-scoped incoming
+// pass never enumerates its stub) and were previously retried only by the
+// whole-graph fallback the exact receipt now avoids. The gates are unchanged:
+// resolveEdge refuses ambiguity identically here, so a name whose surviving
+// candidates are still ambiguous binds no differently and stays pending.
+func (r *Resolver) ResolveIncomingForNames(names, repoPrefixes []string) *ResolveStats {
+	stats := &ResolveStats{}
+	if len(names) == 0 {
+		return stats
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	clear := r.buildPassIndexes()
+	defer clear()
+
+	seen := make(map[string]struct{}, len(names))
+	var stubKeys []string
+	appendKey := func(key string) {
+		if _, duplicate := seen[key]; duplicate {
+			return
+		}
+		seen[key] = struct{}{}
+		stubKeys = append(stubKeys, key)
+	}
+	for _, name := range names {
+		if name == "" {
+			continue
+		}
+		appendKey(graph.UnresolvedMarker + name)
+		for _, prefix := range repoPrefixes {
+			if prefix != "" {
+				appendKey(prefix + "::" + graph.UnresolvedMarker + name)
+			}
+		}
+	}
+	if len(stubKeys) == 0 {
+		return stats
+	}
+	r.resolveIncomingStubKeysLocked(stubKeys, stats)
+	return stats
+}
+
 // resolveIncomingLocked is the core of the reverse pass. Caller holds
 // r.mu and has built the per-pass indexes. For each distinct
 // referenceable symbol name defined in filePath it looks up the pending

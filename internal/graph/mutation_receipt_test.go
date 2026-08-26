@@ -153,3 +153,74 @@ func assertReceiptContains(t *testing.T, label string, got []string, want ...str
 		}
 	}
 }
+
+func TestMutationReceiptEvictFilesCapturesExactFrontier(t *testing.T) {
+	g := New()
+	g.AddBatch([]*Node{
+		{ID: "repo/a.go::A", Kind: KindFunction, Name: "A", QualName: "pkg.A", FilePath: "a.go", RepoPrefix: "repo"},
+		{ID: "repo/b.go::B", Kind: KindType, Name: "B", FilePath: "b.go", RepoPrefix: "repo"},
+		{ID: "repo/keep.go::Keep", Kind: KindFunction, Name: "Keep", FilePath: "keep.go", RepoPrefix: "repo"},
+	}, []*Edge{{From: "repo/keep.go::Keep", To: "repo/a.go::A", Kind: EdgeCalls, FilePath: "keep.go", Line: 3}})
+
+	token := g.BeginMutationReceipt()
+	nodes, edges := g.EvictFiles([]string{"a.go", "b.go"})
+	receipt := g.EndMutationReceipt(token)
+
+	if nodes != 2 || edges != 1 {
+		t.Fatalf("EvictFiles removed nodes=%d edges=%d, want 2/1", nodes, edges)
+	}
+	if !receipt.Complete || !receipt.ResolutionRelevant {
+		t.Fatalf("EvictFiles receipt = %+v, want complete exact eviction frontier", receipt)
+	}
+	if want := []string{"a.go", "b.go"}; !slices.Equal(receipt.DefinitionFiles, want) {
+		t.Fatalf("definition files = %v, want %v", receipt.DefinitionFiles, want)
+	}
+	assertReceiptContains(t, "target names", receipt.TargetNames, "A", "pkg.A", "B")
+	assertReceiptContains(t, "target ids", receipt.TargetIDs, "repo/a.go::A", "repo/b.go::B")
+	assertReceiptContains(t, "changed files", receipt.ChangedFiles, "a.go", "b.go")
+	if slices.Contains(receipt.DefinitionFiles, "keep.go") {
+		t.Fatalf("unrelated file leaked into definition frontier: %+v", receipt)
+	}
+}
+
+func TestMutationReceiptEvictFileCapturesExactFrontier(t *testing.T) {
+	g := New()
+	g.AddNode(&Node{ID: "repo/a.go::A", Kind: KindFunction, Name: "A", FilePath: "a.go", RepoPrefix: "repo"})
+
+	token := g.BeginMutationReceipt()
+	nodes, _ := g.EvictFile("a.go")
+	receipt := g.EndMutationReceipt(token)
+
+	if nodes != 1 {
+		t.Fatalf("EvictFile nodes = %d, want 1", nodes)
+	}
+	if !receipt.Complete || !receipt.ResolutionRelevant {
+		t.Fatalf("EvictFile receipt = %+v, want complete exact eviction frontier", receipt)
+	}
+	if want := []string{"a.go"}; !slices.Equal(receipt.DefinitionFiles, want) {
+		t.Fatalf("definition files = %v, want %v", receipt.DefinitionFiles, want)
+	}
+
+	noop := g.BeginMutationReceipt()
+	g.EvictFile("missing.go")
+	if receipt := g.EndMutationReceipt(noop); !receipt.Complete || receipt.ResolutionRelevant {
+		t.Fatalf("no-op EvictFile receipt = %+v, want complete and neutral", receipt)
+	}
+}
+
+func TestMutationReceiptEvictFilesNonreferenceableOnlyStaysNeutral(t *testing.T) {
+	g := New()
+	g.AddNode(&Node{ID: "repo/doc::note", Kind: KindImport, Name: "note", FilePath: "doc.md", RepoPrefix: "repo"})
+
+	token := g.BeginMutationReceipt()
+	g.EvictFiles([]string{"doc.md"})
+	receipt := g.EndMutationReceipt(token)
+
+	if !receipt.Complete {
+		t.Fatalf("non-referenceable eviction receipt incomplete (%q): %+v", receipt.IncompleteReason, receipt)
+	}
+	if receipt.ResolutionRelevant || len(receipt.ResolutionFiles()) != 0 {
+		t.Fatalf("non-referenceable eviction entered the resolution frontier: %+v", receipt)
+	}
+	assertReceiptContains(t, "changed files", receipt.ChangedFiles, "doc.md")
+}

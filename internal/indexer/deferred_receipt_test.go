@@ -280,3 +280,30 @@ func TestResolveDeferredMutationsIncompleteReceiptFallsBackWhenNoUnresolvedWrite
 		t.Fatalf("fallback edge target = %q, want b.go::Target", edge.To)
 	}
 }
+
+// The reviewer scenario for receipt-exact evictions: a pending reference in a
+// file OUTSIDE every receipt frontier names an evicted definition. The evicted
+// file is empty post-eviction, so the file-scoped pass cannot reach the
+// pending edge; only the receipt's TargetNames can. Before the names pass the
+// whole-graph fallback healed this shape on every wave.
+func TestResolveDeferredMutationsExactReceiptRebindsEvictedNamePendings(t *testing.T) {
+	store, edge := deferredReceiptFixture()
+	mi := &MultiIndexer{graph: store, logger: zap.NewNop()}
+	receipt := &graph.MutationReceipt{
+		Complete:           true,
+		ResolutionRelevant: true,
+		DefinitionFiles:    []string{"gone.go"},
+		TargetNames:        []string{"Target"},
+	}
+
+	mode, complete := mi.resolveDeferredMutations(receipt, false, nil, false)
+	if mode != deferredResolveExact || !complete {
+		t.Fatalf("mode = %q complete=%v, want %q exact", mode, complete, deferredResolveExact)
+	}
+	if got := store.unresolvedScans.Load(); got != 0 {
+		t.Fatalf("exact path performed %d whole unresolved scans", got)
+	}
+	if edge.To != "b.go::Target" {
+		t.Fatalf("name-parked pending edge target = %q, want b.go::Target (rebound via receipt TargetNames)", edge.To)
+	}
+}

@@ -294,6 +294,49 @@ func (g *Graph) recordAddedEdgeForReceipts(e *Edge, exactFile string) {
 	}
 }
 
+// recordEvictedNodesForReceipts describes a bounded file-scoped eviction to
+// active receipts exactly instead of failing them closed. An evicted
+// referenceable definition is resolution-relevant the same way an added one
+// is: pending references naming it elsewhere may resolve differently once it
+// is gone (and in the evict-then-readd reindex flow the re-add records the
+// successor identity), so its file joins the definition frontier and its
+// names join the target set.
+func (g *Graph) recordEvictedNodesForReceipts(nodes []*Node) {
+	if len(nodes) == 0 || g.mutationReceipts.activeCount.Load() == 0 {
+		return
+	}
+	g.mutationReceipts.mu.Lock()
+	defer g.mutationReceipts.mu.Unlock()
+	for _, acc := range g.mutationReceipts.active {
+		for _, n := range nodes {
+			if n == nil {
+				continue
+			}
+			if n.FilePath != "" {
+				acc.changedFiles[n.FilePath] = struct{}{}
+			}
+			if !IsReferenceableSymbol(n.Kind) {
+				continue
+			}
+			acc.resolutionRelevant = true
+			if n.ID != "" {
+				acc.targetIDs[n.ID] = struct{}{}
+			}
+			if n.Name != "" {
+				acc.targetNames[n.Name] = struct{}{}
+			}
+			if n.QualName != "" {
+				acc.targetNames[n.QualName] = struct{}{}
+			}
+			if n.FilePath != "" {
+				acc.definitionFiles[n.FilePath] = struct{}{}
+			} else {
+				acc.noteIncomplete("evicted_node_without_exact_file")
+			}
+		}
+	}
+}
+
 func (g *Graph) markMutationReceiptsIncomplete() {
 	if g.mutationReceipts.activeCount.Load() == 0 {
 		return
