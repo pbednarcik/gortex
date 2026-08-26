@@ -285,6 +285,19 @@ func (f *fakeRouter) ReleaseSpecWorkspace(name, workspace string) {
 	f.calls = append(f.calls, "ReleaseSpecWorkspace:"+name)
 }
 
+// PeekProviderForSpec is the spawn-free census path (backgroundPeekRouter).
+func (f *fakeRouter) PeekProviderForSpec(name string) (Provider, error) {
+	f.calls = append(f.calls, "PeekProviderForSpec:"+name)
+	if err, ok := f.providerErrs[name]; ok {
+		return nil, err
+	}
+	p, ok := f.providers[name]
+	if !ok {
+		return nil, assertionError("no provider for spec " + name)
+	}
+	return p, nil
+}
+
 func (f *fakeRouter) MaxAlive() int {
 	f.calls = append(f.calls, "MaxAlive")
 	return f.maxAlive

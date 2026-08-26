@@ -131,6 +131,134 @@ func (idx *Indexer) reindexIncrementalFilesBatched(
 	return invalidation, reparsed, retryFailed, versionChanged
 }
 
+// mutationBackgroundLanguages collects the languages of the graph nodes the
+// given canonical graph paths currently hold — exactly the languages whose
+// background drains conflict with a mutation of those files. Graph-derived
+// on purpose: a brand-new file has no rows a drain could clobber, and a
+// deleted file's rows (which an in-flight drain could resurrect after the
+// eviction) are still readable before the eviction runs.
+func (idx *Indexer) mutationBackgroundLanguages(graphPaths []string) []string {
+	if len(graphPaths) == 0 {
+		return nil
+	}
+	seen := map[string]bool{}
+	var langs []string
+	for _, nodes := range idx.graph.GetFileNodesByPaths(graphPaths) {
+		for _, n := range nodes {
+			if n == nil || n.Language == "" || seen[n.Language] {
+				continue
+			}
+			seen[n.Language] = true
+			langs = append(langs, n.Language)
+		}
+	}
+	sort.Strings(langs)
+	return langs
+}
+
+// backgroundLaneBracket is one repository mutation's guard against the
+// background lane. The store's node upsert is whole-row last-writer-wins,
+// so a drain flushing its stale node copies behind the mutation would
+// clobber fresh rows (or resurrect an evicted file's) and stamp state it
+// never visited — and a drain STARTING mid-mutation is just as wrong as
+// one already running.
+//
+// The bracket is three moves, in order:
+//
+//  1. HOLD (beginBackgroundLaneBracket, before the topology gate): the
+//     repo's tasks park at the scheduler's dequeue gate. This catches the
+//     triggers the mutation itself creates — above all its semantic
+//     tail's pass-end enqueue, which is born cooldown-free and which
+//     cancellation cannot touch because it does not exist yet.
+//  2. CANCEL (before the first store write): wait out in-flight drains of
+//     exactly the languages whose rows the mutation replaces. Caller
+//     paths that already resolve to graph rows cancel up front, before
+//     the gate, so the wait never blocks readers; directories, brand-new
+//     files, and the nil full-root walk resolve to nothing here and are
+//     cancelled precisely by cancelForFiles once classification has
+//     produced the real stale/deleted set — a zero-change walk therefore
+//     cancels nothing and leaves the active drain untouched.
+//  3. FINISH (deferred at the executor, LIFO after its other defers):
+//     revoke the drained claims of the cancelled languages and re-enter
+//     the repo (cooldown-slid onto any parked pass-end task), then
+//     release the hold. Order matters: releasing first would let the
+//     parked cooldown-free task dequeue before the requeue slides it.
+//     A mutation that cancelled nothing revokes nothing — the fast
+//     tier's own marker movement re-arms the lane for genuinely new
+//     state.
+type backgroundLaneBracket struct {
+	idx     *Indexer
+	release func()
+	langs   map[string]bool
+}
+
+// beginBackgroundLaneBracket opens the bracket: hold first, then the
+// fast-path cancel for caller paths that already resolve to graph rows
+// (reindex-shaped: absolute or root-relative; directories and nil resolve
+// to nothing and wait for cancelForFiles). Never returns nil — inert when
+// the lane cannot be running at all.
+func (idx *Indexer) beginBackgroundLaneBracket(files []string) *backgroundLaneBracket {
+	b := &backgroundLaneBracket{idx: idx}
+	if idx.semanticMgr == nil || !idx.semanticMgr.Enabled() {
+		return b
+	}
+	b.release = idx.semanticMgr.HoldBackgroundMutations(idx.repoPrefix)
+	if len(files) > 0 {
+		b.cancelLangs(idx.mutationBackgroundLanguages(idx.graphFilePaths(files)))
+	}
+	return b
+}
+
+// cancelForFiles cancels the drains of the languages the classified
+// stale/deleted sets actually touch. Called by the engine after
+// classification, immediately before its first store write; languages the
+// bracket already cancelled are not cancelled twice.
+func (b *backgroundLaneBracket) cancelForFiles(staleFiles, deletedFiles []string) {
+	if b == nil || b.release == nil || len(staleFiles)+len(deletedFiles) == 0 {
+		return
+	}
+	paths := append(append([]string(nil), staleFiles...), deletedFiles...)
+	b.cancelLangs(b.idx.mutationBackgroundLanguages(b.idx.graphFilePaths(paths)))
+}
+
+func (b *backgroundLaneBracket) cancelLangs(langs []string) {
+	var fresh []string
+	for _, l := range langs {
+		if !b.langs[l] {
+			fresh = append(fresh, l)
+		}
+	}
+	if len(fresh) == 0 {
+		return
+	}
+	if b.langs == nil {
+		b.langs = map[string]bool{}
+	}
+	for _, l := range fresh {
+		b.langs[l] = true
+	}
+	b.idx.semanticMgr.CancelBackgroundDrains(b.idx.repoPrefix, fresh)
+}
+
+// finish closes the bracket: requeue what was cancelled, then release the
+// hold. For the executor's defer; safe on an inert bracket.
+func (b *backgroundLaneBracket) finish() {
+	if b == nil {
+		return
+	}
+	if len(b.langs) > 0 {
+		langs := make([]string, 0, len(b.langs))
+		for l := range b.langs {
+			langs = append(langs, l)
+		}
+		sort.Strings(langs)
+		b.idx.semanticMgr.RequeueBackgroundForRepo(b.idx.graph, b.idx.repoPrefix, b.idx.rootPath, langs)
+	}
+	if b.release != nil {
+		b.release()
+	}
+}
+
 func (idx *Indexer) reindexIncrementalStalePass(
 	files []string,
 	markerBatch *reparsePendingEnrichmentBatch,

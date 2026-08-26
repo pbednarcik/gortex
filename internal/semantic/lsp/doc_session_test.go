@@ -74,6 +74,7 @@ func TestLSP_Enrich_SessionSharedAcrossPasses(t *testing.T) {
 // definition answers with the callee, so all sites confirm off one open of
 // a.go. Total didOpens stay at two files: a.go (fallback) and b.go (confirm).
 func TestLSP_Enrich_FallbackRebindOpensSiteFileOnce(t *testing.T) {
+	t.Setenv(HeavyRequestsEnv, "")
 	repoRoot := t.TempDir()
 	require.NoError(t, os.WriteFile(
 		filepath.Join(repoRoot, "a.go"),
