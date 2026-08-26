@@ -4,6 +4,9 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"os"
+	"strconv"
+	"strings"
 	"time"
 
 	"go.uber.org/zap"
@@ -34,6 +37,28 @@ const backgroundMarkerSuffix = "-background"
 // The lane optimizes for non-interference, not throughput — the resolved
 // foreground width applies only when it is smaller.
 const backgroundLaneMaxParallel = 4
+
+// laneMaxParallelEnv overrides the lane clamp outright, mirroring what
+// GORTEX_LSP_MAX_PARALLEL does for the foreground width (and the lane's
+// own GORTEX_LSP_LANE_CALL_TIMEOUT naming). The clamp trades drain
+// throughput for non-interference on a default machine; an operator who
+// has measured that their server converts width into wall time — a full
+// re-drain after a store rebuild is width-bound end to end — raises it
+// here without widening the foreground. Zero, negative, or unparseable
+// values are ignored, exactly as the foreground env treats them.
+const laneMaxParallelEnv = "GORTEX_LSP_LANE_MAX_PARALLEL"
+
+// resolveLaneMaxParallel applies the operator override or the
+// non-interference clamp to the lane instance's inherited width.
+func resolveLaneMaxParallel(inherited int) int {
+	if v, err := strconv.Atoi(strings.TrimSpace(os.Getenv(laneMaxParallelEnv))); err == nil && v > 0 {
+		return v
+	}
+	if inherited > backgroundLaneMaxParallel {
+		return backgroundLaneMaxParallel
+	}
+	return inherited
+}
 
 // HasBackgroundWork reports whether the repo has an undrained deferred
 // tier. Cheap by design (two marker reads): node-level resume lives in the
@@ -224,9 +249,7 @@ func (p *Provider) newLaneProvider() (*Provider, error) {
 	if p.maxParallel > 0 {
 		lane.maxParallel = p.maxParallel
 	}
-	if lane.maxParallel > backgroundLaneMaxParallel {
-		lane.maxParallel = backgroundLaneMaxParallel
-	}
+	lane.maxParallel = resolveLaneMaxParallel(lane.maxParallel)
 	return lane, nil
 }
 
