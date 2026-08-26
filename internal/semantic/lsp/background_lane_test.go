@@ -199,6 +199,38 @@ func TestLSPProvider_LaneInheritsForegroundConfig(t *testing.T) {
 	assert.Equal(t, backgroundLaneMaxParallel, lane.maxParallel, "the lane cap bounds a wide foreground width")
 }
 
+// GORTEX_LSP_LANE_MAX_PARALLEL lets an operator override the lane's
+// non-interference clamp the same way GORTEX_LSP_MAX_PARALLEL overrides
+// the foreground width — measured on this machine, csharp-ls converts a
+// wider drain directly into confirm-phase wall time. The env wins in both
+// directions; zero, negative, or unparseable values keep the clamp.
+func TestLSPProvider_LaneMaxParallelEnvOverridesClamp(t *testing.T) {
+	spec := SpecByName("omnisharp")
+	require.NotNil(t, spec)
+
+	p := NewProvider("fake-lsp", nil, []string{"go"}, false, 2, nil)
+	p.spec = spec
+
+	p.maxParallel = 16
+	t.Setenv("GORTEX_LSP_LANE_MAX_PARALLEL", "16")
+	lane, err := p.newLaneProvider()
+	require.NoError(t, err)
+	assert.Equal(t, 16, lane.maxParallel, "the env override must lift the lane clamp")
+
+	t.Setenv("GORTEX_LSP_LANE_MAX_PARALLEL", "2")
+	lane, err = p.newLaneProvider()
+	require.NoError(t, err)
+	assert.Equal(t, 2, lane.maxParallel, "the env override must also lower the lane width")
+
+	for _, v := range []string{"0", "-3", "wide"} {
+		t.Setenv("GORTEX_LSP_LANE_MAX_PARALLEL", v)
+		lane, err = p.newLaneProvider()
+		require.NoError(t, err)
+		assert.Equal(t, backgroundLaneMaxParallel, lane.maxParallel,
+			"an ignored override value (%q) must keep the clamp", v)
+	}
+}
+
 // newLaneProvider builds the drain instance by copying configuration
 // field-by-field — the classic source of "a new Provider field silently
 // never reaches the lane" (it happened twice already: the lane dropped the
@@ -219,7 +251,7 @@ func TestLSPProvider_NewLaneProvider_FieldInventoryPinned(t *testing.T) {
 		"excludeGlobs":     "inherited",
 		"sweepMode":        "inherited",
 		"opensDocs":        "inherited",
-		"maxParallel":      "inherited", // foreground width, capped at backgroundLaneMaxParallel
+		"maxParallel":      "inherited", // foreground width, capped at backgroundLaneMaxParallel unless GORTEX_LSP_LANE_MAX_PARALLEL overrides
 
 		"heavyDelta":      "overridden", // true: the drain runs only the deferred classes
 		"noHeavyRequests": "overridden", // false: the drain exists to run them
