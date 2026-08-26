@@ -170,6 +170,7 @@ func TestLSP_Enrich_IncomingSkippedForPlainStaticFunction(t *testing.T) {
 // concrete callers. Both outgoing and incoming are fetched even under the
 // demand default.
 func TestLSP_Enrich_IncomingFetchedForDispatchMethod(t *testing.T) {
+	t.Setenv(HeavyRequestsEnv, "")
 	t.Setenv(SweepEnv, "") // demand default
 
 	repoRoot := t.TempDir()
@@ -203,6 +204,7 @@ func TestLSP_Enrich_IncomingFetchedForDispatchMethod(t *testing.T) {
 // A full sweep fetches incoming calls unconditionally, even for a plain static
 // function the demand default would skip.
 func TestLSP_Enrich_IncomingFetchedInFullMode(t *testing.T) {
+	t.Setenv(HeavyRequestsEnv, "")
 	t.Setenv(SweepEnv, "full")
 
 	repoRoot := t.TempDir()

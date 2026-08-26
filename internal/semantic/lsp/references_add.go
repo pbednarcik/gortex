@@ -28,7 +28,7 @@ import (
 // rmu as soon as its references land, so a deadline cut loses only the
 // unvisited remainder. Runs under the caller's targeted context (the same
 // budget the confirm pass uses), before the per-file hover sweep.
-func (p *Provider) referencesAddPass(ctx context.Context, g graph.Store, view *lspGraphView, repoPrefix, absRoot string, langNodes []*graph.Node, rmu sync.Locker, session *docSession, result *semantic.EnrichResult) {
+func (p *Provider) referencesAddPass(ctx context.Context, g graph.Store, view *lspGraphView, repoPrefix, absRoot string, langNodes []*graph.Node, rmu sync.Locker, session *docSession, result *semantic.EnrichResult, drainErrs *drainErrorLedger, breaker *phaseBreaker) {
 	targets := selectReferencesAddTargets(view, langNodes)
 	if len(targets) == 0 {
 		return
@@ -44,7 +44,7 @@ func (p *Provider) referencesAddPass(ctx context.Context, g graph.Store, view *l
 	mutations := newLSPMutationBatch()
 
 	for _, n := range targets {
-		if ctx.Err() != nil {
+		if ctx.Err() != nil || breaker.isTripped() {
 			break
 		}
 		line, ok := lspLine(n)
@@ -57,12 +57,25 @@ func (p *Provider) referencesAddPass(ctx context.Context, g graph.Store, view *l
 		}
 		content, release, err := session.acquire(p.client, filepath.Join(absRoot, rel))
 		if err != nil {
+			// For a references-only server this pass IS the deferred tier:
+			// an error-shaped skip here must reach the drain ledger, or a
+			// lane drain reports clean and records its completion marker
+			// over targets that were never asked.
+			drainErrs.record(&drainErrs.confirmAcquire, "refs-add-acquire", rel, err)
 			continue
 		}
 		col := identifierColumn(content, n.StartLine, n.Name)
 		refs, err := p.findReferences(absRoot, rel, line, col)
 		release()
-		if err != nil || len(refs) == 0 {
+		breaker.observe(err == nil)
+		if err != nil {
+			if isCallTimeout(err) {
+				breaker.observeTimeout()
+			}
+			drainErrs.record(&drainErrs.references, "refs-add", n.ID, err)
+			continue
+		}
+		if len(refs) == 0 {
 			continue
 		}
 
