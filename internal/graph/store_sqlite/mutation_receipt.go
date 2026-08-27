@@ -248,6 +248,13 @@ func recordSQLiteAddedEdge(acc *sqliteMutationReceiptAccumulator, e *graph.Edge,
 		return
 	}
 	acc.resolutionRelevant = true
+	if graph.HasRestubProvenance(e) {
+		// A restubbed surviving edge is rebound by the incoming/name
+		// frontier, which restores its stashed provenance; its source file
+		// must not join UnresolvedFiles, or the forward file pass
+		// re-resolves it first and the restored tier is lost.
+		return
+	}
 	if exactFile != "" {
 		acc.unresolvedFiles[exactFile] = struct{}{}
 	} else {

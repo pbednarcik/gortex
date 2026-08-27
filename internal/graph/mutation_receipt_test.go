@@ -162,12 +162,21 @@ func TestMutationReceiptEvictFilesCapturesExactFrontier(t *testing.T) {
 		{ID: "repo/keep.go::Keep", Kind: KindFunction, Name: "Keep", FilePath: "keep.go", RepoPrefix: "repo"},
 	}, []*Edge{{From: "repo/keep.go::Keep", To: "repo/a.go::A", Kind: EdgeCalls, FilePath: "keep.go", Line: 3}})
 
+	// Mirror the reindex composition: the surviving caller's edge is parked
+	// under an unresolved stub BEFORE the eviction, so no resolved incoming
+	// edge from a surviving source is deleted and the receipt can stay exact.
 	token := g.BeginMutationReceipt()
+	in := g.GetInEdgesByNodeIDs([]string{"repo/a.go::A"})
+	stub := in["repo/a.go::A"][0]
+	oldTo := stub.To
+	StashRestubProvenance(stub)
+	stub.To = UnresolvedMarker + "A"
+	g.ReindexEdges([]EdgeReindex{{Edge: stub, OldTo: oldTo}})
 	nodes, edges := g.EvictFiles([]string{"a.go", "b.go"})
 	receipt := g.EndMutationReceipt(token)
 
-	if nodes != 2 || edges != 1 {
-		t.Fatalf("EvictFiles removed nodes=%d edges=%d, want 2/1", nodes, edges)
+	if nodes != 2 || edges != 0 {
+		t.Fatalf("EvictFiles removed nodes=%d edges=%d, want 2/0 (the restubbed edge no longer touches the doomed nodes)", nodes, edges)
 	}
 	if !receipt.Complete || !receipt.ResolutionRelevant {
 		t.Fatalf("EvictFiles receipt = %+v, want complete exact eviction frontier", receipt)
@@ -223,4 +232,113 @@ func TestMutationReceiptEvictFilesNonreferenceableOnlyStaysNeutral(t *testing.T)
 		t.Fatalf("non-referenceable eviction entered the resolution frontier: %+v", receipt)
 	}
 	assertReceiptContains(t, "changed files", receipt.ChangedFiles, "doc.md")
+}
+
+// A restub write — a surviving caller's edge parked under an unresolved stub
+// by the re-parse flow, carrying the stashed provenance — must not enter
+// UnresolvedFiles: the forward file pass re-resolves without restoring the
+// stash (demoting the tier), while the name/incoming frontier restores it.
+// The stub still marks the receipt resolution-relevant and contributes its
+// name so that frontier runs.
+func TestMutationReceiptRestubWriteStaysOutOfUnresolvedFiles(t *testing.T) {
+	g := New()
+	def := &Node{ID: "repo/a.go::A", Kind: KindFunction, Name: "A", QualName: "pkg.A", FilePath: "a.go", RepoPrefix: "repo"}
+	caller := &Node{ID: "repo/keep.go::Keep", Kind: KindFunction, Name: "Keep", FilePath: "keep.go", RepoPrefix: "repo"}
+	e := &Edge{From: caller.ID, To: def.ID, Kind: EdgeCalls, FilePath: "keep.go", Line: 3, Origin: OriginLSPResolved, Confidence: 1}
+	g.AddBatch([]*Node{def, caller}, []*Edge{e})
+
+	token := g.BeginMutationReceipt()
+	oldTo := e.To
+	StashRestubProvenance(e)
+	e.To = UnresolvedMarker + "A"
+	g.ReindexEdges([]EdgeReindex{{Edge: e, OldTo: oldTo}})
+	receipt := g.EndMutationReceipt(token)
+
+	if !receipt.Complete {
+		t.Fatalf("restub write must not void the receipt: %+v", receipt)
+	}
+	if !receipt.ResolutionRelevant {
+		t.Fatalf("a parked stub still needs the name frontier: %+v", receipt)
+	}
+	if slices.Contains(receipt.UnresolvedFiles, "keep.go") {
+		t.Fatalf("restubbed caller file leaked into UnresolvedFiles (forward pass would demote its tier): %+v", receipt)
+	}
+	assertReceiptContains(t, "target names", receipt.TargetNames, "A")
+}
+
+// A bare eviction that deletes a RESOLVED incoming edge from a surviving
+// source cannot describe itself exactly: the surviving caller's edge is
+// removed rather than parked under a stub, so neither the exact frontier nor
+// the whole-graph fallback can reconstruct it. The receipt must fail closed --
+// on every active window.
+func TestMutationReceiptEvictSurvivingIncomingEdgeFailsClosed(t *testing.T) {
+	g := New()
+	g.AddBatch([]*Node{
+		{ID: "repo/a.go::A", Kind: KindFunction, Name: "A", QualName: "pkg.A", FilePath: "a.go", RepoPrefix: "repo"},
+		{ID: "repo/keep.go::Keep", Kind: KindFunction, Name: "Keep", FilePath: "keep.go", RepoPrefix: "repo"},
+	}, []*Edge{{From: "repo/keep.go::Keep", To: "repo/a.go::A", Kind: EdgeCalls, FilePath: "keep.go", Line: 3}})
+
+	outer := g.BeginMutationReceipt()
+	inner := g.BeginMutationReceipt()
+	g.EvictFile("a.go")
+	g.AddNode(&Node{ID: "repo/a.go::A", Kind: KindFunction, Name: "A", QualName: "pkg.A", FilePath: "a.go", RepoPrefix: "repo"})
+	if receipt := g.EndMutationReceipt(inner); receipt.Complete {
+		t.Fatalf("inner receipt claimed complete over a deleted surviving caller edge: %+v", receipt)
+	}
+	if receipt := g.EndMutationReceipt(outer); receipt.Complete {
+		t.Fatalf("outer receipt claimed complete over a deleted surviving caller edge: %+v", receipt)
+	}
+}
+
+// An import edge from a surviving file to a non-referenceable doomed node
+// (e.g. a package) is deleted by the eviction just the same -- the previously
+// "neutral" classification hid real damage. Fail closed.
+func TestMutationReceiptEvictImportToNonreferenceableFailsClosed(t *testing.T) {
+	g := New()
+	g.AddBatch([]*Node{
+		{ID: "repo/a.go::pkg", Kind: KindPackage, Name: "pkg", FilePath: "a.go", RepoPrefix: "repo"},
+		{ID: "repo/keep.go::Keep", Kind: KindFunction, Name: "Keep", FilePath: "keep.go", RepoPrefix: "repo"},
+	}, []*Edge{{From: "repo/keep.go::Keep", To: "repo/a.go::pkg", Kind: EdgeImports, FilePath: "keep.go"}})
+
+	token := g.BeginMutationReceipt()
+	g.EvictFiles([]string{"a.go"})
+	if receipt := g.EndMutationReceipt(token); receipt.Complete {
+		t.Fatalf("receipt claimed complete over a deleted surviving import edge: %+v", receipt)
+	}
+}
+
+func TestMutationReceiptEvictAmbiguousImportPackageCandidateRecordsImportStub(t *testing.T) {
+	g := New()
+	g.AddBatch([]*Node{{
+		ID: "one::pkg", Kind: KindPackage, Name: "pkg", QualName: "example/pkg",
+		FilePath: "a/one.go", RepoPrefix: "one",
+	}}, nil)
+
+	token := g.BeginMutationReceipt()
+	g.EvictFile("a/one.go")
+	receipt := g.EndMutationReceipt(token)
+
+	if !receipt.Complete || !receipt.ResolutionRelevant {
+		t.Fatalf("receipt = %+v, want a complete resolution-relevant delta", receipt)
+	}
+	assertReceiptContains(t, "target names", receipt.TargetNames, "import::example/pkg", "import::pkg")
+	if want := []string{"a/one.go"}; !slices.Equal(receipt.ResolutionFiles(), want) {
+		t.Fatalf("resolution files = %v, want %v", receipt.ResolutionFiles(), want)
+	}
+}
+
+func TestMutationReceiptEvictUnmappedImportCandidateKindFailsClosed(t *testing.T) {
+	g := New()
+	g.AddBatch([]*Node{{
+		ID: "one::mod", Kind: KindModule, Name: "mod", QualName: "example/pkg",
+		FilePath: "m/mod.go", RepoPrefix: "one",
+	}}, nil)
+
+	token := g.BeginMutationReceipt()
+	g.EvictFile("m/mod.go")
+	receipt := g.EndMutationReceipt(token)
+
+	if receipt.Complete {
+		t.Fatalf("receipt = %+v, want incomplete: the kind is a qualified-name import candidate without an exact stub mapping", receipt)
+	}
 }

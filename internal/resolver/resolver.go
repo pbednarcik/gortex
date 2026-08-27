@@ -2914,33 +2914,58 @@ func (r *Resolver) ResolveIncomingForNames(names, repoPrefixes []string) *Resolv
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
-	clear := r.buildPassIndexes()
-	defer clear()
-
 	seen := make(map[string]struct{}, len(names))
 	var stubKeys []string
-	appendKey := func(key string) {
-		if _, duplicate := seen[key]; duplicate {
-			return
+	appendKeys := func(keys []string) {
+		for _, key := range keys {
+			if _, duplicate := seen[key]; duplicate {
+				continue
+			}
+			seen[key] = struct{}{}
+			stubKeys = append(stubKeys, key)
 		}
-		seen[key] = struct{}{}
-		stubKeys = append(stubKeys, key)
 	}
 	for _, name := range names {
 		if name == "" {
 			continue
 		}
-		appendKey(graph.UnresolvedMarker + name)
+		appendKeys(graph.UnresolvedNameCandidateIDsForName(name, ""))
 		for _, prefix := range repoPrefixes {
 			if prefix != "" {
-				appendKey(prefix + "::" + graph.UnresolvedMarker + name)
+				appendKeys(graph.UnresolvedNameCandidateIDsForName(name, prefix))
 			}
 		}
 	}
 	if len(stubKeys) == 0 {
 		return stats
 	}
-	r.resolveIncomingStubKeysLocked(stubKeys, stats)
+	// Probe the pending buckets before paying for the pass indexes: the
+	// receipt consumers call this on every apply, and the common case is
+	// that no edge is parked under any requested name. buildPassIndexes is
+	// graph-wide (it scales with the store, not with the request), so a
+	// no-work call must cost one bounded read instead. The probe's
+	// materialized read is retained and handed to the resolution helper:
+	// it is exactly the batch that helper needs, and re-reading it doubled
+	// the hit path's store time and allocations at scale.
+	inByStub := r.graph.GetInEdgesByNodeIDs(stubKeys)
+	pending := false
+	for _, edges := range inByStub {
+		for _, edge := range edges {
+			if edge != nil && graph.IsUnresolvedTarget(edge.To) {
+				pending = true
+				break
+			}
+		}
+		if pending {
+			break
+		}
+	}
+	if !pending {
+		return stats
+	}
+	clear := r.buildPassIndexes()
+	defer clear()
+	r.resolveIncomingStubEdgesLocked(stubKeys, inByStub, stats)
 	return stats
 }
 
@@ -2967,10 +2992,7 @@ func (r *Resolver) resolveIncomingLocked(filePath string, stats *ResolveStats) {
 			continue
 		}
 		seen[n.Name] = struct{}{}
-		stubKeys = append(stubKeys, graph.UnresolvedMarker+n.Name)
-		if n.RepoPrefix != "" {
-			stubKeys = append(stubKeys, n.RepoPrefix+"::"+graph.UnresolvedMarker+n.Name)
-		}
+		stubKeys = append(stubKeys, graph.UnresolvedNameCandidateIDs(n)...)
 	}
 	if len(stubKeys) == 0 {
 		return
@@ -2985,9 +3007,18 @@ func (r *Resolver) resolveIncomingStubKeysLocked(stubKeys []string, stats *Resol
 	if len(stubKeys) == 0 {
 		return
 	}
+	r.resolveIncomingStubEdgesLocked(stubKeys, r.graph.GetInEdgesByNodeIDs(stubKeys), stats)
+}
+
+// resolveIncomingStubEdgesLocked is resolveIncomingStubKeysLocked over a
+// caller-supplied incoming-edge batch, for callers that already materialized
+// the frontier (the names-pass probe). Caller holds r.mu.
+func (r *Resolver) resolveIncomingStubEdgesLocked(stubKeys []string, inByStub map[string][]*graph.Edge, stats *ResolveStats) {
+	if len(stubKeys) == 0 {
+		return
+	}
 	var reindexBatch []graph.EdgeReindex
 	var jobs []reindexJob
-	inByStub := r.graph.GetInEdgesByNodeIDs(stubKeys)
 	for _, key := range stubKeys {
 		for _, edge := range inByStub[key] {
 			if edge == nil || !graph.IsUnresolvedTarget(edge.To) {

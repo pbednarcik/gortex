@@ -987,12 +987,19 @@ func (mi *MultiIndexer) runMasterResolveNames(names []string) {
 	if master == nil {
 		return
 	}
+	// Snapshot the prefixes under the registry lock and release it before
+	// resolver work: the deferred receipt tail runs concurrently with
+	// UntrackRepo, and an unlocked iteration of mi.indexers races its
+	// registry write (concurrent map iteration and mutation can crash the
+	// daemon, not just trip the detector).
+	mi.mu.RLock()
 	prefixes := make([]string, 0, len(mi.indexers))
 	for prefix := range mi.indexers {
 		if prefix != "" {
 			prefixes = append(prefixes, prefix)
 		}
 	}
+	mi.mu.RUnlock()
 	sort.Strings(prefixes)
 	mt := time.Now()
 	stats := master.ResolveIncomingForNames(names, prefixes)

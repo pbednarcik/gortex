@@ -567,15 +567,16 @@ func (mi *MultiIndexer) collectCrossWorkspaceRules() (map[string][]resolver.Cros
 	// Per-repo crossWorkspaceLookup needs the same precedence as the
 	// stamp path: a global-config Workspace override changes which
 	// source-workspace bucket receives the repo's dependency rules.
+	// ReposSnapshot copies the list under the config mutation mutex — the
+	// deferred receipt tail runs this concurrently with UntrackRepo, which
+	// edits the live Repos slice in place.
 	entryByPrefix := make(map[string]config.RepoEntry)
-	if global := mi.configMgr.Global(); global != nil {
-		for _, e := range global.Repos {
-			p := config.ResolvePrefix(e)
-			if p == "" || p == "." {
-				continue
-			}
-			entryByPrefix[p] = e
+	for _, e := range mi.configMgr.Global().ReposSnapshot() {
+		p := config.ResolvePrefix(e)
+		if p == "" || p == "." {
+			continue
 		}
+		entryByPrefix[p] = e
 	}
 	for _, prefix := range repoPrefixes {
 		cfg := mi.configMgr.GetRepoConfig(prefix)

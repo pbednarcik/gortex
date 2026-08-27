@@ -286,6 +286,13 @@ func (g *Graph) recordAddedEdgeForReceipts(e *Edge, exactFile string) {
 			continue
 		}
 		acc.resolutionRelevant = true
+		if HasRestubProvenance(e) {
+			// A restubbed surviving edge is rebound by the incoming/name
+			// frontier, which restores its stashed provenance; its source
+			// file must not join UnresolvedFiles, or the forward file pass
+			// re-resolves it first and the restored tier is lost.
+			continue
+		}
 		if exactFile != "" {
 			acc.unresolvedFiles[exactFile] = struct{}{}
 		} else {
@@ -296,11 +303,12 @@ func (g *Graph) recordAddedEdgeForReceipts(e *Edge, exactFile string) {
 
 // recordEvictedNodesForReceipts describes a bounded file-scoped eviction to
 // active receipts exactly instead of failing them closed. An evicted
-// referenceable definition is resolution-relevant the same way an added one
-// is: pending references naming it elsewhere may resolve differently once it
+// resolver candidate is resolution-relevant the same way an added one is:
+// pending references naming it elsewhere may resolve differently once it
 // is gone (and in the evict-then-readd reindex flow the re-add records the
-// successor identity), so its file joins the definition frontier and its
-// names join the target set.
+// successor identity), so its file joins the definition frontier and the
+// stub names ReceiptNamesForEvictedSymbol maps it to join the target set.
+// A candidate kind without an exact stub mapping fails the receipt closed.
 func (g *Graph) recordEvictedNodesForReceipts(nodes []*Node) {
 	if len(nodes) == 0 || g.mutationReceipts.activeCount.Load() == 0 {
 		return
@@ -315,18 +323,21 @@ func (g *Graph) recordEvictedNodesForReceipts(nodes []*Node) {
 			if n.FilePath != "" {
 				acc.changedFiles[n.FilePath] = struct{}{}
 			}
-			if !IsReferenceableSymbol(n.Kind) {
+			names, exact := ReceiptNamesForEvictedSymbol(n.Kind, n.Name, n.QualName)
+			if !exact {
+				acc.resolutionRelevant = true
+				acc.noteIncomplete("evicted_import_candidate_kind")
+				continue
+			}
+			if len(names) == 0 {
 				continue
 			}
 			acc.resolutionRelevant = true
 			if n.ID != "" {
 				acc.targetIDs[n.ID] = struct{}{}
 			}
-			if n.Name != "" {
-				acc.targetNames[n.Name] = struct{}{}
-			}
-			if n.QualName != "" {
-				acc.targetNames[n.QualName] = struct{}{}
+			for _, name := range names {
+				acc.targetNames[name] = struct{}{}
 			}
 			if n.FilePath != "" {
 				acc.definitionFiles[n.FilePath] = struct{}{}
@@ -350,3 +361,51 @@ func (g *Graph) markMutationReceiptsIncomplete() {
 }
 
 var _ MutationReceiptStore = (*Graph)(nil)
+
+// recordReindexedEdgeForReceipts describes one in-place edge retarget to the
+// active receipts, mirroring sqliteReindexReceipt: only a write that leaves
+// the edge at an unresolved target creates work for the resolver catch-up —
+// replacing a stub with a resolved target creates none. The empty-FilePath
+// fallback reads the source node's file, the same identity the SQLite
+// recorder preloads.
+func (g *Graph) recordReindexedEdgeForReceipts(e *Edge) {
+	if e == nil || g.mutationReceipts.activeCount.Load() == 0 {
+		return
+	}
+	if !IsUnresolvedTarget(e.To) {
+		return
+	}
+	file := e.FilePath
+	if file == "" {
+		if src := g.GetNode(e.From); src != nil {
+			file = src.FilePath
+		}
+	}
+	g.recordAddedEdgeForReceipts(e, file)
+}
+// recordFileEvictionForReceipts is the receipt gate for file-scoped
+// evictions: it records the exact frontier only when no RESOLVED incoming
+// edge from a surviving source is about to be deleted. Such an edge is
+// removed rather than parked under an unresolved stub, so neither the exact
+// frontier nor the whole-graph fallback can reconstruct it afterwards — no
+// complete receipt exists, and the receipt fails closed. In the reindex
+// composition restubIncomingRefs parks those edges first (stub targets are
+// not node IDs and never reach these buckets), so the scan finds nothing
+// there and exactness is preserved. Caller holds the graph-wide write lock.
+func (g *Graph) recordFileEvictionForReceipts(nodes []*Node, evictedIDs map[string]string) {
+	if len(nodes) == 0 || g.mutationReceipts.activeCount.Load() == 0 {
+		return
+	}
+	for id := range evictedIDs {
+		for _, e := range g.shardFor(id).inEdges[id] {
+			if e == nil {
+				continue
+			}
+			if _, doomed := evictedIDs[e.From]; !doomed {
+				g.markMutationReceiptsIncomplete()
+				return
+			}
+		}
+	}
+	g.recordEvictedNodesForReceipts(nodes)
+}

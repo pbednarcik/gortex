@@ -31,14 +31,13 @@ func (g *Graph) EvictFiles(filePaths []string) (nodesRemoved, edgesRemoved int) 
 	if len(nodes) == 0 {
 		return 0, 0
 	}
-	g.recordEvictedNodesForReceipts(nodes)
-
 	evictedIDs := make(map[string]string, len(nodes))
 	for _, node := range nodes {
 		if node != nil {
 			evictedIDs[node.ID] = node.RepoPrefix
 		}
 	}
+	g.recordFileEvictionForReceipts(nodes, evictedIDs)
 	for _, node := range nodes {
 		if node == nil {
 			continue
