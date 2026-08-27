@@ -316,6 +316,11 @@ func (e *CSharpExtractor) extractCSharp(filePath string, src []byte) (*parser.Ex
 	// shape so a locally-known interface always wins.
 	localInterfaces := collectCSharpInterfaceNames(root, src)
 
+	// Using-alias names, collected once per file: the type-argument stamp
+	// sites consult them per declaration, and a per-declaration rescan of
+	// the enclosing namespace was quadratic in sibling count.
+	fileAliases := csharpFileAliasNames(root, src)
+
 	var calls []csharpDeferredCall
 	var locals []csharpDeferredLocal
 	var typeUses []csharpTypeUse
@@ -329,19 +334,19 @@ func (e *CSharpExtractor) extractCSharp(filePath string, src []byte) (*parser.Ex
 			e.emitNamespace(m, filePath, fileID, result, seen)
 
 		case m.Captures["class.def"] != nil:
-			e.emitContainer(m, "class", graph.KindType, filePath, fileID, src, result, seen, annotationSeen, localInterfaces)
+			e.emitContainer(m, "class", graph.KindType, filePath, fileID, src, result, seen, annotationSeen, localInterfaces, fileAliases)
 
 		case m.Captures["iface.def"] != nil:
-			e.emitContainer(m, "iface", graph.KindInterface, filePath, fileID, src, result, seen, annotationSeen, localInterfaces)
+			e.emitContainer(m, "iface", graph.KindInterface, filePath, fileID, src, result, seen, annotationSeen, localInterfaces, fileAliases)
 
 		case m.Captures["struct.def"] != nil:
-			e.emitContainer(m, "struct", graph.KindType, filePath, fileID, src, result, seen, annotationSeen, localInterfaces)
+			e.emitContainer(m, "struct", graph.KindType, filePath, fileID, src, result, seen, annotationSeen, localInterfaces, fileAliases)
 
 		case m.Captures["record.def"] != nil:
-			e.emitContainer(m, "record", graph.KindType, filePath, fileID, src, result, seen, annotationSeen, localInterfaces)
+			e.emitContainer(m, "record", graph.KindType, filePath, fileID, src, result, seen, annotationSeen, localInterfaces, fileAliases)
 
 		case m.Captures["enum.def"] != nil:
-			e.emitContainer(m, "enum", graph.KindType, filePath, fileID, src, result, seen, annotationSeen, localInterfaces)
+			e.emitContainer(m, "enum", graph.KindType, filePath, fileID, src, result, seen, annotationSeen, localInterfaces, fileAliases)
 
 		case m.Captures["anon.def"] != nil:
 			e.emitAnonymousType(m, filePath, fileID, result, seen)
@@ -353,10 +358,10 @@ func (e *CSharpExtractor) extractCSharp(filePath string, src []byte) (*parser.Ex
 			e.emitConstructor(m, filePath, fileID, src, result, seen)
 
 		case m.Captures["field.def"] != nil:
-			e.emitField(m, filePath, fileID, src, result, seen)
+			e.emitField(m, filePath, fileID, src, result, seen, fileAliases)
 
 		case m.Captures["prop.def"] != nil:
-			e.emitProperty(m, filePath, fileID, src, result, seen)
+			e.emitProperty(m, filePath, fileID, src, result, seen, fileAliases)
 
 		case m.Captures["using.def"] != nil:
 			e.emitUsing(m, filePath, fileID, result)
@@ -669,6 +674,27 @@ func (e *CSharpExtractor) extractCSharp(filePath string, src []byte) (*parser.Ex
 		}
 	}
 
+	// Shadow indexes, built BEFORE the call emission so receiver_name can
+	// honor its contract ("a receiver no local, param or builtin
+	// explains"): a bare receiver naming a declared parameter or local is
+	// that value — never the enclosing type's same-named field, never a
+	// static class. Locals ride the tenv only when typed; the name sets
+	// cover every declaration. The field-identifier emitter reuses both.
+	paramsByOwner := csharpParamNamesByOwner(result)
+	localNamesByOwner := map[string]map[string]bool{}
+	for _, l := range locals {
+		owner := localOwner(l)
+		if owner == "" {
+			continue
+		}
+		m := localNamesByOwner[owner]
+		if m == nil {
+			m = map[string]bool{}
+			localNamesByOwner[owner] = m
+		}
+		m[l.name] = true
+	}
+
 	for _, c := range calls {
 		callerID := funcRanges.enclosing(c.line)
 		if callerID == "" {
@@ -715,15 +741,20 @@ func (e *CSharpExtractor) extractCSharp(filePath string, src []byte) (*parser.Ex
 					// filled, and lands on the wrong overload.
 					edge.Meta = map[string]any{"receiver_name": c.receiver}
 				}
-			} else if c.receiver != "" {
-				// A bare receiver nothing above could type. Its spelling
-				// is still evidence: reaching here means no local, param
-				// or builtin in scope carries that name, so a receiver
-				// that names a static class is the STATIC form of an
-				// extension call (`BagExt.Add(bag)`) — where the `this`
-				// slot is filled by the first argument, not the
-				// receiver. The extension binder needs that distinction
-				// before it can compare argument counts.
+			} else if c.receiver != "" &&
+				!paramsByOwner[callerID][c.receiver] &&
+				!localNamesByOwner[callerID][c.receiver] {
+				// A bare receiver nothing above could type, and no
+				// parameter or local declares its name. Its spelling is
+				// still evidence: a receiver that names a static class is
+				// the STATIC form of an extension call (`BagExt.Add(bag)`)
+				// — where the `this` slot is filled by the first argument,
+				// not the receiver — and a same-named field of the
+				// enclosing type is only bindable because nothing shadows
+				// it. A parameter or local DOES shadow (re-review RED: a
+				// shadowing parameter's call bound through the field it
+				// shadows on the strength of an unrelated same-line
+				// `this.`-qualified read); those receivers stay unknown.
 				edge.Meta = map[string]any{"receiver_name": c.receiver}
 			}
 			// Stamped AFTER the receiver-evidence chain — every branch
@@ -784,24 +815,12 @@ func (e *CSharpExtractor) extractCSharp(filePath string, src []byte) (*parser.Ex
 	emitCSharpMemberAccesses(accesses, src, filePath, funcRanges,
 		tenvByOwner, builtinsByOwner, result)
 
-	// Field-identifier uses need the shadow indexes: every DECLARED
-	// local by name (typed or not — tenv alone holds only the typed
-	// ones), parameters, and builtin-typed locals.
-	localNamesByOwner := map[string]map[string]bool{}
-	for _, l := range locals {
-		owner := localOwner(l)
-		if owner == "" {
-			continue
-		}
-		m := localNamesByOwner[owner]
-		if m == nil {
-			m = map[string]bool{}
-			localNamesByOwner[owner] = m
-		}
-		m[l.name] = true
-	}
+	// Field-identifier uses reuse the same shadow indexes the receiver
+	// stamps consulted: every DECLARED local by name (typed or not — tenv
+	// alone holds only the typed ones), parameters, and builtin-typed
+	// locals.
 	emitCSharpFieldIdentifierUses(calls, accesses, fieldAssigns, src,
-		filePath, funcRanges, localNamesByOwner, builtinsByOwner, result)
+		filePath, funcRanges, paramsByOwner, localNamesByOwner, builtinsByOwner, result)
 
 	// .NET surfaces a symbol walk misses: DI registrations + COM
 	// interop. Stamped onto the file node.
@@ -839,7 +858,7 @@ func (e *CSharpExtractor) emitNamespace(m parser.QueryResult, filePath, fileID s
 // emitContainer collapses the per-kind class/interface/struct/enum
 // node emission. The capture-name prefix selects which capture set to
 // read from (the legacy code repeated this body four times).
-func (e *CSharpExtractor) emitContainer(m parser.QueryResult, kind string, nodeKind graph.NodeKind, filePath, fileID string, src []byte, result *parser.ExtractionResult, seen, annotationSeen map[string]bool, localInterfaces map[string]bool) {
+func (e *CSharpExtractor) emitContainer(m parser.QueryResult, kind string, nodeKind graph.NodeKind, filePath, fileID string, src []byte, result *parser.ExtractionResult, seen, annotationSeen map[string]bool, localInterfaces, fileAliases map[string]bool) {
 	name := m.Captures[kind+".name"].Text
 	def := m.Captures[kind+".def"]
 	id := filePath + "::" + name
@@ -857,6 +876,9 @@ func (e *CSharpExtractor) emitContainer(m parser.QueryResult, kind string, nodeK
 	switch kind {
 	case "iface":
 		meta["type_flavor"] = "interface"
+		if csharpHasVariantTypeParams(def.Node) {
+			meta["variant_type_params"] = true
+		}
 	case "struct":
 		meta["type_flavor"] = "struct"
 	case "enum":
@@ -891,12 +913,12 @@ func (e *CSharpExtractor) emitContainer(m parser.QueryResult, kind string, nodeK
 	// for structs and records, inheritance for interfaces).
 	switch kind {
 	case "class", "struct", "record", "iface":
-		emitCSharpBaseList(id, def.Node, src, filePath, localInterfaces, result)
+		emitCSharpBaseList(id, def.Node, src, filePath, localInterfaces, fileAliases, result)
 	case "enum":
 		e.emitCSharpEnumMembers(def.Node, src, filePath, id, name, result, seen)
 	}
 	if kind == "record" {
-		e.emitCSharpRecordPositionalProps(id, name, def.Node, src, filePath, fileID, result, seen)
+		e.emitCSharpRecordPositionalProps(id, name, def.Node, src, filePath, fileID, result, seen, fileAliases)
 	}
 }
 
@@ -908,7 +930,7 @@ func (e *CSharpExtractor) emitContainer(m parser.QueryResult, kind string, nodeK
 // in tree order: an explicit redeclaration of a positional property
 // (legal C# — it replaces the synthesized one) hits the seen guard and
 // stays a single node for the same logical member.
-func (e *CSharpExtractor) emitCSharpRecordPositionalProps(ownerID, ownerName string, decl *sitter.Node, src []byte, filePath, fileID string, result *parser.ExtractionResult, seen map[string]bool) {
+func (e *CSharpExtractor) emitCSharpRecordPositionalProps(ownerID, ownerName string, decl *sitter.Node, src []byte, filePath, fileID string, result *parser.ExtractionResult, seen map[string]bool, fileAliases map[string]bool) {
 	// The record's parameter_list is an unnamed child in this grammar —
 	// unlike method parameters, ChildByFieldName("parameters") finds
 	// nothing, so scan the direct children by type.
@@ -922,6 +944,9 @@ func (e *CSharpExtractor) emitCSharpRecordPositionalProps(ownerID, ownerName str
 	if params == nil {
 		return
 	}
+	// One set for every positional property: the enclosing chain is the
+	// same for all of them (the record's own type parameters included).
+	unstampable := csharpUnstampableArgNames(decl, src, fileAliases)
 	for i, _nc := 0, int(params.NamedChildCount()); i < _nc; i++ {
 		p := params.NamedChild(i)
 		if p == nil || p.Type() != "parameter" {
@@ -946,6 +971,12 @@ func (e *CSharpExtractor) emitCSharpRecordPositionalProps(ownerID, ownerName str
 		}
 		if t := p.ChildByFieldName("type"); t != nil {
 			meta["field_type"] = strings.TrimSpace(t.Content(src))
+			// Same closed-generic-arguments stamp ordinary fields and
+			// properties carry (dispatch gate receiver evidence) — a
+			// positional property is a first-class receiver.
+			if args := csharpTypeArgsFromTypeNode(t, src, unstampable); args != "" {
+				meta["field_type_args"] = args
+			}
 		}
 		result.Nodes = append(result.Nodes, &graph.Node{
 			ID: id, Kind: graph.KindField, Name: pname,
@@ -1447,7 +1478,7 @@ func (e *CSharpExtractor) emitConstructor(m parser.QueryResult, filePath, fileID
 	emitCSharpFunctionShape(id, def.Node, src, filePath, startLine1, result)
 }
 
-func (e *CSharpExtractor) emitField(m parser.QueryResult, filePath, fileID string, src []byte, result *parser.ExtractionResult, seen map[string]bool) {
+func (e *CSharpExtractor) emitField(m parser.QueryResult, filePath, fileID string, src []byte, result *parser.ExtractionResult, seen map[string]bool, fileAliases map[string]bool) {
 	def := m.Captures["field.def"]
 	owner := csharpDirectMemberOwner(def.Node, src, "class_declaration", "struct_declaration", "interface_declaration", "record_declaration")
 	if owner.kind == "" {
@@ -1475,12 +1506,16 @@ func (e *CSharpExtractor) emitField(m parser.QueryResult, filePath, fileID strin
 	// A field_declaration's type lives on its nested variable_declaration
 	// (`field_declaration → variable_declaration[type] → variable_declarator`),
 	// not as a direct `type` field of the field_declaration itself.
-	fieldTypeRaw := csharpFieldDeclType(def.Node, src)
+	fieldTypeNode := csharpFieldDeclTypeNode(def.Node)
+	fieldTypeRaw := ""
+	if fieldTypeNode != nil {
+		fieldTypeRaw = strings.TrimSpace(fieldTypeNode.Content(src))
+	}
 	if fieldTypeRaw != "" {
 		meta["field_type"] = fieldTypeRaw
 		// Closed generic arguments of the declared type — the dispatch
 		// gate's receiver evidence (see csharp_base_type_args.go).
-		if args := csharpSimpleTypeArgsFromText(fieldTypeRaw, csharpUnstampableArgNames(def.Node, src)); args != "" {
+		if args := csharpTypeArgsFromTypeNode(fieldTypeNode, src, csharpUnstampableArgNames(def.Node, src, fileAliases)); args != "" {
 			meta["field_type_args"] = args
 		}
 	}
@@ -1519,7 +1554,7 @@ func (e *CSharpExtractor) emitField(m parser.QueryResult, filePath, fileID strin
 	emitCSharpTypeUseEdges(id, fieldTypeRaw, filePath, def.StartLine+1, result)
 }
 
-func (e *CSharpExtractor) emitProperty(m parser.QueryResult, filePath, fileID string, src []byte, result *parser.ExtractionResult, seen map[string]bool) {
+func (e *CSharpExtractor) emitProperty(m parser.QueryResult, filePath, fileID string, src []byte, result *parser.ExtractionResult, seen map[string]bool, fileAliases map[string]bool) {
 	def := m.Captures["prop.def"]
 	owner := csharpDirectMemberOwner(def.Node, src, "class_declaration", "struct_declaration", "interface_declaration", "record_declaration")
 	if owner.kind == "" {
@@ -1551,7 +1586,7 @@ func (e *CSharpExtractor) emitProperty(m parser.QueryResult, filePath, fileID st
 		meta["field_type"] = propTypeRaw
 		// Same closed-generic-arguments stamp fields carry (dispatch
 		// gate receiver evidence — csharp_base_type_args.go).
-		if args := csharpSimpleTypeArgsFromText(propTypeRaw, csharpUnstampableArgNames(def.Node, src)); args != "" {
+		if args := csharpTypeArgsFromTypeNode(t, src, csharpUnstampableArgNames(def.Node, src, fileAliases)); args != "" {
 			meta["field_type_args"] = args
 		}
 	}
@@ -1591,10 +1626,11 @@ func (e *CSharpExtractor) emitProperty(m parser.QueryResult, filePath, fileID st
 // as Meta["scoped_usings"] ("scope|name", empty scope = compilation
 // unit). Additive: the flat keys keep their exact legacy shape.
 func stampCSharpUsings(root *sitter.Node, src []byte, fileNode *graph.Node) {
-	var usings, globals, statics, scoped, globalStatics []string
+	var usings, globals, statics, scoped, globalStatics, globalAliases []string
 	seen := map[string]bool{}
 	seenStatic := map[string]bool{}
 	seenScoped := map[string]bool{}
+	seenGlobalAlias := map[string]bool{}
 	walkNodes(root, func(n *sitter.Node) {
 		if n.Type() != "using_directive" {
 			return
@@ -1609,6 +1645,17 @@ func stampCSharpUsings(root *sitter.Node, src []byte, fileNode *graph.Node) {
 			case "static":
 				isStatic = true
 			case "name_equals", "=":
+				// An alias grants no bare-name namespace visibility, but a
+				// GLOBAL alias makes its identifier project-scoped and
+				// opaque to string-compared type-argument stamps in every
+				// OTHER file — record the name so the dispatch gate can
+				// refuse stamps that spell it.
+				if isGlobal {
+					if a := csharpUsingAliasName(n, src); a != "" && !seenGlobalAlias[a] {
+						seenGlobalAlias[a] = true
+						globalAliases = append(globalAliases, a)
+					}
+				}
 				return
 			case "identifier", "qualified_name":
 				name = strings.TrimSpace(c.Content(src))
@@ -1644,11 +1691,14 @@ func stampCSharpUsings(root *sitter.Node, src []byte, fileNode *graph.Node) {
 			scoped = append(scoped, key)
 		}
 	})
-	if len(usings) == 0 && len(statics) == 0 {
+	if len(usings) == 0 && len(statics) == 0 && len(globalAliases) == 0 {
 		return
 	}
 	if fileNode.Meta == nil {
 		fileNode.Meta = map[string]any{}
+	}
+	if len(globalAliases) > 0 {
+		fileNode.Meta["global_using_aliases"] = globalAliases
 	}
 	if len(usings) > 0 {
 		fileNode.Meta["usings"] = usings
@@ -1813,7 +1863,7 @@ func collectCSharpInterfaceNames(root *sitter.Node, src []byte) map[string]bool 
 // the resolver binds them like every other C# reference. A base that
 // resolves to a same-file class still flows through unchanged — it is
 // neither a known interface nor I-prefixed, so it lands as EdgeExtends.
-func emitCSharpBaseList(typeID string, decl *sitter.Node, src []byte, filePath string, localInterfaces map[string]bool, result *parser.ExtractionResult) {
+func emitCSharpBaseList(typeID string, decl *sitter.Node, src []byte, filePath string, localInterfaces, fileAliases map[string]bool, result *parser.ExtractionResult) {
 	if decl == nil {
 		return
 	}
@@ -1844,7 +1894,7 @@ func emitCSharpBaseList(typeID string, decl *sitter.Node, src []byte, filePath s
 	// the declaring type AND every enclosing type (Relay<T> : IBoxStore<T>,
 	// or a type nested inside a generic outer), plus in-scope using
 	// aliases (opaque spellings).
-	declTypeParams := csharpUnstampableArgNames(decl, src)
+	declTypeParams := csharpUnstampableArgNames(decl, src, fileAliases)
 	// A base list closing the SAME erased target twice
 	// (Both : IBoxStore<Crate>, IBoxStore<Widget>) collapses to one stored
 	// edge — identical (from, to, kind, file, line) — so a stamp would
@@ -2377,13 +2427,15 @@ func normalizeCSharpTypeName(t string) string {
 	return t
 }
 
-// csharpFieldDeclType returns the verbatim declared type of a
-// field_declaration. The type is a field of the nested
-// variable_declaration node, not of the field_declaration itself, so a
-// direct ChildByFieldName("type") on the field_declaration is always nil.
-func csharpFieldDeclType(fieldDecl *sitter.Node, src []byte) string {
+// csharpFieldDeclTypeNode returns the declared type NODE of a
+// field_declaration — the type-argument stamp derives its arguments from
+// the parsed tree, not from raw text, so trivia between tokens stays out
+// of the identity. The type is a field of the nested variable_declaration
+// node, not of the field_declaration itself, so a direct
+// ChildByFieldName("type") on the field_declaration is always nil.
+func csharpFieldDeclTypeNode(fieldDecl *sitter.Node) *sitter.Node {
 	if fieldDecl == nil {
-		return ""
+		return nil
 	}
 	for i, _nc := 0, int(fieldDecl.NamedChildCount()); i < _nc; i++ {
 		c := fieldDecl.NamedChild(i)
@@ -2391,17 +2443,17 @@ func csharpFieldDeclType(fieldDecl *sitter.Node, src []byte) string {
 			continue
 		}
 		if t := c.ChildByFieldName("type"); t != nil {
-			return strings.TrimSpace(t.Content(src))
+			return t
 		}
 		// Fallback: first named child of the variable_declaration is the
 		// type in grammar revisions that don't tag the field.
 		if c.NamedChildCount() > 0 {
 			if first := c.NamedChild(0); first != nil && first.Type() != "variable_declarator" {
-				return strings.TrimSpace(first.Content(src))
+				return first
 			}
 		}
 	}
-	return ""
+	return nil
 }
 
 // inferTypeFromCSharpNew extracts the type name from a C# object_creation_expression.

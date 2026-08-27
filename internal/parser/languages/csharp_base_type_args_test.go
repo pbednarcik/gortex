@@ -192,6 +192,161 @@ namespace App {
 		"a using-alias argument is opaque - no stamp")
 }
 
+// Re-review RED: comment trivia between the tokens of a declared type is
+// legal C# and no part of type identity - `IBox</**/Crate>` names the
+// SAME constructed interface as `IBox<Crate>`. The raw-text path stamped
+// "/**/Crate" as an argument and the gate then filtered the valid
+// implementor; deriving the arguments from the parsed type AST keeps
+// trivia out of the compared spelling.
+func TestCSharpExtractor_FieldTypeArgTriviaIsNotIdentity(t *testing.T) {
+	src := []byte(`namespace App {
+    public interface IBox<T> { }
+    public class Crate { }
+
+    public class Flow {
+        private readonly IBox</**/Crate> _box;
+        public IBox</* seasonal */ Crate> Prop { get; set; }
+    }
+}
+`)
+	e := NewCSharpExtractor()
+	result, err := e.Extract("Trivia.cs", src)
+	require.NoError(t, err)
+
+	box := fieldMeta(result.Nodes, "Trivia.cs::Flow._box")
+	require.NotNil(t, box)
+	assert.Equal(t, "Crate", box["field_type_args"],
+		"comment trivia inside the argument list is not part of the argument")
+
+	prop := fieldMeta(result.Nodes, "Trivia.cs::Flow.Prop")
+	require.NotNil(t, prop)
+	assert.Equal(t, "Crate", prop["field_type_args"])
+}
+
+// Re-review RED: declaration-side identifier ESCAPES must land in the
+// same normalization domain the use side compares in. `class Outer<@T>`
+// declares the open parameter T, but the raw spelling "@T" in the
+// open-parameter set never meets the use side's normalized "T" - the
+// field stamps a closed type called "T" and dispatch filters everything.
+// The Unicode escape spelling of the same declaration fails identically.
+func TestCSharpExtractor_EscapedDeclarationTypeParamsStayOpen(t *testing.T) {
+	src := []byte(`namespace App {
+    public interface IBox<T> { }
+
+    public class Outer<@T> {
+        private readonly IBox<@T> _verbatim;
+        private readonly IBox<T> _bare;
+    }
+
+    public class Uni<\u0054> {
+        private readonly IBox<T> _viaEscape;
+    }
+}
+`)
+	e := NewCSharpExtractor()
+	result, err := e.Extract("Esc.cs", src)
+	require.NoError(t, err)
+
+	for _, id := range []string{"Esc.cs::Outer._verbatim", "Esc.cs::Outer._bare", "Esc.cs::Uni._viaEscape"} {
+		m := fieldMeta(result.Nodes, id)
+		require.NotNil(t, m, id)
+		assert.NotContains(t, m, "field_type_args",
+			"%s: every spelling of the open declaration parameter closes nothing", id)
+	}
+}
+
+// Re-review RED: alias keys and use-side arguments compared in different
+// normalization domains. The alias collector stored "@Entity" while the
+// argument normalizer strips the verbatim prefix to "Entity" - the guard
+// missed and the alias-opaque argument stamped as a closed type.
+func TestCSharpExtractor_VerbatimAliasSpellingsAreOpaque(t *testing.T) {
+	src := []byte(`using @Entity = App.Crate;
+
+namespace App {
+    public interface IBox<T> { }
+    public class Crate { }
+
+    public class Flow {
+        private readonly IBox<@Entity> _verbatimUse;
+        private readonly IBox<Entity> _bareUse;
+    }
+}
+`)
+	e := NewCSharpExtractor()
+	result, err := e.Extract("VAlias.cs", src)
+	require.NoError(t, err)
+
+	for _, id := range []string{"VAlias.cs::Flow._verbatimUse", "VAlias.cs::Flow._bareUse"} {
+		m := fieldMeta(result.Nodes, id)
+		require.NotNil(t, m, id)
+		assert.NotContains(t, m, "field_type_args",
+			"%s: every spelling denoting the alias is opaque - no stamp", id)
+	}
+}
+
+// Re-review RED (metadata half): the project-global alias stamp must
+// carry the CANONICAL identifier, or the resolver-side guard compares
+// "@Entity" against normalized stamps and never refuses.
+func TestCSharpExtractor_GlobalAliasMetaIsCanonical(t *testing.T) {
+	src := []byte(`global using @Entity = App.Crate;
+`)
+	e := NewCSharpExtractor()
+	result, err := e.Extract("GAlias.cs", src)
+	require.NoError(t, err)
+
+	var fileMeta map[string]any
+	for _, n := range result.Nodes {
+		if n != nil && n.Kind == graph.KindFile {
+			fileMeta = n.Meta
+			break
+		}
+	}
+	require.NotNil(t, fileMeta)
+	assert.Equal(t, []string{"Entity"}, fileMeta["global_using_aliases"],
+		"the alias identifier is stored canonically - verbatim prefix stripped")
+}
+
+// Re-review RED (P2): the synthesized positional-record property carries
+// field_type but no field_type_args, so `record Flow(IBox<Crate> Store)`
+// never narrows Store's dispatch. The same conservative rules apply: the
+// record's own type parameter is open, an alias is opaque.
+func TestCSharpExtractor_RecordPositionalPropTypeArgs(t *testing.T) {
+	src := []byte(`using MyCrate = App.Crate;
+
+namespace App {
+    public interface IBox<T> { }
+    public class Crate { }
+
+    public record Flow(IBox<Crate> Store, Crate Plain);
+    public record Open<T>(IBox<T> Store);
+    public record Aliased(IBox<MyCrate> Store);
+}
+`)
+	e := NewCSharpExtractor()
+	result, err := e.Extract("Rec.cs", src)
+	require.NoError(t, err)
+
+	store := fieldMeta(result.Nodes, "Rec.cs::Flow.Store")
+	require.NotNil(t, store)
+	assert.Equal(t, "IBox<Crate>", store["field_type"])
+	assert.Equal(t, "Crate", store["field_type_args"],
+		"a positional property is a first-class receiver - same stamp as an ordinary property")
+
+	plain := fieldMeta(result.Nodes, "Rec.cs::Flow.Plain")
+	require.NotNil(t, plain)
+	assert.NotContains(t, plain, "field_type_args")
+
+	open := fieldMeta(result.Nodes, "Rec.cs::Open.Store")
+	require.NotNil(t, open)
+	assert.NotContains(t, open, "field_type_args",
+		"the record's own type parameter is open - no stamp")
+
+	aliased := fieldMeta(result.Nodes, "Rec.cs::Aliased.Store")
+	require.NotNil(t, aliased)
+	assert.NotContains(t, aliased, "field_type_args",
+		"a using-alias argument is opaque - no stamp")
+}
+
 // fieldMeta returns the meta of the node with the given ID.
 func fieldMeta(result_nodes []*graph.Node, id string) map[string]any {
 	for _, n := range result_nodes {
@@ -291,6 +446,28 @@ func TestCSharpExtractor_SameLineSameNameCallsMarkReceiverAmbiguous(t *testing.T
 		if ed.Meta != nil {
 			assert.NotContains(t, ed.Meta, "receiver_ambiguous",
 				"a lone-receiver site stays unmarked")
+		}
+	}
+}
+
+// The 2,000-sibling shape from the review: one namespace whose declaration
+// list holds thousands of types, each with a generic base entry and a
+// generic field. A per-declaration alias scan that re-walks the namespace's
+// children makes stamping quadratic in sibling count; the per-file alias
+// set must be collected once.
+func BenchmarkCSharpExtractSiblingHeavyTypeArgStamps(b *testing.B) {
+	var sb []byte
+	sb = append(sb, []byte("using MyCrate = App.Crate;\nnamespace App {\n    public interface IBoxStore<T> { }\n    public class Crate { }\n")...)
+	for i := 0; i < 2000; i++ {
+		n := []byte("    public class Store" + itoa(i) + " : IBoxStore<Crate> {\n        private readonly IBoxStore<Crate> _store;\n    }\n")
+		sb = append(sb, n...)
+	}
+	sb = append(sb, []byte("}\n")...)
+	e := NewCSharpExtractor()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		if _, err := e.Extract("Siblings.cs", sb); err != nil {
+			b.Fatal(err)
 		}
 	}
 }

@@ -87,7 +87,7 @@ func emitCSharpFieldIdentifierUses(
 	calls []csharpDeferredCall, accesses []csharpDeferredAccess,
 	fieldAssigns []csharpDeferredFieldAssign,
 	src []byte, filePath string, funcRanges *csharpFuncLookup,
-	localNamesByOwner map[string]map[string]bool,
+	paramsByOwner, localNamesByOwner map[string]map[string]bool,
 	builtinsByOwner map[string]map[string]string,
 	result *parser.ExtractionResult,
 ) {
@@ -95,7 +95,6 @@ func emitCSharpFieldIdentifierUses(
 	if len(fieldsByType) == 0 {
 		return
 	}
-	paramsByOwner := csharpParamNamesByOwner(result)
 
 	// eligible resolves the enclosing owner and reports whether name is
 	// an unshadowed field of the owner's type.

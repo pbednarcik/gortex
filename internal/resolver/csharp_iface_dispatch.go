@@ -173,6 +173,29 @@ func ResolveCSharpInterfaceDispatchScoped(g graph.Store, scope map[string]bool) 
 		return 0
 	}
 
+	// Project-global using aliases (`global using Entity = App.Crate;`)
+	// make their identifier opaque to the string-compared stamps in EVERY
+	// file of the project — the extractor's ancestor scan only sees the
+	// declaring file, so a receiver spelled IBox<Entity> and an implementor
+	// spelled IBox<Crate> stamp unequal spellings of one constructed
+	// interface. Any stamp naming such an alias is refused (never filter).
+	// Collected once per pass from the file nodes' extractor stamps, and
+	// only when stamps exist to gate with; the union across repos is
+	// deliberate — over-refusing can only PRESERVE edges.
+	globalAliasNames := map[string]bool{}
+	if len(implArgs) > 0 {
+		for n := range graph.NodesByKindsSeq(g, graph.KindFile) {
+			if n == nil || n.Meta == nil {
+				continue
+			}
+			for _, a := range csharpMetaStrings(n.Meta["global_using_aliases"]) {
+				for _, form := range csharpAliasComparableForms(a) {
+					globalAliasNames[form] = true
+				}
+			}
+		}
+	}
+
 	// implementation/interface type node id → member name → method nodes.
 	// Every overload matters: C# overloads mint one node each (Convert,
 	// Convert_L39, ...) sharing the same Name, and real call sites bind to any
@@ -241,6 +264,30 @@ func ResolveCSharpInterfaceDispatchScoped(g graph.Store, scope map[string]bool) 
 		return 0
 	}
 
+	// A variance-declaring interface (ISource<out T> / ISink<in T>) makes
+	// differently-closed constructions assignable across the family, so the
+	// closed-and-unequal equality gate — which models invariant parameters
+	// only — must never arm for it: its families carry no stamped args at
+	// all, and every site keeps the full fan-out.
+	ifaceIDs := make([]string, 0, len(anchorGroups))
+	seenIfaceIDs := map[string]bool{}
+	for _, key := range anchorOrder {
+		id := anchorGroups[key].ifaceID
+		if !seenIfaceIDs[id] {
+			seenIfaceIDs[id] = true
+			ifaceIDs = append(ifaceIDs, id)
+		}
+	}
+	variantIface := map[string]bool{}
+	for id, n := range g.GetNodesByIDs(ifaceIDs) {
+		if n == nil || n.Meta == nil {
+			continue
+		}
+		if v, _ := n.Meta["variant_type_params"].(bool); v {
+			variantIface[id] = true
+		}
+	}
+
 	// Descendant closure per interface, computed once and shared across that
 	// interface's anchors (one per member name).
 	descCache := map[string][]string{}
@@ -283,12 +330,19 @@ func ResolveCSharpInterfaceDispatchScoped(g graph.Store, scope map[string]bool) 
 		}
 		memberArgs := map[string]string{}
 		implCount := 0
+		variant := variantIface[ag.ifaceID]
 		for _, sub := range descendants(ag.ifaceID) {
 			byName := membersByType[sub]
 			if byName == nil {
 				continue
 			}
-			subArgs := implArgs[sub][ag.ifaceID]
+			subArgs := ""
+			if !variant {
+				subArgs = implArgs[sub][ag.ifaceID]
+				if csharpArgsNameGlobalAlias(subArgs, globalAliasNames) {
+					subArgs = ""
+				}
+			}
 			for _, m := range byName[ag.name] {
 				if m == nil || anchorSet[m.ID] {
 					continue
@@ -354,7 +408,7 @@ func ResolveCSharpInterfaceDispatchScoped(g graph.Store, scope map[string]bool) 
 
 	var batch []*graph.Edge
 	seen := map[string]bool{}
-	receiverFieldTypes := map[string]string{} // per (caller,file,line) cache of the receiver field's declared type text
+	receiverLookups := newCSharpReceiverLookupCtx()
 	for _, e := range callEdges {
 		if e == nil || e.IsSpeculative() || graph.IsUnresolvedTarget(e.To) {
 			continue
@@ -400,7 +454,10 @@ func ResolveCSharpInterfaceDispatchScoped(g graph.Store, scope map[string]bool) 
 			// it never pays the receiver lookup either.
 			srcArgs := f.implArgs[e.To]
 			if srcArgs == "" && len(f.implArgs) > 0 {
-				srcArgs = csharpReceiverDeclaredArgs(g, e, f.ifaceName, receiverFieldTypes)
+				srcArgs = csharpReceiverDeclaredArgs(g, e, f.ifaceID, f.ifaceName, receiverLookups)
+				if csharpArgsNameGlobalAlias(srcArgs, globalAliasNames) {
+					srcArgs = ""
+				}
 			}
 			for _, member := range f.members {
 				// Skip the member the call already reaches — and the CALLER
@@ -612,6 +669,80 @@ func csharpMemberMethodsAllByTypeFromEdges(edges []*graph.Edge, nodes map[string
 	return out
 }
 
+// csharpAliasComparableForms returns every form of a global-alias
+// identifier a type-argument stamp could carry: the canonical name
+// (verbatim prefix stripped — pre-normalization stores stamped it raw)
+// and, for an alias legally shadowing a BCL type name, the keyword the
+// extractor's canonicalization folds arguments onto. `global using
+// Int32 = App.Crate` makes a stamped "int" ambiguous — it may spell the
+// genuine keyword or the folded alias — and an ambiguous stamp must
+// refuse (never filter). The fold mirrors the parser's
+// csharpCanonicalTypeArg table; the packages stay independent, so keep
+// the two in sync.
+func csharpAliasComparableForms(alias string) []string {
+	name := strings.TrimPrefix(alias, "@")
+	if name == "" {
+		return nil
+	}
+	forms := []string{name}
+	folded := ""
+	switch name {
+	case "String":
+		folded = "string"
+	case "Boolean":
+		folded = "bool"
+	case "Byte":
+		folded = "byte"
+	case "SByte":
+		folded = "sbyte"
+	case "Char":
+		folded = "char"
+	case "Decimal":
+		folded = "decimal"
+	case "Double":
+		folded = "double"
+	case "Single":
+		folded = "float"
+	case "Int16":
+		folded = "short"
+	case "UInt16":
+		folded = "ushort"
+	case "Int32":
+		folded = "int"
+	case "UInt32":
+		folded = "uint"
+	case "Int64":
+		folded = "long"
+	case "UInt64":
+		folded = "ulong"
+	case "Object":
+		folded = "object"
+	case "IntPtr":
+		folded = "nint"
+	case "UIntPtr":
+		folded = "nuint"
+	}
+	if folded != "" {
+		forms = append(forms, folded)
+	}
+	return forms
+}
+
+// csharpArgsNameGlobalAlias reports whether any comma-separated argument in
+// a type-argument stamp names a project-global using alias — a spelling the
+// string comparison cannot resolve, so the stamp must be refused.
+func csharpArgsNameGlobalAlias(args string, aliases map[string]bool) bool {
+	if args == "" || len(aliases) == 0 {
+		return false
+	}
+	for _, a := range strings.Split(args, ",") {
+		if aliases[a] {
+			return true
+		}
+	}
+	return false
+}
+
 // containsInt reports whether xs contains v. Family lists are tiny (a method
 // belongs to one or two families), so a linear scan beats a map.
 func containsInt(xs []int, v int) bool {
@@ -661,16 +792,61 @@ func csharpShortTypeName(id string) string {
 // Typed LOCALS are a named remainder: the tenv strips generics before
 // receiver_type is stamped, so local-receiver sites keep the full
 // fan-out until the extractor carries local type arguments too.
-func csharpReceiverDeclaredArgs(g graph.Store, e *graph.Edge, ifaceName string, cache map[string]string) string {
+// csharpReceiverLookupCtx carries the per-pass receiver-evidence caches:
+// declared args per (caller, member, site, interface), each caller's
+// out-edge adjacency read ONCE and served to every site (the companion
+// scan and the field-read evidence scan both consume it), and resolved
+// field nodes by ID.
+type csharpReceiverLookupCtx struct {
+	args      map[string]string
+	outEdges  map[string][]*graph.Edge
+	fields    map[string]*graph.Node
+	fieldSeen map[string]bool
+}
+
+func newCSharpReceiverLookupCtx() *csharpReceiverLookupCtx {
+	return &csharpReceiverLookupCtx{
+		args:      map[string]string{},
+		outEdges:  map[string][]*graph.Edge{},
+		fields:    map[string]*graph.Node{},
+		fieldSeen: map[string]bool{},
+	}
+}
+
+func (c *csharpReceiverLookupCtx) callerOutEdges(g graph.Store, caller string) []*graph.Edge {
+	if es, ok := c.outEdges[caller]; ok {
+		return es
+	}
+	es := g.GetOutEdges(caller)
+	c.outEdges[caller] = es
+	return es
+}
+
+func (c *csharpReceiverLookupCtx) fieldNode(g graph.Store, id string) *graph.Node {
+	if c.fieldSeen[id] {
+		return c.fields[id]
+	}
+	c.fieldSeen[id] = true
+	n := g.GetNodesByIDs([]string{id})[id]
+	c.fields[id] = n
+	return n
+}
+
+func csharpReceiverDeclaredArgs(g graph.Store, e *graph.Edge, ifaceID, ifaceName string, lookups *csharpReceiverLookupCtx) string {
 	if e == nil || e.From == "" {
 		return ""
 	}
-	cacheKey := e.From + "\x00" + e.FilePath + "\x00" + strconv.Itoa(e.Line) + "\x00" + ifaceName
-	if v, ok := cache[cacheKey]; ok {
+	// The member (e.To) selects WHICH companion edge lends its receiver, so
+	// two different member calls sharing a line resolve different fields —
+	// a key without it lets the first call's arguments poison the second.
+	// The full interface ID keeps short-name twins from distinct families
+	// apart for the same reason.
+	cacheKey := e.From + "\x00" + e.To + "\x00" + e.FilePath + "\x00" + strconv.Itoa(e.Line) + "\x00" + ifaceID
+	if v, ok := lookups.args[cacheKey]; ok {
 		return v
 	}
 	args := ""
-	if field := csharpReceiverField(g, e); field != nil {
+	if field := csharpReceiverField(g, e, lookups); field != nil {
 		ft, _ := field.Meta["field_type"].(string)
 		prefix := strings.TrimSpace(ft)
 		if lt := strings.Index(prefix, "<"); lt > 0 {
@@ -683,14 +859,14 @@ func csharpReceiverDeclaredArgs(g graph.Store, e *graph.Edge, ifaceName string, 
 			args, _ = field.Meta["field_type_args"].(string)
 		}
 	}
-	cache[cacheKey] = args
+	lookups.args[cacheKey] = args
 	return args
 }
 
 // csharpReceiverField resolves the call site's receiver to a field (or
 // constant) node of the caller's own type, or nil when the receiver is
 // not an unambiguous bare same-type field.
-func csharpReceiverField(g graph.Store, e *graph.Edge) *graph.Node {
+func csharpReceiverField(g graph.Store, e *graph.Edge, lookups *csharpReceiverLookupCtx) *graph.Node {
 	name := ""
 	if e.Meta != nil {
 		if amb, _ := e.Meta["receiver_ambiguous"].(bool); amb {
@@ -705,7 +881,7 @@ func csharpReceiverField(g graph.Store, e *graph.Edge) *graph.Node {
 		// different call sharing the line can never lend its receiver.
 		memberName := csharpShortTypeName(e.To)
 		companionTo := "unresolved::*." + memberName
-		for _, out := range g.GetOutEdges(e.From) {
+		for _, out := range lookups.callerOutEdges(g, e.From) {
 			if out == nil || out.Kind != graph.EdgeCalls || out.To != companionTo {
 				continue
 			}
@@ -728,7 +904,31 @@ func csharpReceiverField(g graph.Store, e *graph.Edge) *graph.Node {
 	if ownerID == "" {
 		return nil
 	}
-	field := g.GetNodesByIDs([]string{ownerID + "." + name})[ownerID+"."+name]
+	fieldID := ownerID + "." + name
+	// Binding evidence: the field-identifier emitter refuses shadowed
+	// identifiers (a parameter or local with the field's name owns the
+	// identifier inside that method), so an EdgeReads at this exact site
+	// naming the field is proof the bare receiver really is the enclosing
+	// type's field. A name-only lookup would bind a shadowed identifier to
+	// the field it shadows and gate on the wrong declared arguments —
+	// without the read edge the receiver stays unknown (never filter).
+	fieldRead := false
+	for _, out := range lookups.callerOutEdges(g, e.From) {
+		if out == nil || out.Kind != graph.EdgeReads {
+			continue
+		}
+		if out.FilePath != e.FilePath || out.Line != e.Line {
+			continue
+		}
+		if out.To == "unresolved::*."+name || out.To == fieldID {
+			fieldRead = true
+			break
+		}
+	}
+	if !fieldRead {
+		return nil
+	}
+	field := lookups.fieldNode(g, fieldID)
 	if field == nil || field.Meta == nil ||
 		(field.Kind != graph.KindField && field.Kind != graph.KindConstant) {
 		return nil
