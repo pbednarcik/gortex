@@ -688,6 +688,13 @@ func (e *CSharpExtractor) extractCSharp(filePath string, src []byte) (*parser.Ex
 				// this./base.-qualified: the receiver type came from the
 				// enclosing declaration, not from any variable lookup.
 				edge.Meta = map[string]any{"receiver_type": c.recvType}
+				// A base-qualified call is STATIC dispatch - it can never
+				// reach an override, and the virtual fan-out must be able
+				// to skip the site. `this.` stays unmarked: a this-call
+				// still dispatches at runtime.
+				if c.receiver == "base" {
+					edge.Meta["receiver_qualifier"] = "base"
+				}
 			} else if recvType, ok := tenvByOwner[callerID][c.receiver]; ok {
 				edge.Meta = map[string]any{"receiver_type": recvType}
 				if shape := shapesByOwner[callerID][c.receiver]; shape != "" && shape != recvType {
@@ -1334,6 +1341,18 @@ func (e *CSharpExtractor) emitMethod(m parser.QueryResult, filePath, fileID stri
 	}
 	if csharpHasModifier(def.Node, src, "static") {
 		meta["static"] = true
+	}
+	// Runtime-dispatch evidence for the class-virtual fan-out: override
+	// outranks the introducing modifiers (a `sealed override` is still an
+	// override), and a plain or `new`-hiding member stamps nothing - it
+	// is statically bound and must never join a dispatch family.
+	switch {
+	case csharpHasModifier(def.Node, src, "override"):
+		meta["dispatch_modifier"] = "override"
+	case csharpHasModifier(def.Node, src, "abstract"):
+		meta["dispatch_modifier"] = "abstract"
+	case csharpHasModifier(def.Node, src, "virtual"):
+		meta["dispatch_modifier"] = "virtual"
 	}
 	// Extension method: a static method whose first parameter carries the
 	// `this` modifier. Record the receiver type it extends so member-call
