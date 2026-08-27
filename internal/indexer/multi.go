@@ -972,6 +972,22 @@ func (mi *MultiIndexer) runMasterResolveFiles(files []string, useLSP bool) {
 		zap.Int("files", len(files)),
 		zap.Int("pending_scanned", stats.PendingBefore),
 		zap.Int("pending_admitted", stats.PendingAfter))
+	mi.reconcileRetargetedTestCalls(master.TakeRetargetedTestCallFiles())
+}
+
+// reconcileRetargetedTestCalls re-runs the scoped test projection over the
+// caller files of test-classified calls a resolution pass just bound. The
+// receipt-exact catch-up lanes run with no global test-edges pass behind
+// them, so a call that binds later than its caller's projection would
+// otherwise never gain its EdgeTests. No-op on an empty frontier.
+func (mi *MultiIndexer) reconcileRetargetedTestCalls(files []string) {
+	if len(files) == 0 {
+		return
+	}
+	_, emitted := markTestSymbolsAndEmitEdgesScoped(mi.graph, nil, files...)
+	mi.logger.Info("DEFERRED-TIMING test-edges reconcile for retargeted callers",
+		zap.Int("files", len(files)),
+		zap.Int("edges", emitted))
 }
 
 // runMasterResolveNames rebinds pending references parked under the given

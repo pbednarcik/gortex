@@ -1,11 +1,16 @@
 package indexer
 
 import (
+	"context"
+	"os"
 	"path/filepath"
 	"testing"
 
+	"go.uber.org/zap"
+
 	"github.com/zzet/gortex/internal/graph"
 	"github.com/zzet/gortex/internal/graph/store_sqlite"
+	"github.com/zzet/gortex/internal/search"
 )
 
 func TestMarkTestSymbolsAndEmitEdges_GoStyle(t *testing.T) {
@@ -347,5 +352,179 @@ func TestMarkTestSymbolsAndEmitEdges_PersistsMetadataAcrossSQLiteReload(t *testi
 	}
 	if persistedEdges != 2 {
 		t.Fatalf("persisted EdgeTests = %d, want 2", persistedEdges)
+	}
+}
+
+func TestMarkTestSymbolsAndEmitEdges_SkipsUnresolvedCallTargets(t *testing.T) {
+	g := graph.New()
+	g.AddNode(&graph.Node{ID: "pkg/foo.go", Kind: graph.KindFile, Name: "pkg/foo.go", FilePath: "pkg/foo.go", Language: "go"})
+	g.AddNode(&graph.Node{ID: "pkg/foo_test.go", Kind: graph.KindFile, Name: "pkg/foo_test.go", FilePath: "pkg/foo_test.go", Language: "go"})
+	g.AddNode(&graph.Node{ID: "pkg/foo.go::Foo", Kind: graph.KindFunction, Name: "Foo", FilePath: "pkg/foo.go", Language: "go"})
+	g.AddNode(&graph.Node{ID: "pkg/foo_test.go::TestFoo", Kind: graph.KindFunction, Name: "TestFoo", FilePath: "pkg/foo_test.go", Language: "go"})
+
+	// One resolved subject call, one still-unresolved call (an assertion
+	// framework member the repo can never bind). Cloning the unresolved
+	// call would mint a tests edge with NONE of the original's receiver
+	// evidence - a later resolve pass then re-binds the naked clone
+	// without the guards that protect the calls edge.
+	g.AddEdge(&graph.Edge{From: "pkg/foo_test.go::TestFoo", To: "pkg/foo.go::Foo", Kind: graph.EdgeCalls, FilePath: "pkg/foo_test.go", Line: 10})
+	g.AddEdge(&graph.Edge{From: "pkg/foo_test.go::TestFoo", To: "unresolved::*.Equal", Kind: graph.EdgeCalls, FilePath: "pkg/foo_test.go", Line: 11})
+
+	_, emitted := markTestSymbolsAndEmitEdges(g)
+	if emitted != 1 {
+		t.Fatalf("expected 1 EdgeTests (the resolved subject only), got %d", emitted)
+	}
+	for _, e := range g.AllEdges() {
+		if e.Kind == graph.EdgeTests && graph.IsUnresolvedTarget(e.To) {
+			t.Fatalf("tests edge cloned an unresolved call: %+v", e)
+		}
+	}
+}
+
+// findEdge returns the first edge with the given kind, from, and to.
+func findEdge(g graph.Store, kind graph.EdgeKind, from, to string) *graph.Edge {
+	for _, e := range g.AllEdges() {
+		if e != nil && e.Kind == kind && e.From == from && e.To == to {
+			return e
+		}
+	}
+	return nil
+}
+
+// A call that is unresolved at projection time is correctly skipped - but
+// when the subject is added later and the incoming frontier binds the
+// call, the tests projection must be reconciled for the caller. The
+// definition-side derived plan never names the caller file, so without a
+// retarget frontier the valid EdgeTests is permanently absent.
+func TestIncrementalReindex_LaterResolvedCallGainsTestsProjection(t *testing.T) {
+	dir := t.TempDir()
+	writeFile(t, filepath.Join(dir, "foo_test.go"),
+		"package pkg\n\nimport \"testing\"\n\nfunc TestFoo(t *testing.T) { Foo() }\n")
+	writeFile(t, filepath.Join(dir, "foo.go"), "package pkg\n\nfunc Unrelated() {}\n")
+	g := graph.New()
+	idx := newTestIndexer(g)
+	if _, err := idx.Index(dir); err != nil {
+		t.Fatalf("cold index: %v", err)
+	}
+	if e := findEdge(g, graph.EdgeTests, "foo_test.go::TestFoo", "foo.go::Foo"); e != nil {
+		t.Fatalf("tests projection minted for an unresolved call: %+v", e)
+	}
+
+	// The subject arrives later as an EDIT to an existing production
+	// file - a declaration-level delta whose derived plan never names
+	// the caller file. The incremental pass binds the pending caller
+	// through the incoming frontier.
+	bumpMtime(t, filepath.Join(dir, "foo.go"),
+		"package pkg\n\nfunc Unrelated() {}\n\nfunc Foo() {}\n")
+	if _, err := idx.IncrementalReindexPaths(dir, nil); err != nil {
+		t.Fatalf("incremental reindex: %v", err)
+	}
+
+	if e := findEdge(g, graph.EdgeCalls, "foo_test.go::TestFoo", "foo.go::Foo"); e == nil {
+		t.Fatalf("fixture: the pending call must bind once the subject exists")
+	}
+	if e := findEdge(g, graph.EdgeTests, "foo_test.go::TestFoo", "foo.go::Foo"); e == nil {
+		t.Fatalf("resolved test call has no EdgeTests projection")
+	}
+}
+
+// The rebind sibling: the subject moves to another file, the caller file
+// itself never changes - the projection must follow the retargeted call.
+func TestIncrementalReindex_RebindMovesTestsProjection(t *testing.T) {
+	dir := t.TempDir()
+	writeFile(t, filepath.Join(dir, "foo_test.go"),
+		"package pkg\n\nimport \"testing\"\n\nfunc TestFoo(t *testing.T) { Foo() }\n")
+	writeFile(t, filepath.Join(dir, "foo.go"), "package pkg\n\nfunc Foo() {}\n")
+	g := graph.New()
+	idx := newTestIndexer(g)
+	if _, err := idx.Index(dir); err != nil {
+		t.Fatalf("cold index: %v", err)
+	}
+	if e := findEdge(g, graph.EdgeTests, "foo_test.go::TestFoo", "foo.go::Foo"); e == nil {
+		t.Fatalf("fixture: cold index must project the resolved test call")
+	}
+
+	// Move the subject: delete foo.go, define Foo in bar.go.
+	if err := os.Remove(filepath.Join(dir, "foo.go")); err != nil {
+		t.Fatalf("remove foo.go: %v", err)
+	}
+	writeFile(t, filepath.Join(dir, "bar.go"), "package pkg\n\nfunc Foo() {}\n")
+	if _, err := idx.IncrementalReindexPaths(dir, nil); err != nil {
+		t.Fatalf("incremental reindex: %v", err)
+	}
+
+	if e := findEdge(g, graph.EdgeCalls, "foo_test.go::TestFoo", "bar.go::Foo"); e == nil {
+		t.Fatalf("fixture: the restubbed call must rebind to the moved subject")
+	}
+	if e := findEdge(g, graph.EdgeTests, "foo_test.go::TestFoo", "bar.go::Foo"); e == nil {
+		t.Fatalf("rebound test call has no EdgeTests projection")
+	}
+	if e := findEdge(g, graph.EdgeTests, "foo_test.go::TestFoo", "foo.go::Foo"); e != nil {
+		t.Fatalf("stale projection to the evicted subject survived: %+v", e)
+	}
+}
+
+// The declaration-only shape: a definition-side derived plan carries
+// neither the runtime nor the tests flag, so the coordinator previously
+// skipped test projection entirely - even though the resolution step of
+// the same apply just bound a pending TEST caller to the new subject.
+// The resolution pass must report its retargeted test-call frontier and
+// the coordinator must reconcile those callers regardless of plan flags.
+func TestDeclarationOnlyPlanReconcilesLaterResolvedTestCall(t *testing.T) {
+	g := graph.New()
+	g.AddNode(&graph.Node{ID: "pkg/foo_test.go", Kind: graph.KindFile, Name: "pkg/foo_test.go", FilePath: "pkg/foo_test.go", Language: "go"})
+	g.AddNode(&graph.Node{ID: "pkg/foo_test.go::TestFoo", Kind: graph.KindFunction, Name: "TestFoo", FilePath: "pkg/foo_test.go", Language: "go"})
+	call := &graph.Edge{From: "pkg/foo_test.go::TestFoo", To: graph.UnresolvedMarker + "Foo", Kind: graph.EdgeCalls, FilePath: "pkg/foo_test.go", Line: 5}
+	g.AddEdge(call)
+	if _, emitted := markTestSymbolsAndEmitEdges(g); emitted != 0 {
+		t.Fatalf("fixture: an unresolved call must not project, emitted %d", emitted)
+	}
+
+	// The subject arrives; the incoming pass binds the pending caller.
+	g.AddNode(&graph.Node{ID: "pkg/foo.go", Kind: graph.KindFile, Name: "pkg/foo.go", FilePath: "pkg/foo.go", Language: "go"})
+	g.AddNode(&graph.Node{ID: "pkg/foo.go::Foo", Kind: graph.KindFunction, Name: "Foo", FilePath: "pkg/foo.go", Language: "go"})
+	idx := newTestIndexer(g)
+	idx.resolver.ResolveIncomingForFile("pkg/foo.go")
+	if call.To != "pkg/foo.go::Foo" {
+		t.Fatalf("fixture: the pending call must bind, got %q", call.To)
+	}
+
+	idx.runStandaloneIncrementalDerivedPasses(DerivedInvalidationPlan{
+		Flags: DerivedInvalidatesDeclarations,
+		Files: []string{"pkg/foo.go"},
+	})
+
+	if e := findEdge(g, graph.EdgeTests, "pkg/foo_test.go::TestFoo", "pkg/foo.go::Foo"); e == nil {
+		t.Fatalf("resolved test call has no EdgeTests projection")
+	}
+}
+
+// The cross-repository sibling: an inbound test call from repoA binds into
+// a repoB subject through the cross-repo pass, which has no derived plan
+// at all - the reconcile must ride the pass itself.
+func TestCrossRepoResolveReconcilesRetargetedTestCall(t *testing.T) {
+	g := graph.New()
+	g.AddNode(&graph.Node{ID: "repoA/pkg/a_test.go", Kind: graph.KindFile, Name: "a_test.go", FilePath: "repoA/pkg/a_test.go", Language: "go", RepoPrefix: "repoA", WorkspaceID: "ws"})
+	g.AddNode(&graph.Node{ID: "repoA/pkg/a_test.go::TestCaller", Kind: graph.KindFunction, Name: "TestCaller", FilePath: "repoA/pkg/a_test.go", Language: "go", RepoPrefix: "repoA", WorkspaceID: "ws"})
+	g.AddNode(&graph.Node{ID: "repoB/lib/c.go", Kind: graph.KindFile, Name: "c.go", FilePath: "repoB/lib/c.go", Language: "go", RepoPrefix: "repoB", WorkspaceID: "ws"})
+	g.AddNode(&graph.Node{ID: "repoB/lib/c.go::Helper", Kind: graph.KindFunction, Name: "Helper", FilePath: "repoB/lib/c.go", Language: "go", RepoPrefix: "repoB", WorkspaceID: "ws"})
+	// Import-reachability evidence for the cross-repo fallback.
+	g.AddEdge(&graph.Edge{From: "repoA/pkg/a_test.go", To: "repoB/lib/c.go", Kind: graph.EdgeImports, FilePath: "repoA/pkg/a_test.go", Line: 1})
+	call := &graph.Edge{From: "repoA/pkg/a_test.go::TestCaller", To: graph.UnresolvedMarker + "Helper", Kind: graph.EdgeCalls, FilePath: "repoA/pkg/a_test.go", Line: 5}
+	g.AddEdge(call)
+
+	if _, emitted := markTestSymbolsAndEmitEdges(g); emitted != 0 {
+		t.Fatalf("fixture: an unresolved call must not project, emitted %d", emitted)
+	}
+
+	mi := NewMultiIndexer(g, newTestRegistry(), search.NewNull(), nil, zap.NewNop())
+	if err := mi.runCrossRepoResolveContext(context.Background(), false); err != nil {
+		t.Fatalf("cross-repo resolve: %v", err)
+	}
+	if call.To != "repoB/lib/c.go::Helper" {
+		t.Fatalf("fixture: the cross-repo pass must bind the call, got %q", call.To)
+	}
+	if e := findEdge(g, graph.EdgeTests, "repoA/pkg/a_test.go::TestCaller", "repoB/lib/c.go::Helper"); e == nil {
+		t.Fatalf("cross-repo resolved test call has no EdgeTests projection")
 	}
 }
