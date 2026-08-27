@@ -1,6 +1,7 @@
 package licenses
 
 import (
+	"path/filepath"
 	"testing"
 
 	"github.com/zzet/gortex/internal/graph"
@@ -69,6 +70,26 @@ func TestBuildGraphArtifacts(t *testing.T) {
 	}
 	if edges[0].From != "pkg/foo.go" || edges[0].To != "license::MIT" {
 		t.Errorf("edge endpoints wrong: %s -> %s", edges[0].From, edges[0].To)
+	}
+}
+
+func TestBuildGraphArtifacts_PreservesCallerPathSpelling(t *testing.T) {
+	// The indexer keys eviction and incremental replacement by the
+	// exact relPath spelling it hands the builder; a re-spelled edge
+	// endpoint dangles from a nonexistent file node on Windows.
+	rel := filepath.Join("src", "data", "foo.go")
+	nodes, edges := BuildGraphArtifacts(rel, "MIT", "go")
+	if len(nodes) != 1 || len(edges) != 1 {
+		t.Fatalf("nodes = %d, edges = %d", len(nodes), len(edges))
+	}
+	if nodes[0].FilePath != rel {
+		t.Errorf("node file path = %q, want %q", nodes[0].FilePath, rel)
+	}
+	if edges[0].From != rel {
+		t.Errorf("edge.From = %q, want %q", edges[0].From, rel)
+	}
+	if edges[0].FilePath != rel {
+		t.Errorf("edge file path = %q, want %q", edges[0].FilePath, rel)
 	}
 }
 

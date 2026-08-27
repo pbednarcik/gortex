@@ -1,6 +1,7 @@
 package fixtures
 
 import (
+	"path/filepath"
 	"testing"
 
 	"github.com/zzet/gortex/internal/graph"
@@ -81,6 +82,27 @@ func TestBuildGraphArtifacts(t *testing.T) {
 			t.Errorf("expected nil, got %+v", nodes)
 		}
 	})
+}
+
+func TestBuildGraphArtifacts_PreservesCallerPathSpelling(t *testing.T) {
+	// The standalone fixture node deliberately reuses the file path
+	// as its node ID so it merges with the file identity; that only
+	// works when the spelling matches the extractor's relPath exactly
+	// (OS-native separators for subdirectory files on Windows).
+	rel := filepath.Join("pkg", "testdata", "foo.bin")
+	nodes := BuildGraphArtifacts(rel, "binary")
+	if len(nodes) != 1 {
+		t.Fatalf("nodes = %d", len(nodes))
+	}
+	if nodes[0].ID != rel {
+		t.Errorf("node id = %q, want %q", nodes[0].ID, rel)
+	}
+	if nodes[0].FilePath != rel {
+		t.Errorf("node file path = %q, want %q", nodes[0].FilePath, rel)
+	}
+	if nodes[0].Name != "foo.bin" {
+		t.Errorf("node name = %q", nodes[0].Name)
+	}
 }
 
 func TestReclassifyFileToFixture(t *testing.T) {

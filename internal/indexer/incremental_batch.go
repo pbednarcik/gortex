@@ -1041,6 +1041,21 @@ func restubIncomingRefsFromView(
 
 func evictFilesBatched(g graph.Store, paths []string) (int, int) {
 	paths = appendUniqueSorted(nil, paths...)
+	// Stores written before the coverage-domain builders preserved the
+	// extractor's path spelling hold todo/fixture rows keyed by the
+	// forward-slash spelling of these same files (nothing else ever
+	// minted a re-spelled FilePath). Sweep that twin spelling so a
+	// file's replacement or deletion heals its stale rows; on POSIX
+	// the twin equals the native spelling and adds nothing.
+	var twins []string
+	for _, path := range paths {
+		if twin := filepath.ToSlash(path); twin != path {
+			twins = append(twins, twin)
+		}
+	}
+	if len(twins) > 0 {
+		paths = appendUniqueSorted(paths, twins...)
+	}
 	if len(paths) == 0 {
 		return 0, 0
 	}

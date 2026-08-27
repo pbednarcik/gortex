@@ -53,8 +53,16 @@ jobs:
       - name: Build all packages
         run: go build ./...
 
+      # ./internal/agents is one package and does not recurse, so the
+      # opencode adapter is named explicitly. Its plugin asset is embedded
+      # verbatim with go:embed and TestPluginFailsOpen parses it by
+      # splitting on "\n}\n", which is the closest thing the suite has to a
+      # detector for a CRLF checkout of an embedded file — and it can only
+      # fire on a runner that converts line endings.
       - name: Test Windows agent integrations
-        run: go test -timeout=5m -count=1 ./internal/agents
+        run: >
+          go test -timeout=5m -count=1
+          ./internal/agents ./internal/agents/opencode
 
       # Symlink confinement keeps out-of-repo files out of the index, and it
       # reads differently on Windows: a symlink reparse point maps to

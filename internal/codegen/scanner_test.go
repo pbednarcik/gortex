@@ -1,6 +1,7 @@
 package codegen
 
 import (
+	"path/filepath"
 	"testing"
 
 	"github.com/zzet/gortex/internal/graph"
@@ -81,6 +82,23 @@ func TestScan_Variants(t *testing.T) {
 				t.Errorf("Source = %q, want %q", got.Source, tc.source)
 			}
 		})
+	}
+}
+
+func TestBuildGraphArtifacts_PreservesCallerPathSpelling(t *testing.T) {
+	// The indexer keys eviction and incremental replacement by the
+	// exact relPath spelling it hands the builder; a re-spelled edge
+	// endpoint dangles from a nonexistent file node on Windows.
+	rel := filepath.Join("src", "gen", "foo.pb.go")
+	edges := BuildGraphArtifacts(rel, Marker{Generated: true, Tool: "protoc-gen-go"})
+	if len(edges) != 1 {
+		t.Fatalf("edges = %d", len(edges))
+	}
+	if edges[0].From != rel {
+		t.Errorf("edge.From = %q, want %q", edges[0].From, rel)
+	}
+	if edges[0].FilePath != rel {
+		t.Errorf("edge file path = %q, want %q", edges[0].FilePath, rel)
 	}
 }
 
