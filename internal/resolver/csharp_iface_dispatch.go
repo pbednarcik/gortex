@@ -36,6 +36,18 @@ import (
 // in the DEFAULT find_usages / get_callers result. Family membership is
 // established strictly through the implements/extends chain — never by name
 // matching alone — so unrelated same-named methods are never linked.
+//
+// CLASS-VIRTUAL families are the second anchor source: a base-class method
+// the extractor stamped virtual/abstract seeds the family of its override
+// closure, exactly as an interface member seeds its implementations —
+// Roslyn links both shapes identically. Three deliberate asymmetries:
+// members must carry the override stamp (a name-matched `new`-hiding or
+// unrelated declaration is statically bound and never joins); a
+// base-qualified call site (`base.Flush()`) is static dispatch and never
+// fans; and the stamps double as the deployment gate — a store extracted
+// before they existed seeds no class families until the extractor-version
+// salt re-extracts it. An external root (BCL virtuals like ToString) has
+// no in-graph anchor, so object-override whales never form families here.
 
 // csharpIfaceDispatchCap bounds the family size (every interface-member
 // overload node plus every implementing method node). C# overloads mint one
@@ -233,11 +245,19 @@ func ResolveCSharpInterfaceDispatchScoped(g graph.Store, scope map[string]bool) 
 	// Anchor discovery: every C# interface member method node, via its
 	// EdgeMemberOf owner, grouped by (interface, name) so the interface's own
 	// overload nodes land in ONE family rather than seeding duplicates.
+	// Class-virtual roots anchor the same way: a method the extractor
+	// stamped virtual/abstract seeds the override family of its class —
+	// Roslyn links a virtual member and its override closure exactly as it
+	// links an interface member and its implementations. The stamp is the
+	// admission ticket on BOTH sides (members must be stamped override), so
+	// name-matched hiding never joins, and a store extracted before the
+	// stamp existed synthesizes no class families until it re-extracts.
 	type anchorGroup struct {
-		ifaceID    string
-		name       string
-		repoPrefix string
-		nodeIDs    []string
+		ifaceID     string
+		name        string
+		repoPrefix  string
+		nodeIDs     []string
+		virtualRoot bool
 	}
 	anchorGroups := map[string]*anchorGroup{}
 	var anchorOrder []string
@@ -246,13 +266,21 @@ func ResolveCSharpInterfaceDispatchScoped(g graph.Store, scope map[string]bool) 
 			continue
 		}
 		m := anchorNodes[e.From]
-		if m == nil || m.Kind != graph.KindMethod || m.Language != "csharp" || !csharpIsIfaceMember(m) {
+		if m == nil || m.Kind != graph.KindMethod || m.Language != "csharp" {
 			continue
+		}
+		virtualRoot := false
+		if !csharpIsIfaceMember(m) {
+			mod := csharpDispatchModifier(m)
+			if mod != "virtual" && mod != "abstract" {
+				continue
+			}
+			virtualRoot = true
 		}
 		key := e.To + "\x00" + m.Name
 		ag := anchorGroups[key]
 		if ag == nil {
-			ag = &anchorGroup{ifaceID: e.To, name: m.Name, repoPrefix: m.RepoPrefix}
+			ag = &anchorGroup{ifaceID: e.To, name: m.Name, repoPrefix: m.RepoPrefix, virtualRoot: virtualRoot}
 			anchorGroups[key] = ag
 			anchorOrder = append(anchorOrder, key)
 		}
@@ -261,6 +289,7 @@ func ResolveCSharpInterfaceDispatchScoped(g graph.Store, scope map[string]bool) 
 	if len(anchorGroups) == 0 {
 		return 0
 	}
+
 
 	// A variance-declaring interface (ISource<out T> / ISink<in T>) makes
 	// differently-closed constructions assignable across the family, so the
@@ -310,12 +339,43 @@ func ResolveCSharpInterfaceDispatchScoped(g graph.Store, scope map[string]bool) 
 		return out
 	}
 
+	// Virtual families admit only override-stamped members, and the compact
+	// member projection strips Meta — fetch the candidate members' full
+	// nodes once, for the virtual anchor groups only.
+	virtualMemberMods := map[string]string{}
+	{
+		candidateIDs := make([]string, 0)
+		seenCandidates := map[string]bool{}
+		for _, key := range anchorOrder {
+			ag := anchorGroups[key]
+			if !ag.virtualRoot {
+				continue
+			}
+			for _, sub := range descendants(ag.ifaceID) {
+				for _, m := range membersByType[sub][ag.name] {
+					if m != nil && !seenCandidates[m.ID] {
+						seenCandidates[m.ID] = true
+						candidateIDs = append(candidateIDs, m.ID)
+					}
+				}
+			}
+		}
+		if len(candidateIDs) > 0 {
+			for id, n := range g.GetNodesByIDs(candidateIDs) {
+				if mod := csharpDispatchModifier(n); mod != "" {
+					virtualMemberMods[id] = mod
+				}
+			}
+		}
+	}
+
 	// Build families and the member → families index.
 	type family struct {
-		ifaceID   string
-		ifaceName string // short interface name, for matching a receiver's declared field type
-		members   []string
-		implArgs  map[string]string // member method ID → its DIRECT implementor's stamped type args ("" absent = never filter)
+		ifaceID     string
+		ifaceName   string // short root-type name, for matching a receiver's declared field type
+		members     []string
+		implArgs    map[string]string // member method ID → its DIRECT implementor's stamped type args ("" absent = never filter)
+		virtualRoot bool
 	}
 	var families []family
 	famsOfMember := map[string][]int{}
@@ -349,6 +409,13 @@ func ResolveCSharpInterfaceDispatchScoped(g graph.Store, scope map[string]bool) 
 				if m.RepoPrefix != ag.repoPrefix {
 					continue
 				}
+				// A virtual family admits only override-stamped members: a
+				// name-matched descendant member without the stamp is a
+				// `new`-hiding or unrelated declaration — statically bound,
+				// never a dispatch target.
+				if ag.virtualRoot && virtualMemberMods[m.ID] != "override" {
+					continue
+				}
 				memberIDs = append(memberIDs, m.ID)
 				if subArgs != "" {
 					memberArgs[m.ID] = subArgs
@@ -364,7 +431,7 @@ func ResolveCSharpInterfaceDispatchScoped(g graph.Store, scope map[string]bool) 
 		idx := len(families)
 		families = append(families, family{
 			ifaceID: ag.ifaceID, ifaceName: csharpShortTypeName(ag.ifaceID),
-			members: memberIDs, implArgs: memberArgs,
+			members: memberIDs, implArgs: memberArgs, virtualRoot: ag.virtualRoot,
 		})
 		for _, id := range memberIDs {
 			famsOfMember[id] = append(famsOfMember[id], idx)
@@ -442,6 +509,15 @@ func ResolveCSharpInterfaceDispatchScoped(g graph.Store, scope map[string]bool) 
 				continue
 			}
 			f := families[fi]
+			// A base-qualified site (`base.Flush()`) is STATIC dispatch —
+			// it executes exactly the member it binds, never an override —
+			// so a virtual family must not fan it. Interface members can
+			// never be base-qualified, so iface families skip the check.
+			if f.virtualRoot && e.Meta != nil {
+				if q, _ := e.Meta["receiver_qualifier"].(string); q == "base" {
+					continue
+				}
+			}
 			// Constructed-interface gate (G9): the source site's own type
 			// arguments — a sibling site bound to a stamped implementor
 			// carries that implementor's args; a through-interface site
@@ -582,6 +658,17 @@ func csharpIsIfaceMember(n *graph.Node) bool {
 	}
 	v, _ := n.Meta["iface_member"].(bool)
 	return v
+}
+
+// csharpDispatchModifier returns the extractor's runtime-dispatch stamp on
+// a C# method node: "virtual" / "abstract" (family roots), "override"
+// (family members), or "" for a statically-bound member.
+func csharpDispatchModifier(n *graph.Node) string {
+	if n == nil || n.Meta == nil {
+		return ""
+	}
+	mod, _ := n.Meta["dispatch_modifier"].(string)
+	return mod
 }
 
 // csharpIfaceDispatchEdge builds one fan-out call edge from the call site e to
