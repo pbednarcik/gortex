@@ -708,11 +708,18 @@ func (e *CSharpExtractor) extractCSharp(filePath string, src []byte) (*parser.Ex
 	// already covered by emitCSharpBaseList, so it is not re-emitted here.
 	emitCSharpReferenceForms(root, src, filePath, fileID, result)
 
-	// Two same-named member calls on ONE line (`_a.Fetch(_b.Fetch(1))`)
-	// dedupe to a single stored edge — identical (from, to, kind, file,
-	// line) — carrying one arbitrary receiver's evidence. Mark those sites
-	// so no downstream consumer applies one receiver's typing to the other
-	// call's edge (the dispatch gate's receiver evidence in particular).
+	// Two same-named calls on ONE line whose receivers differ make the
+	// line unattributable: member companions dedupe to a single stored
+	// edge (`_a.Fetch(_b.Fetch(1))`), and a receiverless implicit-this
+	// call (`Get(1) + _widgets.Get(2)`) leaves the line's only
+	// `unresolved::*.Get` companion as the join target for a bound edge
+	// that is not its call. Mark those sites so no downstream consumer
+	// applies one receiver's typing to the other call's edge (the
+	// dispatch gate's receiver evidence in particular).
+	//
+	// EVERY call seeds the index — the receiverless form as the empty
+	// receiver — because an empty receiver differing from a spelled one
+	// is exactly as disqualifying as two spelled receivers differing.
 	type csharpCallSite struct {
 		name string
 		line int
@@ -720,9 +727,6 @@ func (e *CSharpExtractor) extractCSharp(filePath string, src []byte) (*parser.Ex
 	memberSiteReceiver := map[csharpCallSite]string{}
 	memberSiteAmbiguous := map[csharpCallSite]bool{}
 	for _, c := range calls {
-		if !c.isMember || c.receiver == "" {
-			continue
-		}
 		key := csharpCallSite{c.name, c.line}
 		if prev, ok := memberSiteReceiver[key]; ok {
 			if prev != c.receiver {

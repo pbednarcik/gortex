@@ -109,3 +109,51 @@ func TestResolveCSharpInterfaceDispatch_BindingFormsShadowFieldReceivers(t *test
 		})
 	}
 }
+
+// A receiverless call is a call on `this`, and it can share a line with
+// a field-receiver call of the same member name:
+//
+//	return Get(1) + _widgets.Get(2);
+//
+// The bare call's bound edge carries no receiver meta, so the receiver
+// join falls back to the only `unresolved::*.Get` companion on the line
+// - the SIBLING's - and adopts its Widget closure for a call whose real
+// receiver is a Flow (an IBox<Crate>). The actual callee is dropped and
+// the type-impossible implementor is the only survivor.
+//
+// The site-ambiguity index skipped receiverless calls entirely, so the
+// steal went unmarked. An empty receiver differing from `_widgets` is
+// exactly as disqualifying as a different spelled one.
+func TestResolveCSharpInterfaceDispatch_ImplicitThisNeverStealsSiblingReceiver(t *testing.T) {
+	g := buildCSharpResolverGraph(t, map[string]string{
+		"F.cs": `namespace App {
+    public class Crate { }
+    public class Widget { }
+    public interface IBox<T> { int Get(int id); }
+    public class WidgetBox : IBox<Widget> { public int Get(int id) { return 2; } }
+    public class Mid : IBox<Crate> { public int Get(int id) { return 1; } }
+    public class Flow : Mid {
+        private readonly IBox<Widget> _widgets;
+        public Flow(IBox<Widget> w) { _widgets = w; }
+        public int Pull() { return Get(1) + _widgets.Get(2); }
+    }
+}`,
+	})
+	New(g).ResolveAll()
+
+	// The bare Get(1) binds through the interface family like any
+	// member call the enrichment tier resolves; its bound edge carries
+	// no receiver evidence of its own.
+	const callerID = "F.cs::Flow.Pull"
+	bindMemberCallAtLine(t, g, callerID, "Get", "F.cs::IBox.Get")
+	ResolveCSharpInterfaceDispatch(g)
+
+	// With the line marked ambiguous nothing at the site may filter, so
+	// the fan-out keeps every implementor - the actual callee Mid.Get
+	// included.
+	assert.ElementsMatch(t, []string{
+		"F.cs::Mid.Get",
+		"F.cs::WidgetBox.Get",
+	}, dispatchTargets(g, callerID),
+		"a receiverless implicit-this call marks its line ambiguous rather than borrowing the sibling's receiver")
+}
