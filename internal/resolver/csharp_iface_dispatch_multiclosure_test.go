@@ -100,3 +100,59 @@ func TestResolveCSharpInterfaceDispatch_SecondClosureViaBaseClass(t *testing.T) 
 	}, dispatchTargets(g, callerID),
 		"a closure inherited through a base class is still a second closure")
 }
+
+// 2c: both constructions are in the type's OWN base list, but one is
+// spelled namespace-qualified. This is the duplicate guard's blind spot
+// rather than the hierarchy walk's: the guard counts base entries by
+// name, and the name extractor returned the namespace segment for a
+// qualified entry whose final segment is generic. `App.IBox<Crate>` and
+// `IBox<Widget>` therefore counted as App=1 and IBox=1, both entries
+// stamped, and the type looked unambiguous.
+//
+// Two commits close it - the extractor descending to the final segment,
+// and the count spanning a whole type ID - so this is the end-to-end
+// pin that the two together actually cover the reported shape.
+func TestResolveCSharpInterfaceDispatch_QualifiedSpellingCountsAsDuplicate(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		bases string
+	}{
+		// zzet's control: with both entries spelled bare, the guard
+		// already fired. Keeping it here makes a future regression in
+		// the qualified path distinguishable from one in the guard.
+		{"control: both bases bare", "IBox<Crate>, IBox<Widget>"},
+		{"one base namespace-qualified", "App.IBox<Crate>, IBox<Widget>"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			g := buildCSharpResolverGraph(t, map[string]string{
+				"Qual.cs": `namespace App {
+    public class Crate { }
+    public class Widget { }
+    public interface IBox<T> { void Put(T item); }
+    public class PlainCrateBox : IBox<Crate> { public void Put(Crate c) { } }
+    public class Dual : ` + tc.bases + ` {
+        public void Put(Crate c) { }
+        public void Put(Widget w) { }
+    }
+    public class Flow {
+        private readonly IBox<Crate> _box;
+        public Flow(IBox<Crate> b) { _box = b; }
+        public void Pull(Crate c) { _box.Put(c); }
+    }
+}`,
+			})
+			New(g).ResolveAll()
+
+			const callerID = "Qual.cs::Flow.Pull"
+			bindFieldReceiverCall(t, g, callerID, "_box", "Qual.cs::IBox.Put")
+			ResolveCSharpInterfaceDispatch(g)
+
+			assert.ElementsMatch(t, []string{
+				"Qual.cs::PlainCrateBox.Put",
+				"Qual.cs::Dual.Put",
+				"Qual.cs::Dual.Put_L8",
+			}, dispatchTargets(g, callerID),
+				"a qualified spelling names the same interface, so the entry is still a duplicate")
+		})
+	}
+}
