@@ -136,13 +136,22 @@ func ResolveCSharpInterfaceDispatchScoped(g graph.Store, scope map[string]bool) 
 	hierarchySources := g.GetNodesByIDs(hierarchySourceIDs)
 	hierarchyByName := g.FindNodesByNames(hierarchyNames)
 	children := map[string][]string{}
-	// Direct implementors' stamped CLOSED type arguments per interface
-	// (extractor: target_type_args on generic base-list entries) — the
-	// evidence half of the G9 gate: an IBoxStore<Crate> receiver never
-	// dispatches into the IBoxStore<Widget> implementor. Absent for
-	// non-generic bases, open generics, transitive descendants, and
-	// non-simple arguments — absence always means "do not filter".
-	implArgs := map[string]map[string]string{}
+	// Every hierarchy edge, carrying whatever CLOSED type arguments the
+	// extractor stamped on it (target_type_args on generic base-list
+	// entries) — the evidence half of the G9 gate: an IBoxStore<Crate>
+	// receiver never dispatches into the IBoxStore<Widget> implementor.
+	// Absent for non-generic bases, open generics and non-simple
+	// arguments — absence always means "do not filter".
+	//
+	// UNSTAMPED edges are recorded too, as the empty string. A type can
+	// implement several constructions of one erased interface, and those
+	// constructions can arrive through an inherited interface or a base
+	// class rather than the type's own base list. Deciding whether one
+	// closure describes a type means walking every path it has to that
+	// interface, and a path carrying no closure is exactly as
+	// disqualifying as two different ones.
+	implEdges := map[string]map[string][]string{}
+	anyStamps := false
 	for _, e := range hierarchyEdges {
 		if e == nil || e.From == "" || e.To == "" {
 			continue
@@ -158,16 +167,19 @@ func ResolveCSharpInterfaceDispatchScoped(g graph.Store, scope map[string]bool) 
 			}
 		}
 		children[toID] = append(children[toID], e.From)
+		args := ""
 		if e.Meta != nil {
-			if args, _ := e.Meta["target_type_args"].(string); args != "" {
-				m := implArgs[e.From]
-				if m == nil {
-					m = map[string]string{}
-					implArgs[e.From] = m
-				}
-				m[toID] = args
-			}
+			args, _ = e.Meta["target_type_args"].(string)
 		}
+		if args != "" {
+			anyStamps = true
+		}
+		m := implEdges[e.From]
+		if m == nil {
+			m = map[string][]string{}
+			implEdges[e.From] = m
+		}
+		m[toID] = append(m[toID], args)
 	}
 	if len(children) == 0 {
 		return 0
@@ -183,7 +195,7 @@ func ResolveCSharpInterfaceDispatchScoped(g graph.Store, scope map[string]bool) 
 	// only when stamps exist to gate with; the union across repos is
 	// deliberate — over-refusing can only PRESERVE edges.
 	globalAliasNames := map[string]bool{}
-	if len(implArgs) > 0 {
+	if anyStamps {
 		for n := range graph.NodesByKindsSeq(g, graph.KindFile) {
 			if n == nil || n.Meta == nil {
 				continue
@@ -312,6 +324,23 @@ func ResolveCSharpInterfaceDispatchScoped(g graph.Store, scope map[string]bool) 
 		return out
 	}
 
+	// The single closure by which each descendant reaches an interface,
+	// or "" where that is not unique. Computed once per interface and
+	// shared across its anchors, like descCache — an interface with many
+	// members would otherwise re-walk the same hierarchy per member.
+	closureCache := map[string]map[string]string{}
+	closuresFor := func(ifaceID string) map[string]string {
+		if c, ok := closureCache[ifaceID]; ok {
+			return c
+		}
+		out := map[string]string{}
+		for _, sub := range descendants(ifaceID) {
+			out[sub] = csharpUniqueClosureToIface(sub, ifaceID, implEdges)
+		}
+		closureCache[ifaceID] = out
+		return out
+	}
+
 	// Build families and the member → families index.
 	type family struct {
 		ifaceID   string
@@ -338,7 +367,7 @@ func ResolveCSharpInterfaceDispatchScoped(g graph.Store, scope map[string]bool) 
 			}
 			subArgs := ""
 			if !variant {
-				subArgs = implArgs[sub][ag.ifaceID]
+				subArgs = closuresFor(ag.ifaceID)[sub]
 				if csharpArgsNameGlobalAlias(subArgs, globalAliasNames) {
 					subArgs = ""
 				}
@@ -731,6 +760,67 @@ func csharpAliasComparableForms(alias string) []string {
 // csharpArgsNameGlobalAlias reports whether any comma-separated argument in
 // a type-argument stamp names a project-global using alias — a spelling the
 // string comparison cannot resolve, so the stamp must be refused.
+// csharpUniqueClosureToIface returns the closed type arguments by which
+// sub reaches ifaceID, or "" when that is not a single known closure.
+//
+// A stamp describes one construction, but the gate applies it to every
+// same-named member of the implementor, so it is only sound when the
+// implementor reaches the interface exactly one way. C# permits several:
+// `class C : IEnumerable<int>, IEnumerable<string>` is legal whenever
+// the arguments cannot unify (CS0695 fires only when they could), and a
+// construction can also arrive through an inherited interface or a base
+// class instead of the type's own base list.
+//
+// The rule is deliberately asymmetric: only the implementor's OWN direct
+// closure can qualify it for filtering, while evidence found anywhere up
+// the hierarchy can disqualify it. A transitive descendant has never
+// been filterable — the closure belongs to an intermediate type, not to
+// this one — and this walk does not change that. What it adds is the
+// ability to NOTICE a second construction arriving through an inherited
+// interface or a base class, and to refuse on it.
+//
+// So the walk can only ever remove filtering power, never add it. That
+// keeps the existing conservative rules intact and makes every outcome
+// change here a preserved edge rather than a dropped one.
+func csharpUniqueClosureToIface(sub, ifaceID string, implEdges map[string]map[string][]string) string {
+	// The implementor's own base list. Absent, ambiguous, or unstamped
+	// means there is nothing to filter on, exactly as before.
+	direct := ""
+	for _, c := range implEdges[sub][ifaceID] {
+		if c == "" || (direct != "" && direct != c) {
+			return ""
+		}
+		direct = c
+	}
+	if direct == "" {
+		return ""
+	}
+
+	// Any OTHER path to the same interface that disagrees — including one
+	// carrying no closure at all, which means a construction we cannot
+	// read — proves no single closure describes this type.
+	visited := map[string]bool{sub: true}
+	queue := []string{sub}
+	for len(queue) > 0 {
+		cur := queue[0]
+		queue = queue[1:]
+		for to, closures := range implEdges[cur] {
+			if to == ifaceID && cur != sub {
+				for _, c := range closures {
+					if c != direct {
+						return ""
+					}
+				}
+			}
+			if !visited[to] {
+				visited[to] = true
+				queue = append(queue, to)
+			}
+		}
+	}
+	return direct
+}
+
 func csharpArgsNameGlobalAlias(args string, aliases map[string]bool) bool {
 	if args == "" || len(aliases) == 0 {
 		return false
