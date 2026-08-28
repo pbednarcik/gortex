@@ -885,21 +885,22 @@ func csharpShortTypeName(id string) string {
 // csharpReceiverLookupCtx carries the per-pass receiver-evidence caches:
 // declared args per (caller, member, site, interface), each caller's
 // out-edge adjacency read ONCE and served to every site (the companion
-// scan and the field-read evidence scan both consume it), and resolved
-// field nodes by ID.
+// scan and the field-read evidence scan both consume it), and nodes by
+// ID - fields, their owner types, and caller methods, since the
+// ownership span check reads all three.
 type csharpReceiverLookupCtx struct {
-	args      map[string]string
-	outEdges  map[string][]*graph.Edge
-	fields    map[string]*graph.Node
-	fieldSeen map[string]bool
+	args     map[string]string
+	outEdges map[string][]*graph.Edge
+	nodes    map[string]*graph.Node
+	nodeSeen map[string]bool
 }
 
 func newCSharpReceiverLookupCtx() *csharpReceiverLookupCtx {
 	return &csharpReceiverLookupCtx{
-		args:      map[string]string{},
-		outEdges:  map[string][]*graph.Edge{},
-		fields:    map[string]*graph.Node{},
-		fieldSeen: map[string]bool{},
+		args:     map[string]string{},
+		outEdges: map[string][]*graph.Edge{},
+		nodes:    map[string]*graph.Node{},
+		nodeSeen: map[string]bool{},
 	}
 }
 
@@ -912,13 +913,13 @@ func (c *csharpReceiverLookupCtx) callerOutEdges(g graph.Store, caller string) [
 	return es
 }
 
-func (c *csharpReceiverLookupCtx) fieldNode(g graph.Store, id string) *graph.Node {
-	if c.fieldSeen[id] {
-		return c.fields[id]
+func (c *csharpReceiverLookupCtx) nodeByID(g graph.Store, id string) *graph.Node {
+	if c.nodeSeen[id] {
+		return c.nodes[id]
 	}
-	c.fieldSeen[id] = true
+	c.nodeSeen[id] = true
 	n := g.GetNodesByIDs([]string{id})[id]
-	c.fields[id] = n
+	c.nodes[id] = n
 	return n
 }
 
@@ -1018,9 +1019,29 @@ func csharpReceiverField(g graph.Store, e *graph.Edge, lookups *csharpReceiverLo
 	if !fieldRead {
 		return nil
 	}
-	field := lookups.fieldNode(g, fieldID)
+	field := lookups.nodeByID(g, fieldID)
 	if field == nil || field.Meta == nil ||
 		(field.Kind != graph.KindField && field.Kind != graph.KindConstant) {
+		return nil
+	}
+	// Ownership proof. The field ID was assembled from the caller's type
+	// ID, but type node IDs carry no arity and no namespace, so an arity
+	// twin (Result / Result<T>) or a same-file namespace twin mints the
+	// same field ID and only one field node survives - possibly the OTHER
+	// declaration's, whose declared type says nothing about this caller's
+	// receiver. Require the caller and the field to both sit inside the
+	// owner type node's line span; any mismatch, or a missing span, means
+	// the ownership cannot be proven and the receiver stays unknown.
+	// (The surviving type node spans one declaration, so a caller in the
+	// twin fails the check from either side - as does a field the twin
+	// contributed. Refusal only ever preserves fan-out.)
+	owner := lookups.nodeByID(g, ownerID)
+	caller := lookups.nodeByID(g, e.From)
+	if owner == nil || caller == nil ||
+		(owner.Kind != graph.KindType && owner.Kind != graph.KindInterface) ||
+		owner.StartLine <= 0 || owner.EndLine < owner.StartLine ||
+		caller.StartLine < owner.StartLine || caller.StartLine > owner.EndLine ||
+		field.StartLine < owner.StartLine || field.StartLine > owner.EndLine {
 		return nil
 	}
 	return field

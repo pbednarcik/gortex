@@ -128,3 +128,48 @@ func TestResolveCSharpInterfaceDispatch_SameFilePartialPartsKeepBothOverloads(t 
 	}, dispatchTargets(g, callerID),
 		"a type whose parts close IBox twice must keep its whole fan-out")
 }
+
+// Field node IDs collide through the same door: `ownerID + "." + name`
+// inherits the type ID's missing arity, so the Result / Result<T> pair
+// mints one `Result.cs::Result._source` and only the first declaration's
+// field node survives. A caller in the OTHER declaration then gates on
+// the survivor's field_type_args - a foreign type's evidence - and the
+// implementor it keeps is the type-impossible one, while the one its
+// own receiver could actually hold is dropped.
+//
+// The receiver lookup must prove the field it resolved belongs to the
+// caller's own declaration, and refuse when it cannot.
+func TestResolveCSharpInterfaceDispatch_ArityTwinFieldCollisionNeverFilters(t *testing.T) {
+	g := buildCSharpResolverGraph(t, map[string]string{
+		"Result.cs": `namespace App {
+    public class Crate { }
+    public class Widget { }
+    public interface IBox<T> { int Get(int id); }
+    public class CrateBox : IBox<Crate> { public int Get(int id) { return 1; } }
+    public class WidgetBox : IBox<Widget> { public int Get(int id) { return 2; } }
+    public class Result {
+        protected readonly IBox<Widget> _source;
+        public Result(IBox<Widget> source) { _source = source; }
+    }
+    public class Result<T> {
+        protected readonly IBox<Crate> _source;
+        public Result(IBox<Crate> source) { _source = source; }
+        public int Load(int id) { return _source.Get(id); }
+    }
+}`,
+	})
+	New(g).ResolveAll()
+
+	const callerID = "Result.cs::Result.Load"
+	bindFieldReceiverCall(t, g, callerID, "_source", "Result.cs::IBox.Get")
+	ResolveCSharpInterfaceDispatch(g)
+
+	// The caller's receiver is IBox<Crate>; the surviving field node says
+	// Widget. Filtering on either would be wrong for one of the twins, so
+	// the only sound answer is the full fan-out.
+	assert.ElementsMatch(t, []string{
+		"Result.cs::CrateBox.Get",
+		"Result.cs::WidgetBox.Get",
+	}, dispatchTargets(g, callerID),
+		"a field ID shared by an arity twin is not evidence about this caller's receiver")
+}
