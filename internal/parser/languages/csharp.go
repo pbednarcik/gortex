@@ -754,6 +754,10 @@ func (e *CSharpExtractor) extractCSharp(filePath string, src []byte) (*parser.Ex
 		}
 		m[l.name] = append(m[l.name], csharpLocalScopeOf(l.defNode))
 	}
+	// The lvar capture sees only local_declaration_statement; C#'s other
+	// binding forms (foreach, patterns, out var, lambda parameters,
+	// parenthesized using) shadow a field exactly the same way.
+	csharpCollectExtraBindingScopes(root, src, funcRanges, localScopes)
 
 	for _, c := range calls {
 		callerID := funcRanges.enclosing(c.line)
