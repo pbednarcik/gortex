@@ -2,6 +2,7 @@ package store_sqlite
 
 import (
 	"database/sql"
+	"fmt"
 	"strings"
 )
 
@@ -17,6 +18,20 @@ const (
 	coveragePerFileNodeKinds = `'todo','fixture'`
 	coverageEdgeKinds        = `'annotated','licensed_as','owns','generated_by','depends_on_module'`
 )
+
+// coverageNodeSidecarTables are the node_id-keyed sidecars a removed node
+// would otherwise dangle in. The eviction path clears them through its own
+// callers (deleteEnrichmentByNodeIDs, the constant-value writer, the vector
+// store); a migration has no such caller, so it deletes them inline — the
+// same reasoning purgeUnprefixedRepoRows applies to vectors.
+var coverageNodeSidecarTables = []string{
+	"vectors",
+	"constant_values",
+	"churn_enrichment",
+	"coverage_enrichment",
+	"release_enrichment",
+	"blame_enrichment",
+}
 
 // purgeLegacyCoverageSpellings removes the coverage-domain rows that
 // pre-fix binaries minted under a re-spelled file path.
@@ -35,32 +50,35 @@ const (
 //
 // Scope, deliberately narrow in three directions:
 //
-//  1. Store-level guard. The purge runs only when the store holds at least
-//     one backslash-bearing file_path, i.e. it was written by a Windows
-//     indexer. On a store written on POSIX every path IS the native
-//     spelling and the whole migration is a no-op.
-//  2. Path-level predicate. Below the repo prefix a Windows-written store
-//     spells separators with a backslash, so a forward slash there marks a
-//     row no current builder could have produced. Top-level files (no
-//     separator below the prefix) were never damaged and never match.
+//  1. Per-repository guard. A repository's rows are judged only when THAT
+//     repository's own paths are backslash-spelled, i.e. it was indexed on
+//     Windows. A repository indexed on POSIX is never touched, even when it
+//     shares a store with a Windows-indexed one — the scope is deliberately
+//     per-repo rather than store-wide, because `fixture` nodes reuse the
+//     file node's ID (see internal/fixtures: "the fixture is the file", and
+//     ReclassifyFileToFixture upgrades a file node in place). Judging a
+//     POSIX repository by the Windows rule would therefore delete live file
+//     nodes and orphan every symbol they define.
+//  2. Path-level predicate. Below the repo prefix a Windows-written
+//     repository spells separators with a backslash, so a forward slash
+//     there marks a row no current builder could have produced. Top-level
+//     files (no separator below the prefix) were never damaged and never
+//     match. Synthetic paths are excluded outright: a `::` in a FilePath
+//     marks a stub namespace (external::, module::, license::), not a file.
 //  3. Kind-level predicate. Only the six coverage domains' own kinds are
-//     considered. A shared target is removed only after the edge purge
-//     leaves it with no references at all — never because a purged file
-//     happened to be its first sighting.
+//     selected. A shared target is removed only after the edge purge leaves
+//     it with no references at all — never because a purged file happened
+//     to be its first sighting.
 //
 // Idempotent: a second run finds no legacy-spelled rows. Bounded to the
 // coverage kinds: language-extractor nodes and edges are never candidates.
 func purgeLegacyCoverageSpellings(tx *sql.Tx) error {
-	windowsWritten, err := storeHasNativeBackslashPaths(tx)
-	if err != nil || !windowsWritten {
+	scope, err := windowsWrittenScope(tx)
+	if err != nil || scope.empty() {
 		return err
 	}
-	prefixes, err := storeRepoPrefixes(tx)
-	if err != nil {
-		return err
-	}
-	legacyNodePath := legacyPathPredicate("nodes.file_path", prefixes)
-	legacyEdgePath := legacyPathPredicate("edges.file_path", prefixes)
+	legacyNodePath := scope.legacyPathPredicate("nodes.file_path")
+	legacyEdgePath := scope.legacyPathPredicate("edges.file_path")
 
 	// Per-file artifacts whose own spelling is legacy. Collected before any
 	// delete so the edge sweep below can clear their endpoints too. The
@@ -134,70 +152,136 @@ func purgeLegacyCoverageSpellings(tx *sql.Tx) error {
 		WHERE node_id IN (SELECT id FROM covdom_doomed_nodes)`); err != nil {
 		return err
 	}
-	_, err = tx.Exec(`DELETE FROM nodes WHERE id IN (SELECT id FROM covdom_doomed_nodes)`)
-	return err
+	// Reference facts are keyed by the endpoint ids, not by file.
+	for _, column := range []string{"from_id", "to_id"} {
+		if _, err := tx.Exec(`DELETE FROM ref_facts
+			WHERE ` + column + ` IN (SELECT id FROM covdom_doomed_nodes)`); err != nil {
+			return err
+		}
+	}
+	// Node-keyed sidecars, deleted while the nodes still exist.
+	for _, table := range coverageNodeSidecarTables {
+		if _, err := tx.Exec(`DELETE FROM ` + table + `
+			WHERE node_id IN (SELECT id FROM covdom_doomed_nodes)`); err != nil {
+			return fmt.Errorf("delete purged coverage rows from %s: %w", table, err)
+		}
+	}
+	if _, err := tx.Exec(`DELETE FROM nodes WHERE id IN (SELECT id FROM covdom_doomed_nodes)`); err != nil {
+		return err
+	}
+	// The persisted analysis generation was computed over the rows just
+	// removed, so it is stale by construction. Eviction invalidates it for
+	// exactly this reason (see evictByPredicateResult); a migration has no
+	// store handle to do that through, so it clears the marker directly.
+	return invalidateAnalysisGenerationIfPresent(tx)
 }
 
-// storeHasNativeBackslashPaths reports whether any node path carries a
-// backslash, i.e. the store was written by an indexer on a platform whose
-// separator is not '/'. It is the migration's outer guard: on a store
-// written on POSIX no path can be a re-spelled twin of another, so the
-// purge must not run at all.
-func storeHasNativeBackslashPaths(tx *sql.Tx) (bool, error) {
+// invalidateAnalysisGenerationIfPresent drops the active analysis generation
+// when the analysis tables exist. A store upgraded from a version that
+// predates them has none, so their absence is not an error.
+func invalidateAnalysisGenerationIfPresent(tx *sql.Tx) error {
 	var present int
-	err := tx.QueryRow(`SELECT EXISTS(SELECT 1 FROM nodes WHERE instr(file_path, '\') > 0)`).Scan(&present)
-	return present == 1, err
+	if err := tx.QueryRow(`SELECT COUNT(*) FROM sqlite_master
+		WHERE type = 'table' AND name = 'analysis_active_generation'`).Scan(&present); err != nil {
+		return err
+	}
+	if present == 0 {
+		return nil
+	}
+	return invalidateAnalysisGenerationTx(tx)
 }
 
-// storeRepoPrefixes returns the distinct repository prefixes the store's
-// nodes carry. Multi-repo IDs and paths are `<repo>/<path>`: that single
-// separator is always a forward slash regardless of platform, so it must be
-// stripped before a path is judged on its remaining separators.
-func storeRepoPrefixes(tx *sql.Tx) ([]string, error) {
-	rows, err := tx.Query(`SELECT DISTINCT repo_prefix FROM nodes WHERE repo_prefix <> ''`)
+// coverageSpellingScope names the repositories whose paths are judged. A
+// repository qualifies only when its OWN nodes carry backslash-spelled
+// paths; one Windows-indexed repository must never put a POSIX-indexed
+// neighbour in the same store at risk.
+type coverageSpellingScope struct {
+	// windowsPrefixes are the repo prefixes whose own paths are
+	// backslash-spelled.
+	windowsPrefixes []string
+	// unprefixedIsWindows reports the same for rows carrying no repo
+	// prefix at all (a single-repo store).
+	unprefixedIsWindows bool
+	// knownPrefixes is every repo prefix present, Windows-written or not.
+	// The unprefixed arm has to exclude all of them, or a POSIX
+	// repository's rows would be judged as if they had no prefix.
+	knownPrefixes []string
+}
+
+func (s coverageSpellingScope) empty() bool {
+	return len(s.windowsPrefixes) == 0 && !s.unprefixedIsWindows
+}
+
+// windowsWrittenScope groups the store's nodes by repository and reports
+// which ones were written by an indexer whose separator is not '/'. One
+// pass: the predicate is not indexable, so grouping beats a probe per
+// repository.
+func windowsWrittenScope(tx *sql.Tx) (coverageSpellingScope, error) {
+	var scope coverageSpellingScope
+	rows, err := tx.Query(`SELECT repo_prefix,
+		MAX(CASE WHEN instr(file_path, '\') > 0 THEN 1 ELSE 0 END)
+		FROM nodes GROUP BY repo_prefix`)
 	if err != nil {
-		return nil, err
+		return scope, err
 	}
 	defer rows.Close() //nolint:errcheck // read-only cursor
-	var prefixes []string
 	for rows.Next() {
 		var prefix string
-		if err := rows.Scan(&prefix); err != nil {
-			return nil, err
+		var windows int
+		if err := rows.Scan(&prefix, &windows); err != nil {
+			return scope, err
 		}
-		prefixes = append(prefixes, prefix)
+		if prefix == "" {
+			scope.unprefixedIsWindows = windows == 1
+			continue
+		}
+		scope.knownPrefixes = append(scope.knownPrefixes, prefix)
+		if windows == 1 {
+			scope.windowsPrefixes = append(scope.windowsPrefixes, prefix)
+		}
 	}
-	return prefixes, rows.Err()
+	return scope, rows.Err()
 }
 
 // legacyPathPredicate builds the SQL test "this path is a pre-fix
-// re-spelling": strip the `<repo>/` prefix when one applies, then look for a
-// forward slash in what remains. On a Windows-written store (the only place
-// this runs — see storeHasNativeBackslashPaths) the remainder's separators
-// are backslashes, so a forward slash there cannot come from a current
-// builder.
+// re-spelling". A path qualifies when it belongs to a Windows-written
+// repository AND carries a forward slash below that repository's prefix:
+// there, separators are backslashes, so a forward slash cannot come from a
+// current builder. Multi-repo paths are `<repo>/<path>` and that first
+// separator is always a forward slash on every platform, so it is stripped
+// before the remainder is judged.
+//
+// Paths containing `::` are excluded on every arm. That sequence marks a
+// synthetic stub namespace (`external::`, `module::`, `license::`) rather
+// than a file, and such a value can carry forward slashes of its own —
+// an import path, for instance — which have nothing to do with separators.
 //
 // Prefixes are embedded as escaped literals rather than bound parameters
 // because the predicate is spliced into CREATE TEMP TABLE ... AS SELECT
 // statements. The values are the store's own repo_prefix column, and
 // quoteSQLLiteral doubles any embedded quote. Exact string comparison, not
 // LIKE, so a prefix containing '%' or '_' cannot match a sibling repo.
-func legacyPathPredicate(column string, prefixes []string) string {
-	// A single-repo store carries no prefix: the whole path is the portion
-	// under test. (SQL CASE requires at least one WHEN, so this branch is
-	// not merely an optimisation.)
-	if len(prefixes) == 0 {
-		return "instr(" + column + ", '/') > 0"
+func (s coverageSpellingScope) legacyPathPredicate(column string) string {
+	if s.empty() {
+		return "0"
 	}
-	var b strings.Builder
-	b.WriteString("instr(CASE")
-	for _, prefix := range prefixes {
+	var arms []string
+	for _, prefix := range s.windowsPrefixes {
 		lit := quoteSQLLiteral(prefix + "/")
-		b.WriteString(" WHEN substr(" + column + ", 1, length(" + lit + ")) = " + lit +
-			" THEN substr(" + column + ", length(" + lit + ") + 1)")
+		arms = append(arms, "(substr("+column+", 1, length("+lit+")) = "+lit+
+			" AND instr(substr("+column+", length("+lit+") + 1), '/') > 0)")
 	}
-	b.WriteString(" ELSE " + column + " END, '/') > 0")
-	return b.String()
+	if s.unprefixedIsWindows {
+		var b strings.Builder
+		b.WriteString("(instr(" + column + ", '/') > 0")
+		for _, prefix := range s.knownPrefixes {
+			lit := quoteSQLLiteral(prefix + "/")
+			b.WriteString(" AND substr(" + column + ", 1, length(" + lit + ")) <> " + lit)
+		}
+		b.WriteString(")")
+		arms = append(arms, b.String())
+	}
+	return "(" + strings.Join(arms, " OR ") + ") AND instr(" + column + ", '::') = 0"
 }
 
 // quoteSQLLiteral renders s as a single-quoted SQLite string literal.
