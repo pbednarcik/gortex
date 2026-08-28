@@ -220,23 +220,30 @@ func TestIncrementalReindex_FailedFileSurfacedAndRetried(t *testing.T) {
 // (purgeLegacyCoverageSpellings), which deletes by edge kind + FilePath
 // and drops a shared target only when nothing references it.
 func TestEvictFilesBatched_EvictsOnlyTheCallerSpelling(t *testing.T) {
+	// Both anchoring orders are present: a shared target whose
+	// first-sighting FilePath is the legacy spelling, and one anchored to
+	// a surviving file. Neither anchor may decide what an eviction of a
+	// removes — the FilePath of a shared coverage target is a breadcrumb,
+	// not ownership.
 	const (
-		nativeA = `src\a.go`
-		nativeB = `src\b.go`
-		legacyA = `src/a.go`
-		license = "license::MIT"
+		nativeA    = `src\a.go`
+		nativeB    = `src\b.go`
+		legacyA    = `src/a.go`
+		licAnchorA = "license::MIT"
+		licAnchorB = "license::Apache-2.0"
 	)
 	nodes := []*graph.Node{
 		{ID: nativeA, Kind: graph.KindFile, Name: "a.go", FilePath: nativeA},
 		{ID: nativeB, Kind: graph.KindFile, Name: "b.go", FilePath: nativeB},
-		// Anchored to the legacy spelling — the first-sighting FilePath
-		// of a shared coverage target is a breadcrumb, not ownership.
-		{ID: license, Kind: graph.KindLicense, Name: "MIT", FilePath: legacyA},
+		{ID: licAnchorA, Kind: graph.KindLicense, Name: "MIT", FilePath: legacyA},
+		{ID: licAnchorB, Kind: graph.KindLicense, Name: "Apache-2.0", FilePath: nativeB},
 	}
 	edges := []*graph.Edge{
-		{From: nativeA, To: license, Kind: graph.EdgeLicensedAs, FilePath: nativeA},
-		{From: nativeB, To: license, Kind: graph.EdgeLicensedAs, FilePath: nativeB},
-		{From: legacyA, To: license, Kind: graph.EdgeLicensedAs, FilePath: legacyA},
+		{From: nativeA, To: licAnchorA, Kind: graph.EdgeLicensedAs, FilePath: nativeA},
+		{From: nativeB, To: licAnchorA, Kind: graph.EdgeLicensedAs, FilePath: nativeB},
+		{From: legacyA, To: licAnchorA, Kind: graph.EdgeLicensedAs, FilePath: legacyA},
+		{From: nativeB, To: licAnchorB, Kind: graph.EdgeLicensedAs, FilePath: nativeB},
+		{From: legacyA, To: licAnchorB, Kind: graph.EdgeLicensedAs, FilePath: legacyA},
 	}
 
 	for _, backend := range []struct {
@@ -257,17 +264,20 @@ func TestEvictFilesBatched_EvictsOnlyTheCallerSpelling(t *testing.T) {
 
 			evictFilesBatched(g, []string{nativeA})
 
-			var froms []string
-			for _, e := range g.GetInEdges(license) {
-				if e != nil {
-					froms = append(froms, e.From)
+			for _, shared := range []string{licAnchorA, licAnchorB} {
+				var froms []string
+				for _, e := range g.GetInEdges(shared) {
+					if e != nil {
+						froms = append(froms, e.From)
+					}
 				}
+				want := []string{nativeB, legacyA}
+				assert.ElementsMatch(t, want, froms,
+					"%s: only a's own spelling is evicted — b keeps its valid "+
+						"edge, and the legacy row is the migration's business", shared)
+				assert.NotNil(t, g.GetNode(shared),
+					"%s: the shared license node outlives one of its files", shared)
 			}
-			assert.ElementsMatch(t, []string{nativeB, legacyA}, froms,
-				"only a's own spelling is evicted: b keeps its valid edge, "+
-					"and the legacy row is the migration's business")
-			assert.NotNil(t, g.GetNode(license),
-				"the shared license node outlives one of its files")
 		})
 	}
 }
