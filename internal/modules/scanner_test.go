@@ -2,7 +2,6 @@ package modules
 
 import (
 	"fmt"
-	"path/filepath"
 	"strings"
 	"testing"
 
@@ -134,7 +133,10 @@ func TestBuildGraphArtifacts_PreservesCallerPathSpelling(t *testing.T) {
 	// exact relPath spelling; a re-spelled EdgeDependsOnModule From
 	// endpoint dangles from a nonexistent node on Windows for any
 	// manifest below the repo root.
-	rel := filepath.Join("services", "api", "go.mod")
+	// Written out, not composed with filepath.Join: on a POSIX runner
+	// Join yields exactly what the pre-fix ToSlash call returned, so
+	// the assertion would hold with or without the fix.
+	const rel = `services\api\go.mod`
 	specs := []Spec{{Ecosystem: "go", Path: "github.com/foo/bar", Version: "v1.0.0", Line: 5}}
 	nodes, edges := BuildGraphArtifacts(rel, specs)
 	if len(nodes) != 1 || len(edges) != 1 {

@@ -1,7 +1,6 @@
 package codegen
 
 import (
-	"path/filepath"
 	"testing"
 
 	"github.com/zzet/gortex/internal/graph"
@@ -89,7 +88,10 @@ func TestBuildGraphArtifacts_PreservesCallerPathSpelling(t *testing.T) {
 	// The indexer keys eviction and incremental replacement by the
 	// exact relPath spelling it hands the builder; a re-spelled edge
 	// endpoint dangles from a nonexistent file node on Windows.
-	rel := filepath.Join("src", "gen", "foo.pb.go")
+	// Written out, not composed with filepath.Join: on a POSIX runner
+	// Join yields exactly what the pre-fix ToSlash call returned, so
+	// the assertion would hold with or without the fix.
+	const rel = `src\gen\foo.pb.go`
 	edges := BuildGraphArtifacts(rel, Marker{Generated: true, Tool: "protoc-gen-go"})
 	if len(edges) != 1 {
 		t.Fatalf("edges = %d", len(edges))

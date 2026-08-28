@@ -2,7 +2,6 @@ package todos
 
 import (
 	"bytes"
-	"path/filepath"
 	"reflect"
 	"testing"
 
@@ -220,7 +219,12 @@ func TestBuildGraphArtifacts_PreservesCallerPathSpelling(t *testing.T) {
 	// replacement by the exact relPath spelling it hands the builder
 	// (OS-native separators for subdirectory files on Windows). A
 	// re-spelled artifact is invisible to those sweeps and goes stale.
-	rel := filepath.Join("src", "data", "foo.go")
+	//
+	// The spelling under test is written out rather than composed with
+	// filepath.Join: on a POSIX runner Join yields the forward-slash
+	// form, which the pre-fix ToSlash call also returned, so the
+	// assertion would hold with or without the fix.
+	const rel = `src\data\foo.go`
 	nodes, edges := BuildGraphArtifacts(rel, []Finding{{Tag: "TODO", Text: "x", Line: 7}}, "go")
 	if len(nodes) != 1 || len(edges) != 1 {
 		t.Fatalf("nodes = %d, edges = %d", len(nodes), len(edges))

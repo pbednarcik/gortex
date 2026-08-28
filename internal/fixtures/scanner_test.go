@@ -1,7 +1,6 @@
 package fixtures
 
 import (
-	"path/filepath"
 	"testing"
 
 	"github.com/zzet/gortex/internal/graph"
@@ -89,7 +88,14 @@ func TestBuildGraphArtifacts_PreservesCallerPathSpelling(t *testing.T) {
 	// as its node ID so it merges with the file identity; that only
 	// works when the spelling matches the extractor's relPath exactly
 	// (OS-native separators for subdirectory files on Windows).
-	rel := filepath.Join("pkg", "testdata", "foo.bin")
+	// The spelling is written out rather than composed with
+	// filepath.Join so a backslash is present on every runner. The
+	// qualifying `testdata/` segment keeps its forward slash because
+	// IsFixturePath normalizes through filepath.ToSlash, which is the
+	// identity on POSIX. Name is asserted by TestBuildGraphArtifacts:
+	// it comes from filepath.Base, whose separator set is the running
+	// platform's.
+	const rel = `testdata/sub\foo.bin`
 	nodes := BuildGraphArtifacts(rel, "binary")
 	if len(nodes) != 1 {
 		t.Fatalf("nodes = %d", len(nodes))
@@ -99,9 +105,6 @@ func TestBuildGraphArtifacts_PreservesCallerPathSpelling(t *testing.T) {
 	}
 	if nodes[0].FilePath != rel {
 		t.Errorf("node file path = %q, want %q", nodes[0].FilePath, rel)
-	}
-	if nodes[0].Name != "foo.bin" {
-		t.Errorf("node name = %q", nodes[0].Name)
 	}
 }
 
