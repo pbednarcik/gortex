@@ -826,8 +826,13 @@ func (e *CSharpExtractor) extractCSharp(filePath string, src []byte) (*parser.Ex
 				edge.Meta = map[string]any{"receiver_name": c.receiver}
 			}
 			// Stamped AFTER the receiver-evidence chain — every branch
-			// above assigns a fresh Meta map and would clobber it.
-			if memberSiteAmbiguous[csharpCallSite{c.name, c.line}] {
+			// above assigns a fresh Meta map and would clobber it. A
+			// two-members-on-one-line tie is the same verdict from the
+			// other side: there the RECEIVERS are attributable but the
+			// CALLER is not, and the shadow refusal above consulted the
+			// tie-break winner's parameter set — possibly the wrong
+			// member's.
+			if memberSiteAmbiguous[csharpCallSite{c.name, c.line}] || funcRanges.ambiguousAt(c.line) {
 				if edge.Meta == nil {
 					edge.Meta = map[string]any{}
 				}
@@ -1879,6 +1884,35 @@ func (l *csharpFuncLookup) enclosing(line int) string {
 		}
 	}
 	return best
+}
+
+// ambiguousAt reports whether two different functions tie for the
+// innermost range covering line - two members declared on one source
+// line. enclosing() breaks that tie by extraction order, which is
+// deterministic but arbitrary: a line-keyed attribution cannot say
+// which member owns a call there, so evidence keyed on the attribution
+// (the shadow refusal consulting the attributed member's parameter set
+// in particular) must refuse at such a line. Nested shapes - a local
+// function inside a method - are ties of COVERAGE, not of span, and
+// stay unambiguous: the innermost is genuinely the owner.
+func (l *csharpFuncLookup) ambiguousAt(line int) bool {
+	i := sort.Search(len(l.ranges), func(j int) bool { return l.ranges[j].startLine > line }) - 1
+	bestSpan := math.MaxInt
+	ties := 0
+	for ; i >= 0; i-- {
+		if l.maxEnd[i] < line {
+			break
+		}
+		if r := l.ranges[i]; line <= r.endLine {
+			switch span := r.endLine - r.startLine; {
+			case span < bestSpan:
+				bestSpan, ties = span, 1
+			case span == bestSpan:
+				ties++
+			}
+		}
+	}
+	return ties > 1
 }
 
 type csharpOwner struct {

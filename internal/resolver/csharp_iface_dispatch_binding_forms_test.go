@@ -157,3 +157,43 @@ func TestResolveCSharpInterfaceDispatch_ImplicitThisNeverStealsSiblingReceiver(t
 	}, dispatchTargets(g, callerID),
 		"a receiverless implicit-this call marks its line ambiguous rather than borrowing the sibling's receiver")
 }
+
+// Two members declared on one source line tie for the innermost func
+// range, and the tie-break is extraction order - so the call inside A
+// is attributed to B. The shadow refusal then consults B's EMPTY
+// parameter set, receiver_name stamps for what is actually A's
+// parameter, and the gate filters on the same-named FIELD's closure
+// instead of the parameter's.
+//
+// The misattribution itself predates the gate; what is new is that it
+// removes a target. A line two members tie on is unattributable, and
+// evidence keyed on that attribution must refuse.
+func TestResolveCSharpInterfaceDispatch_TwoMembersOnOneLineRefuseReceiverEvidence(t *testing.T) {
+	g := buildCSharpResolverGraph(t, map[string]string{
+		"F.cs": `namespace App {
+    public class Crate { }
+    public class Widget { }
+    public interface IBox<T> { int Get(int id); }
+    public class CrateBox : IBox<Crate> { public int Get(int id) { return 1; } }
+    public class WidgetBox : IBox<Widget> { public int Get(int id) { return 2; } }
+    public class Flow {
+        private readonly IBox<Crate> _store;
+        public Flow(IBox<Crate> s) { _store = s; }
+        public int B() { return 0; } public int A(IBox<Widget> _store, int id) { return _store.Get(id); }
+    }
+}`,
+	})
+	New(g).ResolveAll()
+
+	// The line-keyed attribution hands the call to B - the production
+	// state this pins, not an artifact of the test setup.
+	const callerID = "F.cs::Flow.B"
+	bindMemberCallAtLine(t, g, callerID, "Get", "F.cs::IBox.Get")
+	ResolveCSharpInterfaceDispatch(g)
+
+	assert.ElementsMatch(t, []string{
+		"F.cs::CrateBox.Get",
+		"F.cs::WidgetBox.Get",
+	}, dispatchTargets(g, callerID),
+		"a line two members tie on carries no usable receiver evidence, so the full fan-out stays")
+}
