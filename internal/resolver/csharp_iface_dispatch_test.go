@@ -21,8 +21,9 @@ func isIfaceDispatchEdge(e *graph.Edge) bool {
 
 // buildCSharpResolverGraph extracts each C# fixture with the real extractor and
 // loads its nodes/edges into a fresh graph — the same unresolved shape a live
-// index produces, ready for New(g).ResolveAll().
-func buildCSharpResolverGraph(t *testing.T, files map[string]string) graph.Store {
+// index produces, ready for New(g).ResolveAll(). testing.TB so benchmarks
+// can build the same shape tests do.
+func buildCSharpResolverGraph(t testing.TB, files map[string]string) graph.Store {
 	t.Helper()
 	g := graph.New()
 	e := languages.NewCSharpExtractor()

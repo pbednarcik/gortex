@@ -890,7 +890,7 @@ func csharpShortTypeName(id string) string {
 // ownership span check reads all three.
 type csharpReceiverLookupCtx struct {
 	args     map[string]string
-	outEdges map[string][]*graph.Edge
+	evidence map[string]*csharpCallerEvidence
 	nodes    map[string]*graph.Node
 	nodeSeen map[string]bool
 }
@@ -898,19 +898,55 @@ type csharpReceiverLookupCtx struct {
 func newCSharpReceiverLookupCtx() *csharpReceiverLookupCtx {
 	return &csharpReceiverLookupCtx{
 		args:     map[string]string{},
-		outEdges: map[string][]*graph.Edge{},
+		evidence: map[string]*csharpCallerEvidence{},
 		nodes:    map[string]*graph.Node{},
 		nodeSeen: map[string]bool{},
 	}
 }
 
-func (c *csharpReceiverLookupCtx) callerOutEdges(g graph.Store, caller string) []*graph.Edge {
-	if es, ok := c.outEdges[caller]; ok {
-		return es
+// csharpEvidenceSite addresses one piece of a caller's evidence: an edge
+// target at an exact file position.
+type csharpEvidenceSite struct {
+	to   string
+	file string
+	line int
+}
+
+// csharpCallerEvidence is one caller's out-edge evidence bucketed by
+// exact site. Caching the adjacency READ per caller still left every
+// site rescanning the whole slice - twice, for the companion join and
+// the field-read proof - which is quadratic in the caller's site count.
+// Bucketing once makes each site's consultation two map probes plus a
+// walk of its own (almost always single-edge) companion bucket.
+type csharpCallerEvidence struct {
+	calls map[csharpEvidenceSite][]*graph.Edge
+	reads map[csharpEvidenceSite]bool
+}
+
+func (c *csharpReceiverLookupCtx) siteEvidence(g graph.Store, caller string) *csharpCallerEvidence {
+	if ev, ok := c.evidence[caller]; ok {
+		return ev
 	}
-	es := g.GetOutEdges(caller)
-	c.outEdges[caller] = es
-	return es
+	ev := &csharpCallerEvidence{
+		calls: map[csharpEvidenceSite][]*graph.Edge{},
+		reads: map[csharpEvidenceSite]bool{},
+	}
+	for _, out := range g.GetOutEdges(caller) {
+		if out == nil {
+			continue
+		}
+		key := csharpEvidenceSite{out.To, out.FilePath, out.Line}
+		switch out.Kind {
+		case graph.EdgeCalls:
+			// Adjacency order is preserved within a bucket, so the
+			// companion walk sees edges exactly as the slice scan did.
+			ev.calls[key] = append(ev.calls[key], out)
+		case graph.EdgeReads:
+			ev.reads[key] = true
+		}
+	}
+	c.evidence[caller] = ev
+	return ev
 }
 
 func (c *csharpReceiverLookupCtx) nodeByID(g graph.Store, id string) *graph.Node {
@@ -965,18 +1001,15 @@ func csharpReceiverField(g graph.Store, e *graph.Edge, lookups *csharpReceiverLo
 		}
 		name, _ = e.Meta["receiver_name"].(string)
 	}
+	ev := lookups.siteEvidence(g, e.From)
 	if name == "" {
 		// The bound edge (enrichment/LSP tiers) carries no receiver
 		// evidence; the extraction's unresolved companion for the same
 		// member name at the same site does. Match the member name so a
 		// different call sharing the line can never lend its receiver.
-		memberName := csharpShortTypeName(e.To)
-		companionTo := "unresolved::*." + memberName
-		for _, out := range lookups.callerOutEdges(g, e.From) {
-			if out == nil || out.Kind != graph.EdgeCalls || out.To != companionTo {
-				continue
-			}
-			if out.FilePath != e.FilePath || out.Line != e.Line || out.Meta == nil {
+		companionTo := "unresolved::*." + csharpShortTypeName(e.To)
+		for _, out := range ev.calls[csharpEvidenceSite{companionTo, e.FilePath, e.Line}] {
+			if out.Meta == nil {
 				continue
 			}
 			if amb, _ := out.Meta["receiver_ambiguous"].(bool); amb {
@@ -1003,20 +1036,8 @@ func csharpReceiverField(g graph.Store, e *graph.Edge, lookups *csharpReceiverLo
 	// type's field. A name-only lookup would bind a shadowed identifier to
 	// the field it shadows and gate on the wrong declared arguments —
 	// without the read edge the receiver stays unknown (never filter).
-	fieldRead := false
-	for _, out := range lookups.callerOutEdges(g, e.From) {
-		if out == nil || out.Kind != graph.EdgeReads {
-			continue
-		}
-		if out.FilePath != e.FilePath || out.Line != e.Line {
-			continue
-		}
-		if out.To == "unresolved::*."+name || out.To == fieldID {
-			fieldRead = true
-			break
-		}
-	}
-	if !fieldRead {
+	if !ev.reads[csharpEvidenceSite{"unresolved::*." + name, e.FilePath, e.Line}] &&
+		!ev.reads[csharpEvidenceSite{fieldID, e.FilePath, e.Line}] {
 		return nil
 	}
 	field := lookups.nodeByID(g, fieldID)
