@@ -325,6 +325,35 @@ func (r *Router) ProviderForSpecWorkspace(name, workspace string) (semantic.Prov
 	return r.forSpecWorkspace(spec, workspace, true)
 }
 
+// newConfiguredProvider constructs a provider from spec with the
+// operator/router-level knobs every router-owned instance carries. Pure
+// construction — no spawn; the caller decides whether to EnsureClient.
+func (r *Router) newConfiguredProvider(spec *ServerSpec) *Provider {
+	p := NewProviderFromSpec(spec, r.logger)
+	p.workspaceFolders = r.additionalWorkspaceFolders
+	p.excludeGlobs = r.enrichExcludeGlobs
+	p.sweepMode = r.enrichSweepMode
+	p.opensDocs = resolveOpensDocs(r.enrichOpenDocs, spec)
+	p.maxParallel = resolveMaxParallel(r.enrichMaxParallel, spec.MaxParallel)
+	return p
+}
+
+// PeekProviderForSpec returns a fully configured but UNSPAWNED provider for
+// the named spec — the background census's path (semantic.backgroundPeekRouter):
+// it reads enrichment markers through the provider value and the drain later
+// spawns its own dedicated instance, so no live server is ever needed. The
+// returned provider is not cached, not pinned, and holds no subprocess; it
+// needs no Release.
+func (r *Router) PeekProviderForSpec(name string) (semantic.Provider, error) {
+	r.mu.Lock()
+	spec, ok := r.enabled[name]
+	r.mu.Unlock()
+	if !ok {
+		return nil, fmt.Errorf("LSP spec %q not registered", name)
+	}
+	return r.newConfiguredProvider(spec), nil
+}
+
 // SpecAvailable reports whether the named spec is registered AND its
 // command resolves on PATH. Pure read — no subprocess spawn. Caches
 // the PATH-lookup result like specAvailable does for ForSpec.
@@ -606,12 +635,7 @@ func (r *Router) forSpecWorkspace(spec *ServerSpec, workspace string, pin bool) 
 	}
 
 	// Spawn outside the lock — initialize() blocks on stdio I/O.
-	p := NewProviderFromSpec(spec, r.logger)
-	p.workspaceFolders = r.additionalWorkspaceFolders
-	p.excludeGlobs = r.enrichExcludeGlobs
-	p.sweepMode = r.enrichSweepMode
-	p.opensDocs = resolveOpensDocs(r.enrichOpenDocs, spec)
-	p.maxParallel = resolveMaxParallel(r.enrichMaxParallel, spec.MaxParallel)
+	p := r.newConfiguredProvider(spec)
 	// ruby-lsp (and any spec opting in) runs a `bundle install` for a composed
 	// bundle on spawn unless BUNDLE_GEMFILE is set; point it at the workspace's
 	// own Gemfile when present so enrichment skips that install.
