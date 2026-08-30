@@ -705,22 +705,37 @@ func markNodeRefsStamped(n *graph.Node) {
 // measured runs (every drain error was references-class), so skipping
 // the sweep would only discard good incoming edges.
 func terminalUnconfirmable(n *graph.Node) bool {
-	if n == nil || n.Kind != graph.KindMethod || n.Language != "csharp" {
+	if n == nil || n.Language != "csharp" {
 		return false
 	}
-	switch n.Name {
-	case "ToString", "GetHashCode", "Equals":
-		return true
-	case "GetFieldDeserializers":
-		// Kiota-generated IParsable member: every generated model class
-		// implements it, so the references up-symbol cascade gathers the
-		// entire generated API client before searching. Measured live on a
-		// generated swagger client: the cascade spun Roslyn for minutes
-		// per target (SymbolEquivalenceComparer recursion) and outlived
-		// the server. Kiota's name, nobody else's — the same
-		// name+kind+language contract as the object overrides above.
-		// Further generated-serializer names join ON MEASUREMENT only.
-		return true
+	switch n.Kind {
+	case graph.KindMethod:
+		switch n.Name {
+		case "ToString", "GetHashCode", "Equals":
+			return true
+		case "GetFieldDeserializers":
+			// Kiota-generated IParsable member: every generated model class
+			// implements it, so the references up-symbol cascade gathers the
+			// entire generated API client before searching. Measured live on a
+			// generated swagger client: the cascade spun Roslyn for minutes
+			// per target (SymbolEquivalenceComparer recursion) and outlived
+			// the server. Kiota's name, nobody else's — the same
+			// name+kind+language contract as the object overrides above.
+			// Further generated-serializer names join ON MEASUREMENT only.
+			return true
+		}
+	case graph.KindField:
+		// Kiota-generated IAdditionalDataHolder property — the same whale as
+		// GetFieldDeserializers wearing a field kind: every generated model
+		// carries AdditionalData, so its references cascade walks the whole
+		// generated client. Measured on a true cold drain of the same
+		// generated swagger client: 44 sampled 3-minute references timeouts,
+		// every one naming this member, drain landing Partial and retrying a
+		// cost that can never converge. Same name+kind+language contract;
+		// further names join ON MEASUREMENT only.
+		if n.Name == "AdditionalData" {
+			return true
+		}
 	}
 	return false
 }
