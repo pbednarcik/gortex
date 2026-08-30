@@ -165,6 +165,11 @@ func TestLSPProvider_EnrichBackground_LaneIsolation(t *testing.T) {
 // The lane instance inherits the operator/router configuration the
 // foreground provider carries — and never dials an IDE-attached server.
 func TestLSPProvider_LaneInheritsForegroundConfig(t *testing.T) {
+	// This test pins the inherit/clamp width path, so the operator override
+	// must be silenced: a machine that durably exports
+	// GORTEX_LSP_LANE_MAX_PARALLEL (a documented operator setting) would
+	// legitimately win over both assertions below. Empty parses as unset.
+	t.Setenv(laneMaxParallelEnv, "")
 	spec := SpecByName("omnisharp")
 	require.NotNil(t, spec)
 	specWithConnect := *spec
