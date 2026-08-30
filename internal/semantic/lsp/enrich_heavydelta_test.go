@@ -210,6 +210,7 @@ func TestLSP_Enrich_HeavyDelta_SkipsTerminalUnconfirmableTargets(t *testing.T) {
 			"    public void Target() { }\n"+
 			"    public void Caller() { this.Target(); }\n"+
 			"    public object GetFieldDeserializers() { return null; }\n"+
+			"    public IDictionary<string, object> AdditionalData { get; set; }\n"+
 			"}\n"), 0o644))
 
 	g := graph.New()
@@ -224,11 +225,20 @@ func TestLSP_Enrich_HeavyDelta_SkipsTerminalUnconfirmableTargets(t *testing.T) {
 	// up-symbol cascade walks the whole generated client).
 	g.AddNode(&graph.Node{ID: "svc.cs::C.GetFieldDeserializers", Kind: graph.KindMethod, Name: "GetFieldDeserializers",
 		FilePath: "svc.cs", StartLine: 5, EndLine: 5, Language: "csharp"})
+	// Kiota-generated IAdditionalDataHolder property — the third measured
+	// terminal class, and a FIELD, not a method: every generated model
+	// carries it, so its references cascade is the same whole-client walk.
+	g.AddNode(&graph.Node{ID: "svc.cs::C.AdditionalData", Kind: graph.KindField, Name: "AdditionalData",
+		FilePath: "svc.cs", StartLine: 6, EndLine: 6, Language: "csharp"})
 	g.AddEdge(&graph.Edge{From: "svc.cs::C.Caller", To: "svc.cs::C.ToString", Kind: graph.EdgeCalls,
 		FilePath: "svc.cs", Line: 4, Confidence: 0.7, ConfidenceLabel: "INFERRED", Origin: graph.OriginTextMatched})
 	g.AddEdge(&graph.Edge{From: "svc.cs::C.Caller", To: "svc.cs::C.Target", Kind: graph.EdgeCalls,
 		FilePath: "svc.cs", Line: 4, Confidence: 0.7, ConfidenceLabel: "INFERRED", Origin: graph.OriginTextMatched})
 	g.AddEdge(&graph.Edge{From: "svc.cs::C.Caller", To: "svc.cs::C.GetFieldDeserializers", Kind: graph.EdgeCalls,
+		FilePath: "svc.cs", Line: 4, Confidence: 0.7, ConfidenceLabel: "INFERRED", Origin: graph.OriginTextMatched})
+	// The production shape: an ambiguous accesses_field edge is a confirm
+	// target too (confirmableEdgeKind keeps dataflow kinds).
+	g.AddEdge(&graph.Edge{From: "svc.cs::C.Caller", To: "svc.cs::C.AdditionalData", Kind: graph.EdgeAccessesField,
 		FilePath: "svc.cs", Line: 4, Confidence: 0.7, ConfidenceLabel: "INFERRED", Origin: graph.OriginTextMatched})
 
 	server := newFakeLSPServer()
@@ -263,7 +273,7 @@ func TestLSP_Enrich_HeavyDelta_SkipsTerminalUnconfirmableTargets(t *testing.T) {
 	require.NotNil(t, result)
 
 	assert.EqualValues(t, 1, refCalls.Load(),
-		"only the ordinary target may be asked; the object override AND the generated serializer member are terminal-unconfirmable")
+		"only the ordinary target may be asked; the object override, the generated serializer member, and the generated AdditionalData field are terminal-unconfirmable")
 	assert.False(t, result.Partial, "a policy skip is not an error — the drain stays clean")
 }
 

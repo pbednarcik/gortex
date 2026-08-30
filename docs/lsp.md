@@ -375,11 +375,25 @@ explicitly, the global bound applies to the lane too. One target class is
 never asked at all: C# object-override members (`ToString`, `GetHashCode`,
 `Equals`), whose references request degenerates into a solution-wide
 implicit-call search no finite budget converts, and the Kiota-generated
-`GetFieldDeserializers` member, where the same cascade walks every
-generated model in an API client. The drain skips them as
+`GetFieldDeserializers` member and `AdditionalData` property, where the
+same cascade walks every generated model in an API client. The drain skips
+them as
 **terminal-unconfirmable** — their edges keep their static confidence, the
 skip is not an error, the completion marker may land over them, and the
 completion log counts them as `drain_skipped_terminal`.
+
+The drain instance also carries its own concurrency width. It inherits the
+foreground's resolved width but clamps it at 4: the lane optimizes for
+non-interference, and a wide foreground setting should not silently turn
+the background drain into a foreground-scale load. On a machine where the
+server converts width directly into wall time, `GORTEX_LSP_LANE_MAX_PARALLEL`
+overrides the clamp outright — a positive value wins in both directions
+(raising past 4 or narrowing below the inherited width), and zero,
+negative, or unparseable values keep the clamp, the same semantics as
+`GORTEX_LSP_MAX_PARALLEL` on the foreground. Measured on a 118k-node C#
+solution: a full re-drain's references-confirm phase ran at 10.9 requests/s
+at the default width and 49.5 requests/s at 16, with per-request server
+time unchanged — the drain was width-bound end to end.
 
 The references-confirm leg records a per-node verdict: a confirm target
 whose reference list came back cleanly (or that is statically terminal) is
