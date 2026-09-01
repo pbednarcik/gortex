@@ -2532,7 +2532,7 @@ func csharpBaseNameCounts(root *sitter.Node, src []byte, filePath string, fileAl
 		if nameNode == nil {
 			return
 		}
-		id := filePath + "::" + nameNode.Content(src)
+		id := filePath + "::" + csharpCanonBaseIdent(nameNode.Content(src))
 		m := counts[id]
 		if m == nil {
 			m = map[string]int{}
@@ -2615,10 +2615,23 @@ type csharpPartialIdentity struct {
 
 func csharpPartialIdentityOf(decl *sitter.Node, src []byte) csharpPartialIdentity {
 	return csharpPartialIdentity{
-		ns:         csharpEnclosingNamespace(decl, src),
+		ns:         csharpCanonDottedName(csharpEnclosingNamespace(decl, src)),
 		outerChain: csharpEnclosingTypeChain(decl, src),
 		arity:      csharpTypeParamArity(decl),
 	}
+}
+
+// csharpCanonDottedName canonicalizes each segment of a dotted name so
+// the identity key compares identifiers, not spellings.
+func csharpCanonDottedName(s string) string {
+	if s == "" || !strings.ContainsAny(s, "@\\") {
+		return s
+	}
+	parts := strings.Split(s, ".")
+	for i := range parts {
+		parts[i] = csharpCanonBaseIdent(strings.TrimSpace(parts[i]))
+	}
+	return strings.Join(parts, ".")
 }
 
 // sameType reports whether a later fragment's identity key matches -
@@ -2636,7 +2649,7 @@ func csharpEnclosingTypeChain(decl *sitter.Node, src []byte) string {
 		switch n.Type() {
 		case "class_declaration", "struct_declaration", "record_declaration", "interface_declaration":
 			if nm := n.ChildByFieldName("name"); nm != nil {
-				parts = append(parts, nm.Content(src))
+				parts = append(parts, csharpCanonBaseIdent(nm.Content(src)))
 			}
 		}
 	}
