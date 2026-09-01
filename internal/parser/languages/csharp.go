@@ -366,6 +366,48 @@ func csharpTypedLocalAt(m map[string]map[string][]*csharpTypedBinding, owner, na
 	return best, csharpTypedFound
 }
 
+// csharpChainHead returns the leading identifier of a chained receiver
+// expression (`h.Make().Ping` -> `h`), the only name the chain walker
+// looks up in the type environment.
+func csharpChainHead(expr string) string {
+	cleaned := strings.ReplaceAll(stripCallArgs(expr), "::", ".")
+	if i := strings.IndexByte(cleaned, '.'); i >= 0 {
+		cleaned = cleaned[:i]
+	}
+	return strings.TrimSpace(cleaned)
+}
+
+// csharpOffsetEnv hands the offset-blind chain/awaited walkers a type
+// environment whose HEAD entry is corrected by the offset-aware
+// typed-local records (issue #725 item 3: the function-wide tenv is
+// written last-wins by sibling redeclarations, so consulting it raw
+// types a chain through whichever sibling declared LAST). A Found
+// record overrides the head, an Expired or type-less record removes it
+// (the flat value belongs to a sibling), and an Absent name keeps the
+// function-wide fallback exactly as before.
+func csharpOffsetEnv(typedLocals map[string]map[string][]*csharpTypedBinding, tenv typeEnv, owner, head string, offset int) typeEnv {
+	if head == "" {
+		return tenv
+	}
+	b, state := csharpTypedLocalAt(typedLocals, owner, head, offset)
+	if state == csharpTypedAbsent {
+		return tenv
+	}
+	if state == csharpTypedFound && b.typ != "" && tenv[head] == b.typ {
+		return tenv
+	}
+	env := make(typeEnv, len(tenv))
+	for k, v := range tenv {
+		env[k] = v
+	}
+	if state == csharpTypedFound && b.typ != "" {
+		env[head] = b.typ
+	} else {
+		delete(env, head)
+	}
+	return env
+}
+
 // csharpTypeUse buffers a type referenced only in a local-variable
 // annotation (`HttpResponse resp = Get();`) so the post-pass can emit an
 // EdgeTypedAs from the enclosing function once funcRanges are built.
@@ -782,7 +824,12 @@ func (e *CSharpExtractor) extractCSharp(filePath string, src []byte) (*parser.Ex
 			if inner == nil {
 				return
 			}
-			if t := csharpAwaitedCallType(inner.Content(src), csharpOwnerTypeName(owner), tenvByOwner[owner], result); t != "" {
+			// The awaited call's receiver is typed at the DECLARATION's
+			// offset, not from the function-wide last-wins map — a sibling
+			// block's same-named local must not type this block's await.
+			innerText := inner.Content(src)
+			env := csharpOffsetEnv(typedLocalsByOwner, tenvByOwner[owner], owner, csharpChainHead(innerText), int(n.StartByte()))
+			if t := csharpAwaitedCallType(innerText, csharpOwnerTypeName(owner), env, result); t != "" {
 				setLocalType(owner, l, t)
 			}
 		})
@@ -1015,11 +1062,13 @@ func (e *CSharpExtractor) extractCSharp(filePath string, src []byte) (*parser.Ex
 				// `(await LoadAsync()).X()` — the chain walker collapses a
 				// fully-parenthesized receiver to nothing; the receiver is
 				// the T inside the awaited call's Task<T>.
-				if t := csharpAwaitedCallType(inner, csharpOwnerTypeName(callerID), tenvByOwner[callerID], result); t != "" {
+				env := csharpOffsetEnv(typedLocalsByOwner, tenvByOwner[callerID], callerID, csharpChainHead(inner), c.offset)
+				if t := csharpAwaitedCallType(inner, csharpOwnerTypeName(callerID), env, result); t != "" {
 					edge.Meta = map[string]any{"receiver_type": t}
 				}
 			} else if strings.Contains(c.receiver, ".") || strings.Contains(c.receiver, "(") {
-				stampFactoryChainReceiver(edge, c.receiver, resolveChainType(c.receiver, tenvByOwner[callerID], result))
+				env := csharpOffsetEnv(typedLocalsByOwner, tenvByOwner[callerID], callerID, csharpChainHead(c.receiver), c.offset)
+				stampFactoryChainReceiver(edge, c.receiver, resolveChainType(c.receiver, env, result))
 				if edge.Meta == nil && !strings.Contains(c.receiver, "(") {
 					// A namespace-qualified receiver the chain walker could
 					// not type (`Lib.BagExt.Add(bag)`). That is the same
