@@ -171,8 +171,18 @@ func TestCSharpAdopt_AlreadyResolvedAccessorStubIsConfirmed(t *testing.T) {
 	}
 }
 
-// Two authored calls of the SAME name on one line from the SAME owner —
-// two stubs, one owner. stubOwnerAt must not read the repeat as a tie.
+// Two authored calls of the SAME trailing name on one line from the SAME
+// owner — two stubs, one owner. stubOwnersAt must not read the repeat as
+// a tie: without the owner dedupe the duplicate looks like a multi-owner
+// tie, and a property owner cannot win the containment tie-break (it is
+// not in idx.funcs), so the call would be dropped outright.
+//
+// Two same-name MEMBER calls cannot produce the shape — they stub to the
+// same target (unresolved::*.Run) and collapse into one edge under the
+// graph's (From, To, Kind, FilePath, Line) edge key. The receiverless
+// form stubs to a DIFFERENT id (unresolved::Run) with the same trailing
+// name, so member + receiverless is the minimal two-stub fixture; the
+// precondition below keeps it honest.
 func TestCSharpAdopt_SameOwnerTwoSameNameCallsOnOneLine(t *testing.T) {
 	g, dir := buildFixture(t, map[string]string{
 		"A/Svc.cs": csSvc,
@@ -181,17 +191,20 @@ func TestCSharpAdopt_SameOwnerTwoSameNameCallsOnOneLine(t *testing.T) {
         private Svc worker;
 
         public int Tick {
-            get { worker.Run(); worker.Run(); return 1; }
+            get { worker.Run(); Run(); return 1; }
         }
     }
 }
 `,
 	})
+	tick := nodeByNameKind(t, g, "Tick", graph.KindField)
+	if stubs := callEdgesNamed(g, tick.ID, "Run"); len(stubs) != 2 {
+		t.Fatalf("fixture precondition: want 2 extracted Run stubs on the property, got %d: %v", len(stubs), stubs)
+	}
 	p := NewProvider(CSharpSpec(), zap.NewNop())
 	if _, err := p.Enrich(g, dir); err != nil {
 		t.Fatal(err)
 	}
-	tick := nodeByNameKind(t, g, "Tick", graph.KindField)
 	run := nodeByNameKind(t, g, "Run", graph.KindMethod)
 	e := callEdgeTo(g, tick.ID, run.ID)
 	if e == nil {
