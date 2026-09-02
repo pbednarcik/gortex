@@ -21,12 +21,18 @@ import (
 // siblings, so a sibling-section use must keep the receiver's type and
 // an assignment there must stay a local write, not a field write
 // (round-6 finding B1).
+//
+// SwRunner declares a SAME-NAMED field: without it the no-field-write
+// branch was unreachable - writes are only minted for names that ARE
+// fields of the enclosing type, so the assertion held vacuously however
+// the extent was drawn (issue #726).
 func TestResolveCSharpTypedLocal_AliveAcrossSwitchSections(t *testing.T) {
 	g := buildCSharpResolverGraph(t, map[string]string{
 		"Switch.cs": `namespace App {
     public interface ISwConverter { string Convert(int n); }
     public class SwEnglish : ISwConverter { public string Convert(int n) { return "en"; } }
     public class SwRunner {
+        private ISwConverter conv;
         public void Run(ISwConverter c, int k) {
             switch (k) {
                 case 1: ISwConverter conv = c; conv.Convert(1); break;

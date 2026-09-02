@@ -4,6 +4,7 @@ import (
 	"testing"
 
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 
 	"github.com/zzet/gortex/internal/graph"
 )
@@ -62,6 +63,16 @@ func TestResolveCSharp_VerbatimDeclaredTypeKeepsItsHierarchy(t *testing.T) {
 	assert.Contains(t, targets, "Ev.cs::EvB.Put")
 }
 
+// The fan-out assertion this test once carried went vacuous when the
+// dispatch gate was deferred - with no type-argument gate every
+// implementor survives however the bases are spelled (issue #726). The
+// pins now sit where the canonicalization actually acts, on the
+// hierarchy edges and their closure stamps: a respelled entry must pass
+// the interface test (no extends misclassification), enter the
+// duplicate count (a dual type's surviving stamp must NOT read as the
+// unique closure), enter the alias-sentinel lookup (an @-spelled alias
+// suppresses the stamp exactly like its plain spelling), and decode
+// before minting an unresolved target (no `@` survives into any edge).
 func TestResolveCSharpInterfaceDispatch_RespelledBasesKeepTheFamily(t *testing.T) {
 	g := buildCSharpResolverGraph(t, map[string]string{
 		"Rack.cs": `namespace App {
@@ -69,11 +80,6 @@ func TestResolveCSharpInterfaceDispatch_RespelledBasesKeepTheFamily(t *testing.T
     public class Widget { }
     public interface IBox<T> { void Put(T item); }
     public class PlainCrateBox : IBox<Crate> { public void Put(Crate item) { } }
-    public class Flow {
-        private readonly IBox<Crate> _box;
-        public Flow(IBox<Crate> box) { _box = box; }
-        public void Pull(Crate item) { _box.Put(item); }
-    }
 }`,
 		"Dual.cs": `using @BX = App.IBox<App.Crate>;
 namespace App {
@@ -89,20 +95,39 @@ namespace App {
 	})
 	New(g).ResolveAll()
 
-	const callerID = "Rack.cs::Flow.Pull"
-	bindMemberCallAtLine(t, g, callerID, "Put", "Rack.cs::IBox.Put")
-	ResolveCSharpInterfaceDispatch(g)
+	type hier struct {
+		kind graph.EdgeKind
+		to   string
+		args any
+	}
+	byFrom := map[string][]hier{}
+	for _, e := range g.AllEdges() {
+		if e == nil || (e.Kind != graph.EdgeImplements && e.Kind != graph.EdgeExtends) {
+			continue
+		}
+		var args any
+		if e.Meta != nil {
+			args = e.Meta["target_type_args"]
+		}
+		byFrom[e.From] = append(byFrom[e.From], hier{kind: e.Kind, to: e.To, args: args})
+		assert.NotContains(t, e.To, "@",
+			"a respelled base entry decodes before minting its target - %s -> %s", e.From, e.To)
+	}
 
-	targets := dispatchTargets(g, callerID)
-	hasA, hasB := false, false
-	for _, to := range targets {
-		switch to {
-		case "Dual.cs::DualA.Put":
-			hasA = true
-		case "Dual.cs::DualB.Put":
-			hasB = true
+	assert.Equal(t, []hier{{kind: graph.EdgeImplements, to: "Rack.cs::IBox", args: "Crate"}},
+		byFrom["Rack.cs::PlainCrateBox"],
+		"control: a lone plain base keeps its unique-closure stamp")
+
+	assert.Equal(t, []hier{{kind: graph.EdgeImplements, to: "Rack.cs::IBox", args: nil}},
+		byFrom["Dual.cs::DualB"],
+		"the verbatim entry passes the interface test (no extends misclassification) and the duplicate count - a dual type's surviving stamp must not claim the unique closure")
+
+	require.Len(t, byFrom["Dual.cs::DualA"], 2, "alias entry plus plain entry, got %v", byFrom["Dual.cs::DualA"])
+	for _, h := range byFrom["Dual.cs::DualA"] {
+		if h.kind == graph.EdgeImplements {
+			assert.Equal(t, "Rack.cs::IBox", h.to)
+			assert.Nil(t, h.args,
+				"the @-spelled alias enters the alias-sentinel lookup - the plain entry's stamp is suppressed exactly as it would be beside `BX`")
 		}
 	}
-	assert.True(t, hasA, "the alias-based dual implementor must stay in the fan-out, got %v", targets)
-	assert.True(t, hasB, "the verbatim-direct dual implementor must stay in the fan-out, got %v", targets)
 }

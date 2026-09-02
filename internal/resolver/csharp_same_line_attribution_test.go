@@ -133,17 +133,21 @@ func TestResolveCSharp_UnequalSpanMethodsSharingALine(t *testing.T) {
 	assert.Empty(t, callsFrom(g, "UnequalSpanSameLine.cs::SMFlow.B"),
 		"B's body is `return 0;` - it owns no call, whatever shares its line")
 
+	// The fan-out assertion this test once ended on went vacuous when
+	// the dispatch gate was deferred - with no type-argument gate every
+	// implementor survives whoever owns the call (issue #726). The
+	// round-5 failure chain is pinned at its first two links instead:
+	// the companion must hang off A, and the shadow refusal must
+	// consult A's OWN parameter set - `_store` is A's parameter, so no
+	// field read may be minted anywhere. Under line-keyed attribution B
+	// carried the call, B has no `_store` parameter, and the field read
+	// appeared with full receiver evidence.
 	const callerID = "UnequalSpanSameLine.cs::SMFlow.A"
-	bindMemberCallAtLine(t, g, callerID, "Get", "UnequalSpanSameLine.cs::SMBox.Get")
-	ResolveCSharpInterfaceDispatch(g)
-
-	targets := dispatchTargets(g, callerID)
-	widgetSurvives := false
-	for _, to := range targets {
-		if to == "UnequalSpanSameLine.cs::SMWidgetBox.Get" {
-			widgetSurvives = true
+	assert.Contains(t, callsFrom(g, callerID), "unresolved::*.Get",
+		"the split-line call's companion rides on A, whose byte extent contains it")
+	for _, e := range g.AllEdges() {
+		if e != nil && e.Kind == graph.EdgeReads && strings.Contains(e.To, "_store") {
+			t.Fatalf("the receiver is A's parameter - no member may read the `_store` FIELD, got %s -> %s", e.From, e.To)
 		}
 	}
-	assert.True(t, widgetSurvives,
-		"the call belongs to A and its receiver is A's SMBox<SMWidget> parameter - at minimum SMWidgetBox.Get must survive in A's fan-out, got %v", targets)
 }
