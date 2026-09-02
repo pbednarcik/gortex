@@ -735,6 +735,7 @@ func (e *CSharpExtractor) extractCSharp(filePath string, src []byte) (*parser.Ex
 	// type environments. Owner attribution runs once per local, call and
 	// type use — the sorted lookup keeps that from multiplying into an
 	// O(locals×functions) linear-scan product on member-heavy files.
+	csharpStampOwnershipSpans(result, funcLines)
 	funcRanges := newCSharpFuncLookup(csharpOwnerRanges(result, funcBytes, funcLines), funcBytes)
 
 	// Build type environments in legacy precedence, scoped per enclosing
@@ -2509,6 +2510,41 @@ func csharpOwnerRanges(result *parser.ExtractionResult, funcBytes, funcLines map
 		ranges = append(ranges, funcRange{id: n.ID, startLine: start, endLine: end})
 	}
 	return ranges
+}
+
+// csharpStampOwnershipSpans carries the recorded ownership span onto the
+// member node whenever the node's own lines do not contain it. A node is
+// minted once per id, so a C# 13 partial property extracted declaring
+// fragment first (or a property declared in both arms of an #if / #else)
+// keeps the first fragment's lines while csharpOwnerRanges owns its
+// calls by the body-bearing fragment's span - and every stub the
+// extractor parks there sits outside the node. A consumer that tests a
+// call's line against the owner's extent (the semantic tier's adoption
+// guard, issue #731) needs the span the extractor actually attributed
+// by; the stamp is that span, the same 1-based lines csharpOwnerRanges
+// reads. Two cases leave a node unstamped, deliberately alike in effect:
+// no span was recorded at all (a field without an initializer, a member
+// kind that records none), and a recorded span the node's own lines
+// already contain (the ordinary property, the implementing-first order,
+// a field's declarator inside its declaration). Either way the node's
+// lines answer and its meta stays as before. Kept as its own walk rather
+// than folded into csharpOwnerRanges so the owner lookup stays a pure
+// read of the result.
+func csharpStampOwnershipSpans(result *parser.ExtractionResult, funcLines map[string][2]int) {
+	for _, n := range result.Nodes {
+		if n.Kind != graph.KindField {
+			continue
+		}
+		ln, ok := funcLines[n.ID]
+		if !ok || (ln[0] >= n.StartLine && ln[1] <= n.EndLine) {
+			continue
+		}
+		if n.Meta == nil {
+			n.Meta = make(map[string]any)
+		}
+		n.Meta[graph.MetaOwnershipStartLine] = ln[0]
+		n.Meta[graph.MetaOwnershipEndLine] = ln[1]
+	}
 }
 
 func newCSharpFuncLookup(ranges []funcRange, bytes map[string][2]int) *csharpFuncLookup {
