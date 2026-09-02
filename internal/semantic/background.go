@@ -161,14 +161,18 @@ type backgroundScheduler struct {
 // BackgroundLaneStatus is a point-in-time snapshot of the lane's progress
 // for the health surface.
 type BackgroundLaneStatus struct {
-	Started        bool   `json:"started"`
-	Pending        int    `json:"pending"`
-	InFlightRepo   string `json:"in_flight_repo,omitempty"`
-	LastRepo       string `json:"last_repo,omitempty"`
-	LastDurationMs int64  `json:"last_duration_ms,omitempty"`
-	Drained        int    `json:"drained"`
-	Failed         int    `json:"failed,omitempty"`
-	Retries        int    `json:"retries,omitempty"`
+	Started      bool   `json:"started"`
+	Pending      int    `json:"pending"`
+	InFlightRepo string `json:"in_flight_repo,omitempty"`
+	// InFlight is the live progress of the drain named by InFlightRepo,
+	// when its provider can report one. Nil for providers that do not
+	// implement BackgroundProgressReporter and between drains.
+	InFlight       *LaneProgress `json:"in_flight,omitempty"`
+	LastRepo       string        `json:"last_repo,omitempty"`
+	LastDurationMs int64         `json:"last_duration_ms,omitempty"`
+	Drained        int           `json:"drained"`
+	Failed         int           `json:"failed,omitempty"`
+	Retries        int           `json:"retries,omitempty"`
 	// Abandoned counts tasks parked after backgroundRetryMaxZeroProgress
 	// consecutive zero-progress retries — the "server keeps refusing an
 	// identical drain" signature. They revive on the next external trigger.
@@ -205,7 +209,7 @@ type LaneProgress struct {
 func (s *backgroundScheduler) status() BackgroundLaneStatus {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	return BackgroundLaneStatus{
+	out := BackgroundLaneStatus{
 		Started:           s.started,
 		Pending:           len(s.pending),
 		InFlightRepo:      s.inFlightRepo,
@@ -219,6 +223,21 @@ func (s *backgroundScheduler) status() BackgroundLaneStatus {
 		LastFailedRepo:    s.lastFailedRepo,
 		LastFailure:       s.lastFailure,
 	}
+	// inFlight is populated at dequeue and cleared by finishInFlight;
+	// inFlightRepo is set by drain() just before the provider runs. A task
+	// dequeued but not yet at that point reports nothing (its provider has
+	// no lane yet), which is the honest answer.
+	for _, t := range s.inFlight {
+		if t.repoName != s.inFlightRepo {
+			continue
+		}
+		if rep, ok := t.provider.(BackgroundProgressReporter); ok {
+			if lp, live := rep.LaneProgress(); live {
+				out.InFlight = &lp
+			}
+		}
+	}
+	return out
 }
 
 func newBackgroundScheduler(logger *zap.Logger) *backgroundScheduler {

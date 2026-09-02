@@ -39,6 +39,49 @@ type mockBackgroundProvider struct {
 	laneEnabled func() bool
 	// roots, when non-nil, receives the repoRoot each drain was handed.
 	roots chan string
+	// progress, when set, is what LaneProgress reports while a drain is
+	// blocked; the scheduler must surface it on status() and drop it after
+	// finishInFlight.
+	progress *LaneProgress
+}
+
+func (m *mockBackgroundProvider) LaneProgress() (LaneProgress, bool) {
+	if m.progress == nil {
+		return LaneProgress{}, false
+	}
+	return *m.progress, true
+}
+
+// A blocked drain's live progress rides on the lane status while it runs
+// and is gone once the drain settles.
+func TestBackgroundScheduler_StatusCarriesInFlightProgress(t *testing.T) {
+	m := &mockBackgroundProvider{
+		mockProvider: mockProvider{name: "mock-bg", languages: []string{"go"}, available: true},
+		drained:      make(chan string, 1),
+		block:        make(chan struct{}),
+		progress:     &LaneProgress{Repo: "repo-a", Phase: "sweep", FilesDone: 40, FilesTotal: 100},
+	}
+	s := newBackgroundScheduler(zap.NewNop())
+	defer s.close()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	s.start(ctx, graph.New())
+	require.True(t, s.enqueue(backgroundTask{repoName: "repo-a", repoRoot: t.TempDir(), lang: "go", provider: m}))
+
+	select {
+	case <-m.drained: // the drain is now parked inside EnrichBackground
+	case <-time.After(5 * time.Second):
+		t.Fatal("drain never started")
+	}
+	st := s.status()
+	require.NotNil(t, st.InFlight, "a blocked drain is in flight")
+	assert.Equal(t, "sweep", st.InFlight.Phase)
+	assert.Equal(t, int64(40), st.InFlight.FilesDone)
+	assert.Equal(t, "repo-a", st.InFlightRepo)
+
+	close(m.block)
+	require.Eventually(t, func() bool { return s.status().InFlight == nil }, 5*time.Second, 10*time.Millisecond,
+		"the snapshot is dropped once the drain finishes")
 }
 
 func (m *mockBackgroundProvider) BackgroundLaneEnabled() bool {
