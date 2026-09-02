@@ -119,6 +119,15 @@ type BackgroundEnricher interface {
 	InvalidateBackground(g graph.Store, repoPrefix string) error
 }
 
+// BackgroundProgressReporter is implemented by providers that can describe
+// an in-flight background drain. The scheduler type-asserts it when it
+// builds the lane status; a provider that does not implement it simply
+// shows no progress detail. The ok result is false when nothing is
+// draining, so a stale snapshot is never mistaken for a live one.
+type BackgroundProgressReporter interface {
+	LaneProgress() (LaneProgress, bool)
+}
+
 // backgroundLaneGate is an optional refinement a BackgroundEnricher MAY
 // implement: whether the lane can run for this provider AT ALL (mode and
 // construction), independent of any completion marker. The fail-open
