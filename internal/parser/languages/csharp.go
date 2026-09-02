@@ -276,12 +276,16 @@ func (s csharpLocalScopes) shadowsAnywhere(owner, name string) bool {
 // an `if` condition escapes to the ENCLOSING block (definite-assignment
 // scoping), so stopping at the `if` would under-refuse. Loop headers do
 // not leak their pattern variables past the statement. The switch BODY
-// is one declaration space shared by every section — that is exactly
-// why redeclaring a name in a sibling section is CS0128 — so the extent
-// stops at `switch_body`, never at a single section (round-6 finding
-// B1: stopping at the section read a sibling-section local as expired,
-// dropping its receiver evidence and re-minting its assignments as
-// field writes).
+// is one declaration space shared by every section for the locals its
+// STATEMENT LISTS declare — that is exactly why redeclaring a name in a
+// sibling section is CS0128 — so those extents stop at `switch_body`
+// (round-6 finding B1: stopping at the section read a sibling-section
+// local as expired, dropping its receiver evidence and re-minting its
+// assignments as field writes). A pattern variable bound in a case
+// LABEL or `when` guard is the one exception: it is section-scoped
+// (sibling sections may redeclare it), handled positionally in
+// csharpLocalScopeOf rather than by this table — the ancestor node type
+// alone cannot express both rules.
 var csharpScopeFormers = map[string]bool{
 	"block":                       true,
 	"switch_body":                 true,
@@ -314,11 +318,38 @@ var csharpScopeFormers = map[string]bool{
 // lose a refusal.
 func csharpLocalScopeOf(n *sitter.Node) csharpLocalScope {
 	for cur := n; cur != nil; cur = cur.Parent() {
+		// A switch SECTION is not a declaration space for the locals its
+		// statement list declares (those live in the switch BODY), but it
+		// IS one for a pattern variable bound in a case label or a `when`
+		// guard. Roslyn accepts `case int x:` beside `case string x:` in a
+		// sibling section AND accepts `case 1: int y = 1;` / `default: y =
+		// 2;`, so the two rules coexist and the answer depends on where in
+		// the section the binder sits: label territory is everything
+		// before the section's first statement.
+		if cur.Type() == "switch_section" && csharpInSwitchLabel(cur, n) {
+			return csharpLocalScope{start: int(cur.StartByte()), end: int(cur.EndByte())}
+		}
 		if csharpScopeFormers[cur.Type()] {
 			return csharpLocalScope{start: int(cur.StartByte()), end: int(cur.EndByte())}
 		}
 	}
 	return csharpLocalScope{start: 0, end: math.MaxInt}
+}
+
+// csharpInSwitchLabel reports whether binder sits in section's LABEL
+// region - before the first statement the section lists.
+func csharpInSwitchLabel(section, binder *sitter.Node) bool {
+	for i, _nc := 0, int(section.NamedChildCount()); i < _nc; i++ {
+		c := section.NamedChild(i)
+		if c == nil {
+			continue
+		}
+		t := c.Type()
+		if strings.HasSuffix(t, "_statement") || t == "block" {
+			return binder.StartByte() < c.StartByte()
+		}
+	}
+	return false
 }
 
 // csharpTypedBinding is one typed local declaration's evidence record:
