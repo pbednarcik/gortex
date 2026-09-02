@@ -130,6 +130,8 @@ func (p *Provider) EnrichBackground(ctx context.Context, g graph.Store, repoPref
 	if err != nil {
 		return nil, err
 	}
+	p.activeLane.Store(lane)
+	defer p.activeLane.Store(nil)
 	// Seal, not Close: the lane instance is single-use, and sealing also
 	// refuses any client a still-wedged prober or reconnect leg builds
 	// AFTER this teardown — without it that late server would publish
@@ -213,6 +215,26 @@ func (p *Provider) EnrichBackground(ctx context.Context, g graph.Store, repoPref
 		p.recordBackgroundMarker(g, repoPrefix, startSHA)
 	}
 	return result, err
+}
+
+// LaneProgress reports the in-flight lane drain's progress. It implements
+// semantic.BackgroundProgressReporter on the foreground provider, which is
+// the instance the scheduler holds; the drain itself runs on the dedicated
+// lane instance, so the call forwards there.
+func (p *Provider) LaneProgress() (semantic.LaneProgress, bool) {
+	lane := p.activeLane.Load()
+	if lane == nil {
+		return semantic.LaneProgress{}, false
+	}
+	dp := lane.progress.Load()
+	if dp == nil {
+		return semantic.LaneProgress{}, false
+	}
+	repo := ""
+	if r := lane.progressRepo.Load(); r != nil {
+		repo = *r
+	}
+	return dp.snapshot(repo, &lane.reqStats, lane.drainErrsLive.Load()), true
 }
 
 // newLaneProvider builds the drain-pass instance: same spec, heavyDelta
