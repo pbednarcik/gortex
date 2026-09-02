@@ -1,6 +1,7 @@
 package lsp
 
 import (
+	"context"
 	"sync/atomic"
 	"time"
 
@@ -131,6 +132,46 @@ func (p *Provider) progressFor() *drainProgress { return p.progress.Load() }
 
 // drainHeartbeatInterval paces the progress log line. Var so tests shrink it.
 var drainHeartbeatInterval = 20 * time.Second
+
+// startDrainHeartbeat logs the live snapshot every drainHeartbeatInterval
+// until stop is called or ctx ends. Started only for heavy-delta passes:
+// they run for minutes to hours with no other output, and a wedged server
+// is otherwise indistinguishable from a slow one. The phase name is the
+// honest scale — the sweep file list is built only after confirm ends, so
+// a confirm-phase line cannot say how much sweep is still ahead.
+func (p *Provider) startDrainHeartbeat(ctx context.Context) (stop func()) {
+	if p.logger == nil {
+		return func() {}
+	}
+	hctx, cancel := context.WithCancel(ctx)
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		t := time.NewTicker(drainHeartbeatInterval)
+		defer t.Stop()
+		for {
+			select {
+			case <-hctx.Done():
+				return
+			case <-t.C:
+				dp := p.progress.Load()
+				if dp == nil {
+					return
+				}
+				repo := ""
+				if r := p.progressRepo.Load(); r != nil {
+					repo = *r
+				}
+				p.logger.Info("LSP background drain progress",
+					laneProgressFields(dp.snapshot(repo, &p.reqStats, p.drainErrsLive.Load()))...)
+			}
+		}
+	}()
+	return func() {
+		cancel()
+		<-done // the last tick has landed before the completion line prints
+	}
+}
 
 // laneProgressFields flattens a snapshot for the heartbeat line.
 func laneProgressFields(lp semantic.LaneProgress) []zap.Field {
