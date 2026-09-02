@@ -1257,7 +1257,7 @@ func (e *CSharpExtractor) emitContainer(m parser.QueryResult, kind string, nodeK
 	if ns := csharpEnclosingNamespace(def.Node, src); ns != "" {
 		meta["scope_ns"] = ns
 	}
-	if doc := extractCSharpDoc(src, def.StartLine); doc != "" {
+	if doc := extractCSharpDoc(src, def.Node); doc != "" {
 		meta["doc"] = doc
 	}
 	// EF Core fluent mapping: a class implementing
@@ -1668,11 +1668,19 @@ func emitCSharpAnnotationEdges(anns []javaAnnotation, fromID, filePath string, r
 
 // extractCSharpDoc tries the XML-doc form first (/// <summary>…) and
 // falls back to /** … */ block comments (less common in C# but valid).
-func extractCSharpDoc(src []byte, startRow int) string {
-	if d := ExtractDocAbove(src, startRow, DocLangCSharpXML); d != "" {
+// extractCSharpDoc returns the doc comment directly above decl: XML doc
+// lines first, then the /** */ or // fallback. Addressed by the node's
+// start byte so the walk starts at the declaration instead of counting
+// rows from the top of the file for every member.
+func extractCSharpDoc(src []byte, decl *sitter.Node) string {
+	if decl == nil {
+		return ""
+	}
+	start := int(decl.StartByte())
+	if d := ExtractDocAboveByte(src, start, DocLangCSharpXML); d != "" {
 		return d
 	}
-	return ExtractDocAbove(src, startRow, DocLangBlockStar)
+	return ExtractDocAboveByte(src, start, DocLangBlockStar)
 }
 
 func (e *CSharpExtractor) emitMethod(m parser.QueryResult, filePath, fileID string, src []byte, result *parser.ExtractionResult, seen, annotationSeen map[string]bool, ifaceMethods map[string][]string, funcBytes map[string][2]int) {
@@ -1794,7 +1802,7 @@ func (e *CSharpExtractor) emitMethod(m parser.QueryResult, filePath, fileID stri
 	if ns := csharpEnclosingNamespace(def.Node, src); ns != "" {
 		meta["scope_ns"] = ns
 	}
-	if doc := extractCSharpDoc(src, def.StartLine); doc != "" {
+	if doc := extractCSharpDoc(src, def.Node); doc != "" {
 		meta["doc"] = doc
 	}
 	result.Nodes = append(result.Nodes, &graph.Node{
@@ -1951,7 +1959,7 @@ func (e *CSharpExtractor) emitField(m parser.QueryResult, filePath, fileID strin
 	if csharpHasModifier(def.Node, src, "readonly") {
 		meta["readonly"] = true
 	}
-	if doc := extractCSharpDoc(src, def.StartLine); doc != "" {
+	if doc := extractCSharpDoc(src, def.Node); doc != "" {
 		meta["doc"] = doc
 	}
 	result.Nodes = append(result.Nodes, &graph.Node{
@@ -2105,7 +2113,7 @@ func (e *CSharpExtractor) emitProperty(m parser.QueryResult, filePath, fileID st
 			meta["field_type_args"] = args
 		}
 	}
-	if doc := extractCSharpDoc(src, def.StartLine); doc != "" {
+	if doc := extractCSharpDoc(src, def.Node); doc != "" {
 		meta["doc"] = doc
 	}
 	result.Nodes = append(result.Nodes, &graph.Node{
@@ -2831,11 +2839,6 @@ func csharpDeclAllowsBaseClass(decl *sitter.Node) bool {
 	}
 }
 
-// csharpBaseTypeName extracts the bare type name from a single base_list
-// entry, stripping generic arguments and namespace qualification so the
-// `I`-prefix test sees IList rather than IList<int> or System.IList. The
-// bool return reports whether the entry is a primary_constructor_base_type
-// (`Base(args)`), which can only ever be a base class.
 // csharpCanonBaseIdent reduces one base-entry identifier SPELLING to the
 // identifier it denotes: the verbatim `@` prefix drops and unicode
 // escapes decode, so `@IRack` and the escaped spelling compare equal to
@@ -2851,6 +2854,11 @@ func csharpCanonBaseIdent(s string) string {
 	return s
 }
 
+// csharpBaseTypeName extracts the bare type name from a single base_list
+// entry, stripping generic arguments and namespace qualification so the
+// `I`-prefix test sees IList rather than IList<int> or System.IList. The
+// bool return reports whether the entry is a primary_constructor_base_type
+// (`Base(args)`), which can only ever be a base class.
 func csharpBaseTypeName(entry *sitter.Node, src []byte) (string, bool) {
 	switch entry.Type() {
 	case "identifier":
