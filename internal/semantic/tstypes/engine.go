@@ -1107,6 +1107,29 @@ func (idx *fileIndex) enclosingCallable(line int) *graph.Node {
 	return best
 }
 
+// authoredOwner picks, out of a same-line same-name stub tie, the owner
+// the binder named as the call fact's author (LangSpec.MemberDeclName
+// spells it exactly as the extractor names the node). nil when the author
+// is unnamed, names none of the tied owners (a member the extractor mints
+// no node for), or names more than one (same-named overloads sharing a
+// line) — every one of those falls back to line containment.
+func authoredOwner(owners []*graph.Node, author string) *graph.Node {
+	if author == "" {
+		return nil
+	}
+	var match *graph.Node
+	for _, o := range owners {
+		if o.Name != author {
+			continue
+		}
+		if match != nil {
+			return nil
+		}
+		match = o
+	}
+	return match
+}
+
 // --- Call application -------------------------------------------------
 
 func (a *applier) applyCall(idx *fileIndex, cf callFact, res *semantic.EnrichResult) {
@@ -1138,11 +1161,17 @@ func (a *applier) applyCall(idx *fileIndex, cf callFact, res *semantic.EnrichRes
 	// of every edge identity). The line-keyed containment lookup stays
 	// as the fallback for sites the extractor recorded no stub for
 	// (desugared operator calls carry no authored-name stub). On a
-	// multi-owner tie, containment may still break it — but only WITHIN
-	// the tied set: a callable that merely shares the line never
-	// collects a call it did not author (it has no stub to claim, so it
-	// would mint), and when no tied owner contains the line the site is
-	// refused outright.
+	// multi-owner tie the fact's own author breaks it: the binder names
+	// the member each call sits in, spelled as the extractor names its
+	// node, so a same-line same-name tie resolves each fact onto its own
+	// owner's stub — never onto a neighbour's, whatever target that
+	// neighbour's own site resolves to. Containment breaks a tie only
+	// when the author is unnamed (a spec without MemberDeclName) or names
+	// none — or several — of the tied owners, and then only WITHIN the
+	// tied set: a callable that merely shares the line never collects a
+	// call it did not author (it has no stub to claim, so it would mint),
+	// and when no tied owner contains the line the site is refused
+	// outright.
 	var caller *graph.Node
 	owners := idx.stubOwnersAt(cf.line, cf.method)
 	switch len(owners) {
@@ -1151,11 +1180,14 @@ func (a *applier) applyCall(idx *fileIndex, cf callFact, res *semantic.EnrichRes
 	case 1:
 		caller = owners[0]
 	default:
-		if enc := idx.enclosingCallable(cf.line); enc != nil {
-			for _, o := range owners {
-				if o.ID == enc.ID {
-					caller = enc
-					break
+		caller = authoredOwner(owners, cf.owner)
+		if caller == nil {
+			if enc := idx.enclosingCallable(cf.line); enc != nil {
+				for _, o := range owners {
+					if o.ID == enc.ID {
+						caller = enc
+						break
+					}
 				}
 			}
 		}
