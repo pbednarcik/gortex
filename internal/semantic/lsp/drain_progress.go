@@ -125,6 +125,10 @@ func (dp *drainProgress) snapshot(repo string, stats *requestStats, errs *drainE
 	return out
 }
 
+// progressFor returns the live record or nil; loops call it once outside
+// their goroutines so a fast pass pays one atomic load, not one per file.
+func (p *Provider) progressFor() *drainProgress { return p.progress.Load() }
+
 // drainHeartbeatInterval paces the progress log line. Var so tests shrink it.
 var drainHeartbeatInterval = 20 * time.Second
 

@@ -21,6 +21,72 @@ import (
 // The LSP provider is the background lane's first tenant.
 var _ semantic.BackgroundEnricher = (*Provider)(nil)
 
+// It also describes its in-flight drain.
+var _ semantic.BackgroundProgressReporter = (*Provider)(nil)
+
+// While the lane drains, the FOREGROUND provider (the one the scheduler
+// holds) reports the lane instance's live progress; once the drain returns
+// it reports nothing. The fake server parks the references confirm so the
+// test can read the snapshot mid-phase.
+func TestLSPProvider_LaneProgress_LiveDuringDrain(t *testing.T) {
+	t.Setenv(SweepEnv, "")
+	t.Setenv(HeavyRequestsEnv, "")
+
+	repoRoot, g, _ := heavyDeltaFixture(t)
+
+	serverA := newFakeLSPServer()
+	newHeavyDeltaRig(serverA.handle, repoRoot)
+	p, cleanupA := providerWithFakeServer(t, serverA, []string{"go"})
+	defer cleanupA()
+
+	serverB := newFakeLSPServer()
+	rigB := newHeavyDeltaRig(serverB.handle, repoRoot)
+	inRefs := make(chan struct{}, 1)
+	release := make(chan struct{})
+	serverB.handle("textDocument/references", func(json.RawMessage) (any, *jsonRPCError) {
+		rigB.references.Add(1)
+		select {
+		case inRefs <- struct{}{}:
+		default:
+		}
+		<-release
+		return rigB.refsResult, nil
+	})
+	lane, cleanupB := providerWithFakeServer(t, serverB, []string{"go"})
+	defer cleanupB()
+	lane.heavyDelta = true
+	p.laneProviderFactory = func() (*Provider, error) { return lane, nil }
+
+	_, before := p.LaneProgress()
+	assert.False(t, before, "nothing in flight before the drain")
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		_, _ = p.EnrichBackground(ctx, g, "", repoRoot)
+	}()
+
+	select {
+	case <-inRefs:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the drain never reached the references confirm")
+	}
+	lp, ok := p.LaneProgress()
+	require.True(t, ok, "a drain is in flight")
+	assert.Equal(t, "confirm", lp.Phase)
+	assert.Equal(t, int64(1), lp.FilesTotal, "the fixture has one confirm group")
+	assert.Equal(t, int64(0), lp.FilesDone, "the only group is still parked")
+	assert.Equal(t, estimateWarming, lp.EstimateState)
+	assert.Positive(t, lp.References)
+
+	close(release)
+	<-done
+	_, after := p.LaneProgress()
+	assert.False(t, after, "the drain returned; nothing in flight")
+}
+
 // markerStore wraps an in-memory graph with a durable-marker table so the
 // lane's census logic (which keys off enrichment-state markers) is testable
 // without a SQLite store.
@@ -297,6 +363,10 @@ func TestLSPProvider_NewLaneProvider_FieldInventoryPinned(t *testing.T) {
 		"reconnectAttempts":   "runtime",
 		"connectOnce":         "runtime",
 		"reqStats":            "runtime",
+		"progress":            "runtime", // the lane's own drain record — set at its pass entry
+		"progressRepo":        "runtime",
+		"drainErrsLive":       "runtime",
+		"activeLane":          "runtime", // foreground-side pointer AT the lane; a lane never spawns lanes
 	}
 
 	tp := reflect.TypeOf(Provider{})

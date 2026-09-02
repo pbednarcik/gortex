@@ -201,6 +201,19 @@ type Provider struct {
 	// enrichment pass. Reset at pass start and surfaced in the end-of-pass
 	// telemetry so the round-trip volume per method is observable.
 	reqStats requestStats
+
+	// progress is the live record of the heavy-delta drain this instance is
+	// running, nil otherwise. progressRepo names the repo it describes and
+	// drainErrsLive points at that pass's error ledger (a pass-local value
+	// the snapshot needs to read). All three are set at pass entry and
+	// cleared at pass exit; only the heartbeat and LaneProgress read them.
+	progress      atomic.Pointer[drainProgress]
+	progressRepo  atomic.Pointer[string]
+	drainErrsLive atomic.Pointer[drainErrorLedger]
+	// activeLane is the dedicated lane instance a FOREGROUND provider is
+	// currently draining through (see EnrichBackground). The scheduler
+	// holds the foreground provider, so LaneProgress forwards to it.
+	activeLane atomic.Pointer[Provider]
 }
 
 // requestStats holds one atomic counter per LSP request method the
@@ -1164,6 +1177,20 @@ func (p *Provider) EnrichRepoContext(ctx context.Context, g graph.Store, repoPre
 	// reports only this invocation's round trips.
 	p.reqStats.reset()
 
+	// A heavy-delta drain is the multi-minute pass nobody can see into;
+	// publish its progress for the heartbeat and the scheduler snapshot.
+	// Fast passes are short and already report per-repo status.
+	if p.heavyDelta {
+		repoName := repoPrefix
+		p.progressRepo.Store(&repoName)
+		p.progress.Store(newDrainProgress())
+		defer func() {
+			p.progress.Store(nil)
+			p.progressRepo.Store(nil)
+			p.drainErrsLive.Store(nil)
+		}()
+	}
+
 	// One document session shared by every phase below: a file didOpen'd
 	// by the interface pass stays warm for the confirm pass and the sweep
 	// instead of being reopened, and every open is paired with a didClose
@@ -1357,6 +1384,9 @@ func (p *Provider) EnrichRepoContext(ctx context.Context, g graph.Store, repoPre
 	// drain skipped anything on an error, and the breaker cannot catch a
 	// server dying mid-sweep — any early success permanently disarms it.
 	drainErrs := &drainErrorLedger{}
+	if p.heavyDelta {
+		p.drainErrsLive.Store(drainErrs)
+	}
 
 	// Phase boundary timestamps: the completion log breaks the pass wall time
 	// out per phase (phase_*_ms) — an aggregate duration cannot say which pass
@@ -1496,6 +1526,10 @@ func (p *Provider) EnrichRepoContext(ctx context.Context, g graph.Store, repoPre
 		}
 	} else {
 		confirmGroups := p.groupConfirmTargets(view.nodesByID, targets, degradedSkipFile)
+		dp := p.progressFor()
+		if dp != nil {
+			dp.beginPhase(drainPhaseConfirm, len(confirmGroups))
+		}
 		sem := make(chan struct{}, p.maxParallel)
 		var wg sync.WaitGroup
 		for _, grp := range confirmGroups {
@@ -1506,6 +1540,9 @@ func (p *Provider) EnrichRepoContext(ctx context.Context, g graph.Store, repoPre
 			sem <- struct{}{}
 			go func(grp *confirmGroup) {
 				defer func() {
+					if dp != nil {
+						dp.fileDone()
+					}
 					<-sem
 					wg.Done()
 				}()
@@ -1647,6 +1684,9 @@ func (p *Provider) EnrichRepoContext(ctx context.Context, g graph.Store, repoPre
 				}
 			}
 			diagRefsStamped.Add(int64(len(refsStamped)))
+			if dp := p.progressFor(); dp != nil {
+				dp.addStamped(len(refsStamped))
+			}
 		}
 		mutations := newLSPMutationBatch()
 		rmu.Lock()
@@ -1702,6 +1742,10 @@ func (p *Provider) EnrichRepoContext(ctx context.Context, g graph.Store, repoPre
 	}
 	fallbackMutations := newLSPMutationBatch()
 	{
+		dp := p.progressFor()
+		if dp != nil {
+			dp.beginPhase(drainPhaseDefinitions, len(defGroups))
+		}
 		sem := make(chan struct{}, p.maxParallel)
 		var wg sync.WaitGroup
 		for i := range defGroups {
@@ -1712,6 +1756,9 @@ func (p *Provider) EnrichRepoContext(ctx context.Context, g graph.Store, repoPre
 			sem <- struct{}{}
 			go func(grp *defSiteGroup) {
 				defer func() {
+					if dp != nil {
+						dp.fileDone()
+					}
 					<-sem
 					wg.Done()
 				}()
@@ -2078,6 +2125,9 @@ func (p *Provider) EnrichRepoContext(ctx context.Context, g graph.Store, repoPre
 			p.linkTypeHierarchy(view, mutations, repoPrefix, absRoot, h.n, h.other, h.asSupertype, result)
 		}
 		mutations.apply(g, stamped)
+		if dp := p.progressFor(); dp != nil {
+			dp.addStamped(len(stamped) + len(cHops) + len(tHops))
+		}
 	}
 
 	// fileSem bounds the number of simultaneously-open documents; hoverSem
@@ -2089,6 +2139,16 @@ func (p *Provider) EnrichRepoContext(ctx context.Context, g graph.Store, repoPre
 	hoverSem := make(chan struct{}, p.maxParallel)
 	var wg sync.WaitGroup
 
+	sweepProgress := p.progressFor()
+	if sweepProgress != nil {
+		sweepTotal := 0
+		for _, ft := range fileList {
+			if sweepFile(sweepMode, ft.demand, ft.dispatch) {
+				sweepTotal++
+			}
+		}
+		sweepProgress.beginPhase(drainPhaseSweep, sweepTotal)
+	}
 	for _, ft := range fileList {
 		if aborted.Load() || ctx.Err() != nil {
 			break
@@ -2100,6 +2160,9 @@ func (p *Provider) EnrichRepoContext(ctx context.Context, g graph.Store, repoPre
 		fileSem <- struct{}{} // acquire — bounds simultaneously-open docs
 		go func(ft *fileTargets) {
 			defer func() {
+				if sweepProgress != nil {
+					sweepProgress.fileDone()
+				}
 				<-fileSem
 				wg.Done()
 			}()
