@@ -2335,7 +2335,7 @@ func (e *CSharpExtractor) emitAccessorMember(def *parser.CapturedNode, name, mem
 			meta["field_type_args"] = args
 		}
 	}
-	if doc := extractCSharpDoc(src, def.StartLine); doc != "" {
+	if doc := extractCSharpDoc(src, def.Node); doc != "" {
 		meta["doc"] = doc
 	}
 	result.Nodes = append(result.Nodes, &graph.Node{
