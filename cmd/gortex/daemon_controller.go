@@ -1096,6 +1096,7 @@ func (c *realController) Status(ctx context.Context) (daemon.StatusResponse, err
 		LocalServerSlug:    c.localServerSlug(),
 		LSPRouter:          c.collectLSPRouterStatus(),
 		Enrichment:         c.collectEnrichmentProgress(),
+		BackgroundLane:     c.collectBackgroundLane(),
 	}
 	if c.toolSurface != nil {
 		resp.ToolPreset, resp.ToolPresetMode, resp.LearnedTools = c.toolSurface()
@@ -1269,6 +1270,48 @@ func (c *realController) collectEnrichmentProgress() *daemon.EnrichmentProgress 
 		return nil
 	}
 	return enrichmentProgressFromStatuses(semMgr.EnrichmentStatuses())
+}
+
+// collectBackgroundLane mirrors the semantic manager's lane status into the
+// status payload. Nil when nothing has ever happened on the lane, so the
+// common no-lane setup renders no row.
+func (c *realController) collectBackgroundLane() *daemon.BackgroundLaneStatus {
+	if c.indexer == nil {
+		return nil
+	}
+	semMgr := c.indexer.SemanticManager()
+	if semMgr == nil {
+		return nil
+	}
+	lane := semMgr.BackgroundLaneStatus()
+	if !lane.Started && lane.Pending == 0 && lane.Drained == 0 && lane.Failed == 0 {
+		return nil
+	}
+	out := &daemon.BackgroundLaneStatus{
+		Started:           lane.Started,
+		Pending:           lane.Pending,
+		InFlightRepo:      lane.InFlightRepo,
+		LastRepo:          lane.LastRepo,
+		LastDurationMs:    lane.LastDurationMs,
+		Drained:           lane.Drained,
+		Failed:            lane.Failed,
+		Retries:           lane.Retries,
+		Abandoned:         lane.Abandoned,
+		LastAbandonedRepo: lane.LastAbandonedRepo,
+		LastFailedRepo:    lane.LastFailedRepo,
+		LastFailure:       lane.LastFailure,
+	}
+	if lp := lane.InFlight; lp != nil {
+		out.InFlight = &daemon.LaneProgress{
+			Repo: lp.Repo, Phase: lp.Phase,
+			FilesDone: lp.FilesDone, FilesTotal: lp.FilesTotal,
+			References: lp.References, IncomingCalls: lp.IncomingCalls, IncomingSkipped: lp.IncomingSkipped,
+			Stamped: lp.Stamped, Errors: lp.Errors,
+			ElapsedSeconds: lp.ElapsedSeconds, PhaseSeconds: lp.PhaseSeconds, FilesPerMinute: lp.FilesPerMinute,
+			EstimateMinutes: lp.EstimateMinutes, EstimateState: lp.EstimateState,
+		}
+	}
+	return out
 }
 
 // enrichmentProgressFromStatuses is the pure reduction behind

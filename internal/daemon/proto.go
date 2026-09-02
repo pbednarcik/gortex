@@ -332,6 +332,12 @@ type StatusResponse struct {
 	// semantic manager is wired or it has never run a pass.
 	Enrichment *EnrichmentProgress `json:"enrichment,omitempty"`
 
+	// BackgroundLane reflects the deferred heavy-tier drain scheduler:
+	// what is in flight (with live progress when the provider reports it),
+	// what is queued, and the last outcome. Nil when no semantic manager is
+	// wired or the lane never started and never drained.
+	BackgroundLane *BackgroundLaneStatus `json:"background_lane,omitempty"`
+
 	// Workspaces aggregates TrackedRepos by workspace slug. Empty
 	// when no repo declares one (every repo defaults to its own
 	// workspace; the table form is more compact in that case).
@@ -451,6 +457,45 @@ type EnrichmentCurrent struct {
 	Provider        string  `json:"provider"`
 	ElapsedSeconds  float64 `json:"elapsed_seconds"`
 	DeadlineSeconds float64 `json:"deadline_seconds,omitempty"`
+}
+
+// BackgroundLaneStatus mirrors semantic.BackgroundLaneStatus for the status
+// payload (this package does not import semantic). Field names and JSON
+// tags match so the health push and the status RPC describe the lane the
+// same way.
+type BackgroundLaneStatus struct {
+	Started           bool          `json:"started"`
+	Pending           int           `json:"pending"`
+	InFlightRepo      string        `json:"in_flight_repo,omitempty"`
+	InFlight          *LaneProgress `json:"in_flight,omitempty"`
+	LastRepo          string        `json:"last_repo,omitempty"`
+	LastDurationMs    int64         `json:"last_duration_ms,omitempty"`
+	Drained           int           `json:"drained"`
+	Failed            int           `json:"failed,omitempty"`
+	Retries           int           `json:"retries,omitempty"`
+	Abandoned         int           `json:"abandoned,omitempty"`
+	LastAbandonedRepo string        `json:"last_abandoned_repo,omitempty"`
+	LastFailedRepo    string        `json:"last_failed_repo,omitempty"`
+	LastFailure       string        `json:"last_failure,omitempty"`
+}
+
+// LaneProgress mirrors semantic.LaneProgress: the live view of one
+// in-flight background drain.
+type LaneProgress struct {
+	Repo            string  `json:"repo"`
+	Phase           string  `json:"phase"`
+	FilesDone       int64   `json:"files_done"`
+	FilesTotal      int64   `json:"files_total"`
+	References      int64   `json:"req_references"`
+	IncomingCalls   int64   `json:"req_incoming_calls"`
+	IncomingSkipped int64   `json:"incoming_skipped"`
+	Stamped         int64   `json:"stamped"`
+	Errors          int64   `json:"errors"`
+	ElapsedSeconds  float64 `json:"elapsed_seconds"`
+	PhaseSeconds    float64 `json:"phase_seconds"`
+	FilesPerMinute  float64 `json:"files_per_minute"`
+	EstimateMinutes float64 `json:"estimate_minutes,omitempty"`
+	EstimateState   string  `json:"estimate_state"`
 }
 
 // RuntimeStats captures Go runtime.MemStats fields users care about
