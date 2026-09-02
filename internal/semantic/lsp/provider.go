@@ -1179,7 +1179,12 @@ func (p *Provider) EnrichRepoContext(ctx context.Context, g graph.Store, repoPre
 
 	// A heavy-delta drain is the multi-minute pass nobody can see into;
 	// publish its progress for the heartbeat and the scheduler snapshot.
-	// Fast passes are short and already report per-repo status.
+	// Fast passes are short and already report per-repo status. The
+	// heartbeat is stopped explicitly before the completion line below so
+	// that line stays the pass's last word; the deferred stop covers early
+	// returns, and it is registered AFTER the record-clearing defer so it
+	// runs first (LIFO) — a tick never reads a cleared record.
+	stopHeartbeat := func() {}
 	if p.heavyDelta {
 		repoName := repoPrefix
 		p.progressRepo.Store(&repoName)
@@ -1189,6 +1194,8 @@ func (p *Provider) EnrichRepoContext(ctx context.Context, g graph.Store, repoPre
 			p.progressRepo.Store(nil)
 			p.drainErrsLive.Store(nil)
 		}()
+		stopHeartbeat = p.startDrainHeartbeat(ctx)
+		defer stopHeartbeat()
 	}
 
 	// One document session shared by every phase below: a file didOpen'd
@@ -2473,6 +2480,7 @@ func (p *Provider) EnrichRepoContext(ctx context.Context, g graph.Store, repoPre
 	// shared document session's open/reopen/eviction accounting, and the
 	// per-method request volume that drove the pass.
 	didOpens, reopenedFiles, docEvictions, peakOpenDocs := session.stats()
+	stopHeartbeat()
 	p.logger.Info("LSP enrich: hover phase complete",
 		zap.String("sweep_mode", sweepMode),
 		zap.Int64("total_nodes", diagTotalNodes.Load()),

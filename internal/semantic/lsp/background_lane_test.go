@@ -13,6 +13,8 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"go.uber.org/zap"
+	"go.uber.org/zap/zapcore"
+	"go.uber.org/zap/zaptest/observer"
 
 	"github.com/zzet/gortex/internal/graph"
 	"github.com/zzet/gortex/internal/semantic"
@@ -85,6 +87,93 @@ func TestLSPProvider_LaneProgress_LiveDuringDrain(t *testing.T) {
 	<-done
 	_, after := p.LaneProgress()
 	assert.False(t, after, "the drain returned; nothing in flight")
+}
+
+// A heavy-delta drain logs a throttled progress line while it runs and
+// stops when the pass ends; the completion line stays the last word.
+func TestLSPProvider_DrainHeartbeat_LogsWhileDraining(t *testing.T) {
+	t.Setenv(SweepEnv, "")
+	t.Setenv(HeavyRequestsEnv, "")
+	prev := drainHeartbeatInterval
+	drainHeartbeatInterval = time.Millisecond
+	t.Cleanup(func() { drainHeartbeatInterval = prev })
+
+	repoRoot, g, _ := heavyDeltaFixture(t)
+
+	serverA := newFakeLSPServer()
+	newHeavyDeltaRig(serverA.handle, repoRoot)
+	p, cleanupA := providerWithFakeServer(t, serverA, []string{"go"})
+	defer cleanupA()
+
+	serverB := newFakeLSPServer()
+	rigB := newHeavyDeltaRig(serverB.handle, repoRoot)
+	serverB.handle("textDocument/references", func(json.RawMessage) (any, *jsonRPCError) {
+		rigB.references.Add(1)
+		time.Sleep(40 * time.Millisecond) // long enough for several 1 ms ticks
+		return rigB.refsResult, nil
+	})
+	lane, cleanupB := providerWithFakeServer(t, serverB, []string{"go"})
+	defer cleanupB()
+	lane.heavyDelta = true
+	core, logs := observer.New(zapcore.InfoLevel)
+	lane.logger = zap.New(core)
+	p.laneProviderFactory = func() (*Provider, error) { return lane, nil }
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	_, err := p.EnrichBackground(ctx, g, "", repoRoot)
+	require.NoError(t, err)
+
+	beats := logs.FilterMessage("LSP background drain progress").All()
+	require.NotEmpty(t, beats, "at least one heartbeat during a 40 ms confirm")
+	first := beats[0].ContextMap()
+	assert.Equal(t, "confirm", first["phase"])
+	assert.Equal(t, int64(1), first["files_total"])
+	assert.Equal(t, estimateWarming, first["estimate"])
+
+	// Ordering: the last heartbeat precedes the completion line.
+	all := logs.All()
+	lastBeat, completion := -1, -1
+	for i, e := range all {
+		switch e.Message {
+		case "LSP background drain progress":
+			lastBeat = i
+		case "LSP enrich: hover phase complete":
+			completion = i
+		}
+	}
+	require.NotEqual(t, -1, completion)
+	assert.Less(t, lastBeat, completion, "no heartbeat after the completion line")
+	// Give a stray ticker a chance to prove it is still alive; it must not be.
+	n := logs.Len()
+	time.Sleep(10 * time.Millisecond)
+	assert.Equal(t, n, logs.Len(), "the heartbeat stopped with the pass")
+}
+
+// A fast pass logs no heartbeat, however slow its server is.
+func TestLSPProvider_FastPass_NoHeartbeat(t *testing.T) {
+	t.Setenv(SweepEnv, "")
+	t.Setenv(HeavyRequestsEnv, "")
+	prev := drainHeartbeatInterval
+	drainHeartbeatInterval = time.Millisecond
+	t.Cleanup(func() { drainHeartbeatInterval = prev })
+
+	repoRoot, g, _ := heavyDeltaFixture(t)
+	server := newFakeLSPServer()
+	rig := newHeavyDeltaRig(server.handle, repoRoot)
+	server.handle("textDocument/hover", func(json.RawMessage) (any, *jsonRPCError) {
+		rig.hover.Add(1)
+		time.Sleep(10 * time.Millisecond)
+		return nil, nil
+	})
+	p, cleanup := providerWithFakeServer(t, server, []string{"go"})
+	defer cleanup()
+	core, logs := observer.New(zapcore.InfoLevel)
+	p.logger = zap.New(core)
+
+	_, err := p.EnrichRepoContext(context.Background(), g, "", repoRoot, nil)
+	require.NoError(t, err)
+	assert.Empty(t, logs.FilterMessage("LSP background drain progress").All())
 }
 
 // markerStore wraps an in-memory graph with a durable-marker table so the
