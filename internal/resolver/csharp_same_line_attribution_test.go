@@ -14,19 +14,21 @@ import (
 // its call BYTE-precisely, not hand it to whoever shares the line (the
 // pre-owner-widening behavior this test silently tolerated).
 //
-// A member kind still WITHOUT extents (indexer, event accessor) is the
-// hard case: its call matches no recorded extent, and the line fallback
-// answers a same-line neighbour that provably does NOT contain the call
-// - the neighbour's recorded bytes exclude the offset. Handing it the
-// call invents a false edge carrying full receiver evidence and no
-// ambiguity stamp (ambiguousAt counts ranges, and an extent-less member
-// contributes none), indistinguishable downstream from a correct edge.
-// Such calls are REFUSED instead. This deliberately trades the
-// extent-less member's recall for precision; the recall returns when
-// indexers and event accessors are emitted with extents of their own
-// (tracked follow-up). Distinct from the round-6 B3 erasure: there the
-// "" answer dropped calls whose line owner was plausible - here the
-// line owner is provably wrong.
+// A member kind WITHOUT extents is the hard case: its call matches no
+// recorded extent, and the line fallback answers a same-line neighbour
+// that provably does NOT contain the call - the neighbour's recorded
+// bytes exclude the offset. Handing it the call invents a false edge
+// carrying full receiver evidence and no ambiguity stamp (ambiguousAt
+// counts ranges, and an extent-less member contributes none),
+// indistinguishable downstream from a correct edge. Such calls are
+// REFUSED instead, trading that member's recall for precision. Distinct
+// from the round-6 B3 erasure: there the "" answer dropped calls whose
+// line owner was plausible - here the line owner is provably wrong.
+//
+// Indexers and event accessors were the original refused kinds; they now
+// carry extents of their own, so the trade is off for them and they own
+// their calls outright. Operators, conversion operators and destructors
+// are still unemitted, and hold the refusal arm under test.
 func TestResolveCSharp_SameLineMemberCallAttribution(t *testing.T) {
 	cases := map[string]struct {
 		src     string
@@ -39,10 +41,28 @@ func TestResolveCSharp_SameLineMemberCallAttribution(t *testing.T) {
  public class BLProp { private BLBag _b = new BLBag();
   public int Q => _b.Take(); public void M() { }
  } }`, owner: "X.cs::BLProp.Q"},
-		"indexer_beside_method_refused": {src: `namespace App {
+		"indexer_beside_method_owns_its_call": {src: `namespace App {
  public class BLBag { public int Take() { return 1; } }
  public class BLIdx { private BLBag _b = new BLBag();
   public int this[int i] => _b.Take(); public void M() { }
+ } }`, owner: "X.cs::BLIdx.this[]"},
+		// Operators and destructors record no extents, so the refusal arm
+		// still governs them: the line answer is a member whose own bytes
+		// exclude the call, and a false edge there is worse than the drop.
+		"operator_beside_property_refused": {src: `namespace App {
+ public class OBag { public int Take() { return 1; } }
+ public class OpRig { private static OBag _b = new OBag();
+  public static OpRig operator +(OpRig a, OpRig b) { _b.Take(); return a; } public int Q => 1;
+ } }`, refused: true},
+		"destructor_beside_property_refused": {src: `namespace App {
+ public class DBag { public int Take() { return 1; } }
+ public class DtorRig { private DBag _b = new DBag();
+  ~DtorRig() { _b.Take(); } public int Q => 1;
+ } }`, refused: true},
+		"conversion_operator_beside_property_refused": {src: `namespace App {
+ public class CBag { public int Take() { return 1; } }
+ public class ConvRig { private static CBag _b = new CBag();
+  public static implicit operator int(ConvRig r) { _b.Take(); return 1; } public int Q => 1;
  } }`, refused: true},
 		"field_init_shares_line": {src: `namespace App {
  public class BLBag { public int Take() { return 1; } }
@@ -54,24 +74,26 @@ func TestResolveCSharp_SameLineMemberCallAttribution(t *testing.T) {
  public class BLCtor { private BLBag _b = new BLBag();
   public BLCtor() { } public int Q => _b.Take();
  } }`, owner: "X.cs::BLCtor.Q"},
-		// The two shapes below are NEW false-edge populations opened by
-		// the owner widening itself: the base emitted nothing for them,
-		// while widened properties made a wrong owner available.
-		"indexer_beside_property_refused": {src: `namespace App {
+		// The two shapes below were the false-edge populations opened by
+		// the owner widening itself - the base emitted nothing for them,
+		// while widened properties made a wrong owner available. Issue
+		// #728 is exactly this pair reaching the semantic tier, where
+		// caller adoption turned the stub into a confident resolved edge.
+		"indexer_beside_property_owns_its_call": {src: `namespace App {
  public class QBag { public int Idx() { return 1; } public int Pro() { return 2; } }
  public class Q01 { private QBag _b = new QBag();
   public int this[int i] => _b.Idx(); public int Q => _b.Pro();
- } }`, call: "Idx", refused: true},
+ } }`, call: "Idx", owner: "X.cs::Q01.this[]"},
 		"indexer_beside_property_neighbour_keeps_own": {src: `namespace App {
  public class QBag { public int Idx() { return 1; } public int Pro() { return 2; } }
  public class Q01 { private QBag _b = new QBag();
   public int this[int i] => _b.Idx(); public int Q => _b.Pro();
  } }`, call: "Pro", owner: "X.cs::Q01.Q"},
-		"event_accessor_beside_property_refused": {src: `namespace App {
+		"event_accessor_beside_property_owns_its_call": {src: `namespace App {
  public class QBag { public int Ev() { return 1; } public int Pro() { return 2; } }
  public class Q03 { private QBag _b = new QBag();
   public event System.EventHandler E { add { _b.Ev(); } remove { } } public int Q => _b.Pro();
- } }`, call: "Ev", refused: true},
+ } }`, call: "Ev", owner: "X.cs::Q03.E"},
 		"event_accessor_beside_property_neighbour_keeps_own": {src: `namespace App {
  public class QBag { public int Ev() { return 1; } public int Pro() { return 2; } }
  public class Q03 { private QBag _b = new QBag();

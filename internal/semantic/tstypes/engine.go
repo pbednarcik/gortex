@@ -1190,6 +1190,25 @@ func (a *applier) applyCall(idx *fileIndex, cf callFact, res *semantic.EnrichRes
 	// call it did not author (it has no stub to claim, so it would mint),
 	// and when no tied owner contains the line the site is refused
 	// outright.
+	//
+	// Adoption couples this tier's precision to extraction's attribution
+	// accuracy, and that trade is only sound where extraction is
+	// byte-precise for the owner kind in question. An attribution defect
+	// that used to surface as a harmless unresolved stub surfaces here as
+	// a confident resolved edge instead: issue #728 caught an indexer's
+	// body call parked on a same-line property, promoted to
+	// ast_resolved/0.95 on a member whose whole body was `=> 1`.
+	//
+	// Two different things hold that end up, and they cover different
+	// kinds. The accessor-bearing members (property, indexer, event with
+	// add/remove) record byte extents, so they own their calls outright.
+	// The kinds that still record NONE - operator, conversion operator,
+	// destructor - are held only by the extractor REFUSING a call whose
+	// line owner's recorded bytes provably exclude the offset. That
+	// refusal is what turns their attribution defect into a dropped edge
+	// rather than a confident wrong one. So: giving one of those kinds a
+	// node without giving it extents in the same change re-opens #728,
+	// because adoption would start trusting a line fallback again.
 	var caller *graph.Node
 	owners := idx.stubOwnersAt(cf.line, cf.method)
 	switch len(owners) {
