@@ -679,6 +679,7 @@ func (a *applier) buildIndex(facts *fileFacts) *fileIndex {
 			// branch loads file nodes a kind-filtered store would not).
 			continue
 		}
+		stampLo, stampHi, stamped := recordedOwnershipSpan(n)
 		for _, e := range a.outEdges(n.ID) {
 			if e == nil || e.Kind != graph.EdgeCalls || e.Line == 0 {
 				continue
@@ -686,14 +687,17 @@ func (a *applier) buildIndex(facts *fileFacts) *fileIndex {
 			if e.FilePath != "" && e.FilePath != facts.file {
 				continue
 			}
-			if lo, hi := ownerLineSpan(n); e.Line < lo || e.Line > hi {
+			inNode := e.Line >= n.StartLine && e.Line <= n.EndLine
+			inStamp := stamped && e.Line >= stampLo && e.Line <= stampHi
+			if !inNode && !inStamp {
 				// Framework-dispatch synthesis (Rails callbacks, Laravel
 				// middleware) parks an owner's edge on a line outside the
 				// owner's own span — not site evidence at that line. The
-				// span tested is the one the extractor attributed by, which
-				// is the node's unless it stamped a different one (see
-				// ownerLineSpan): a stub the extractor parked outside the
-				// node but inside its recorded span IS the authored site.
+				// owner's span is its node's lines plus, when the extractor
+				// recorded one elsewhere, the ownership span it stamped on
+				// the node (recordedOwnershipSpan): a stub parked there IS
+				// the authored site. Two intervals, never their hull — the
+				// lines between two fragments belong to other members.
 				continue
 			}
 			idx.stubsByLine[e.Line] = append(idx.stubsByLine[e.Line], stubRef{owner: n, to: e.To})
@@ -702,24 +706,26 @@ func (a *applier) buildIndex(facts *fileFacts) *fileIndex {
 	return idx
 }
 
-// ownerLineSpan is the line span an owner's snapshotted calls are tested
-// against: the ownership span the extractor recorded on the node
-// (`ownership_start_line` / `ownership_end_line`, stamped only when it
-// escapes the node's own lines) or, absent that, the node's lines. A C#
-// 13 partial property extracted declaring fragment first, or a property
-// declared in both arms of an #if / #else, keeps the first fragment's
-// lines on its node while its calls are owned by the body-bearing
-// fragment's span - the node's lines would refuse every stub the
-// extractor deliberately parked there (issue #731). The values are read
-// leniently because a persisted meta value comes back from the store as
-// a float64 or a string, not the int the extractor wrote.
-func ownerLineSpan(n *graph.Node) (int, int) {
-	if lo, ok := metaLine(n.Meta["ownership_start_line"]); ok {
-		if hi, ok := metaLine(n.Meta["ownership_end_line"]); ok && lo > 0 && hi >= lo {
-			return lo, hi
-		}
+// recordedOwnershipSpan reads the ownership span the extractor stamped on
+// a node (graph.MetaOwnershipStartLine / MetaOwnershipEndLine) when the
+// span it attributed the member's calls by is not contained by the node's
+// own lines: a C# 13 partial property extracted declaring fragment first,
+// or a property declared in both arms of an #if / #else, keeps the first
+// fragment's lines on its node while its calls are owned by the
+// body-bearing fragment's span - the node's lines alone would refuse
+// every stub the extractor deliberately parked there (issue #731). ok is
+// false when nothing is stamped or the pair is not a sane 1-based span,
+// and the caller then tests the node's lines only. The store's flat meta
+// codec hands an int back as an int and its JSON fallback normalizes an
+// integral number to int too, so the wider metaLine cases are a cheap
+// guard against another writer or a future codec, not an observed shape.
+func recordedOwnershipSpan(n *graph.Node) (lo, hi int, ok bool) {
+	lo, okLo := metaLine(n.Meta[graph.MetaOwnershipStartLine])
+	hi, okHi := metaLine(n.Meta[graph.MetaOwnershipEndLine])
+	if !okLo || !okHi || lo <= 0 || hi < lo {
+		return 0, 0, false
 	}
-	return n.StartLine, n.EndLine
+	return lo, hi, true
 }
 
 func metaLine(v any) (int, bool) {
