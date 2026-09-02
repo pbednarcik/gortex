@@ -4,6 +4,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 
 	"github.com/zzet/gortex/internal/graph"
@@ -685,16 +686,60 @@ func (a *applier) buildIndex(facts *fileFacts) *fileIndex {
 			if e.FilePath != "" && e.FilePath != facts.file {
 				continue
 			}
-			if e.Line < n.StartLine || e.Line > n.EndLine {
+			if lo, hi := ownerLineSpan(n); e.Line < lo || e.Line > hi {
 				// Framework-dispatch synthesis (Rails callbacks, Laravel
 				// middleware) parks an owner's edge on a line outside the
-				// owner's own span — not site evidence at that line.
+				// owner's own span — not site evidence at that line. The
+				// span tested is the one the extractor attributed by, which
+				// is the node's unless it stamped a different one (see
+				// ownerLineSpan): a stub the extractor parked outside the
+				// node but inside its recorded span IS the authored site.
 				continue
 			}
 			idx.stubsByLine[e.Line] = append(idx.stubsByLine[e.Line], stubRef{owner: n, to: e.To})
 		}
 	}
 	return idx
+}
+
+// ownerLineSpan is the line span an owner's snapshotted calls are tested
+// against: the ownership span the extractor recorded on the node
+// (`ownership_start_line` / `ownership_end_line`, stamped only when it
+// escapes the node's own lines) or, absent that, the node's lines. A C#
+// 13 partial property extracted declaring fragment first, or a property
+// declared in both arms of an #if / #else, keeps the first fragment's
+// lines on its node while its calls are owned by the body-bearing
+// fragment's span - the node's lines would refuse every stub the
+// extractor deliberately parked there (issue #731). The values are read
+// leniently because a persisted meta value comes back from the store as
+// a float64 or a string, not the int the extractor wrote.
+func ownerLineSpan(n *graph.Node) (int, int) {
+	if lo, ok := metaLine(n.Meta["ownership_start_line"]); ok {
+		if hi, ok := metaLine(n.Meta["ownership_end_line"]); ok && lo > 0 && hi >= lo {
+			return lo, hi
+		}
+	}
+	return n.StartLine, n.EndLine
+}
+
+func metaLine(v any) (int, bool) {
+	switch x := v.(type) {
+	case int:
+		return x, true
+	case int64:
+		return int(x), true
+	case float64:
+		return int(x), true
+	case interface{ Int64() (int64, error) }:
+		if i, err := x.Int64(); err == nil {
+			return int(i), true
+		}
+	case string:
+		if i, err := strconv.Atoi(x); err == nil {
+			return i, true
+		}
+	}
+	return 0, false
 }
 
 // applyAll joins every analyzed file's facts against the graph in
