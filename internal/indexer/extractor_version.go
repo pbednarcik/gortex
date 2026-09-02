@@ -40,7 +40,7 @@ var extractorVersions = map[string]int{
 	//   "go": 2,
 	"c":      generatedParserProjectionPolicyVersion, // generated parser projection covers all strictly detected table sizes
 	"php":    2,                                      // class/interface inheritance now emits typed structural edges
-	"csharp": 19,                                     // verbatim-identifier canonicalization unified across type refs, the base-list prescan, and partial identity (was: accessor bodies, property/field initializers, and the typed value parameter own their calls)
+	"csharp": 21,                                     // combo lane-7: verbatim canon (19) + repeated partial bases / chained-awaited receivers (#735) + switch-section pattern scoping (#734) + indexer/event member emission (#738); single bump so the lane store re-extracts once (was: verbatim-identifier canonicalization unified across type refs, the base-list prescan, and partial identity)
 	"scala":  2,                                      // explicitly instantiated generic calls emit call edges
 	"go":     3,                                      // generic instantiations are marked so indexing a func value cannot bind (was: generic calls emit call edges)
 	"cpp":    2,                                      // templated and namespace-qualified calls emit call edges
