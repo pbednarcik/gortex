@@ -178,6 +178,30 @@ type BackgroundLaneStatus struct {
 	LastFailure       string `json:"last_failure,omitempty"`
 }
 
+// LaneProgress is a point-in-time view of ONE in-flight background drain,
+// reported by providers that implement BackgroundProgressReporter. Files
+// are the unit the drain loops actually iterate (one confirm group or one
+// sweep file each), so done/total is a real fraction of the current phase;
+// the estimate is a linear extrapolation of that phase only and says so.
+// A drain has several phases of different per-file cost, so a phase at
+// 90% is not a drain at 90%; the phase name is the signal.
+type LaneProgress struct {
+	Repo            string  `json:"repo"`
+	Phase           string  `json:"phase"`
+	FilesDone       int64   `json:"files_done"`
+	FilesTotal      int64   `json:"files_total"`
+	References      int64   `json:"req_references"`
+	IncomingCalls   int64   `json:"req_incoming_calls"`
+	IncomingSkipped int64   `json:"incoming_skipped"`
+	Stamped         int64   `json:"stamped"`
+	Errors          int64   `json:"errors"`
+	ElapsedSeconds  float64 `json:"elapsed_seconds"`
+	PhaseSeconds    float64 `json:"phase_seconds"`
+	FilesPerMinute  float64 `json:"files_per_minute"`
+	EstimateMinutes float64 `json:"estimate_minutes,omitempty"`
+	EstimateState   string  `json:"estimate_state"`
+}
+
 func (s *backgroundScheduler) status() BackgroundLaneStatus {
 	s.mu.Lock()
 	defer s.mu.Unlock()
