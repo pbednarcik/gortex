@@ -111,6 +111,48 @@ func (s *lspFrontierCountingStore) observeFiles(files []string) {
 	}
 }
 
+// The semantic_heavy stamp lives in the opaque Meta blob, so the light
+// location projection cannot see it — only the full-node re-fetch can. A
+// heavyDelta frontier must therefore recheck the stamp on the full nodes,
+// or every drain re-issues the deferred tier for the whole repo.
+func TestReadLSPRepoProjectionHeavyDeltaSkipsHeavyStampedNodes(t *testing.T) {
+	store, err := store_sqlite.Open(filepath.Join(t.TempDir(), "lsp-frontier-heavy.sqlite"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = store.Close() })
+
+	// Both nodes carry the fast tier's semantic_type stamp — the heavy
+	// frontier is exactly the fast-stamped population — and one already
+	// completed its heavy drain.
+	store.AddBatch([]*graph.Node{
+		{
+			ID: "drained", RepoPrefix: "repo", Language: "go", Kind: graph.KindFunction,
+			Name: "Drained", FilePath: "repo/a.go", StartLine: 1, EndLine: 5,
+			Meta: map[string]any{"semantic_type": "func()", "semantic_heavy": "1"},
+		},
+		{
+			ID: "pending", RepoPrefix: "repo", Language: "go", Kind: graph.KindFunction,
+			Name: "Pending", FilePath: "repo/a.go", StartLine: 7, EndLine: 11,
+			Meta: map[string]any{"semantic_type": "func()"},
+		},
+	}, nil)
+
+	provider := &Provider{languages: []string{"go"}, heavyDelta: true}
+	projection, ok := provider.readLSPRepoProjection(store, "repo")
+	if !ok {
+		t.Fatal("SQLite projection capability was not selected")
+	}
+
+	ids := make([]string, 0, len(projection.langNodes))
+	for _, node := range projection.langNodes {
+		ids = append(ids, node.ID)
+	}
+	if fmt.Sprint(ids) != "[pending]" {
+		t.Fatalf("heavyDelta frontier candidates=%v, want only [pending]: the drained node's semantic_heavy stamp must survive the light projection", ids)
+	}
+}
+
 func TestReadLSPRepoProjectionBoundsFrontiersAndMatchesLegacyDecisions(t *testing.T) {
 	store, err := store_sqlite.Open(filepath.Join(t.TempDir(), "lsp-frontier.sqlite"))
 	if err != nil {
@@ -178,8 +220,12 @@ func TestReadLSPRepoProjectionBoundsFrontiersAndMatchesLegacyDecisions(t *testin
 			counting.fileCountCalls, counting.nodePageCalls, counting.confirmPageCalls, counting.kindPageCalls,
 			wantPages, wantPages, wantPages)
 	}
-	if counting.nodeBatchCalls != wantPages {
-		t.Fatalf("full-node batch calls=%d, want one candidate batch per frontier (%d)", counting.nodeBatchCalls, wantPages)
+	// One candidate batch per frontier page, plus ONE endpoint batch: the
+	// confirm pass reads blob-only state (heavy stamp, references verdict)
+	// on its targets, so every confirmable endpoint is resolved in full in
+	// a single extra batch — a light endpoint would hide a banked verdict.
+	if counting.nodeBatchCalls != wantPages+1 {
+		t.Fatalf("full-node batch calls=%d, want one candidate batch per frontier plus one endpoint batch (%d)", counting.nodeBatchCalls, wantPages+1)
 	}
 	if counting.fanInCalls != 1 || counting.inboundKindCalls != 1 {
 		t.Fatalf("compact inbound queries fan-in=%d dispatch=%d, want one each", counting.fanInCalls, counting.inboundKindCalls)

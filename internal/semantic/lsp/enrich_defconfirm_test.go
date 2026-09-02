@@ -21,6 +21,7 @@ import (
 // Edge confirmation goes through textDocument/definition at the call site
 // instead — same verdicts, position-request cost.
 func TestCSharpSpecOptsOutOfHeavyRequests(t *testing.T) {
+	t.Setenv(HeavyRequestsEnv, "")
 	spec := SpecByName("omnisharp")
 	require.NotNil(t, spec)
 	assert.True(t, spec.NoHeavyRequests, "csharp spec must skip references/incomingCalls")
@@ -99,6 +100,7 @@ func TestLSP_Enrich_NoHeavy_DefinitionConfirmsWithoutReferences(t *testing.T) {
 // Without the opt-out nothing changes: the references confirm sweep still runs
 // first — this pins that gopls-shaped providers are untouched.
 func TestLSP_Enrich_HeavyDefault_StillIssuesReferences(t *testing.T) {
+	t.Setenv(HeavyRequestsEnv, "")
 	t.Setenv(SweepEnv, "full")
 	repoRoot := t.TempDir()
 	g := graph.New()
@@ -285,6 +287,7 @@ func TestLSP_Enrich_DefConfirm_DispatchedCallAddsDeclaredMemberEdge(t *testing.T
 // this path REBOUND the impl edge to the declared member, so a gopls/tsserver/
 // pyright repo now keeps the devirtualization guess AND gains the declared edge.
 func TestLSP_Enrich_HeavyDefault_DispatchedCallAddsDeclaredMemberEdge(t *testing.T) {
+	t.Setenv(HeavyRequestsEnv, "")
 	t.Setenv(SweepEnv, "full")
 	repoRoot := t.TempDir()
 	g := graph.New()
@@ -356,6 +359,36 @@ func TestResolveNoHeavyRequests_Precedence(t *testing.T) {
 		t.Setenv(HeavyRequestsEnv, "off")
 		def := NewProvider("fake-lsp", nil, []string{"go"}, false, 2, nil)
 		assert.True(t, def.noHeavyRequests)
+	})
+}
+
+// GORTEX_LSP_HEAVY=background keeps the fast pass exactly as fast as "off" —
+// the heavy legs are skipped inline — while flagging that a background drain
+// should pick them up after the pass completes.
+func TestResolveHeavyBackgroundMode(t *testing.T) {
+	csharp := SpecByName("omnisharp")
+	require.NotNil(t, csharp)
+
+	t.Run("background skips heavy inline for every spec", func(t *testing.T) {
+		t.Setenv(HeavyRequestsEnv, "background")
+		assert.True(t, resolveNoHeavyRequests(csharp))
+		assert.True(t, resolveNoHeavyRequests(nil))
+	})
+	t.Run("background enables the lane", func(t *testing.T) {
+		t.Setenv(HeavyRequestsEnv, "background")
+		assert.True(t, resolveBackgroundHeavy(csharp))
+		assert.True(t, resolveBackgroundHeavy(nil))
+	})
+	t.Run("other values do not enable the lane", func(t *testing.T) {
+		for _, v := range []string{"", "on", "off", "1", "0", "bogus"} {
+			t.Setenv(HeavyRequestsEnv, v)
+			assert.False(t, resolveBackgroundHeavy(csharp), "value %q", v)
+		}
+	})
+	t.Run("case and whitespace tolerant", func(t *testing.T) {
+		t.Setenv(HeavyRequestsEnv, " Background ")
+		assert.True(t, resolveBackgroundHeavy(nil))
+		assert.True(t, resolveNoHeavyRequests(nil))
 	})
 }
 

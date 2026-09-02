@@ -982,6 +982,22 @@ func warmupDaemonState(state *daemonState, logger *zap.Logger, markReady func())
 		"elapsed_ms": time.Since(phaseStart).Milliseconds(),
 	})
 
+	// Warmup is fully done — open the background enrichment lane. Deferred
+	// deep-tier work (the heavy LSP legs a defconfirm fast pass skips under
+	// GORTEX_LSP_HEAVY=background) drains from here on, one repo at a time,
+	// never against warmup or the fast passes. StartBackgroundLane also runs
+	// the restart census, re-enqueueing repos whose fast tier is current but
+	// whose deep tier never finished.
+	if semMgr := state.multiIndexer.SemanticManager(); semMgr != nil {
+		laneRoots := make(map[string]string)
+		for prefix, meta := range state.multiIndexer.AllMetadata() {
+			if meta != nil && meta.RootPath != "" {
+				laneRoots[prefix] = meta.RootPath
+			}
+		}
+		semMgr.StartBackgroundLane(context.Background(), state.multiIndexer.Graph(), laneRoots)
+	}
+
 	watchCfgs := make(map[string]config.WatchConfig)
 	for prefix := range state.multiIndexer.AllMetadata() {
 		watchCfgs[prefix] = state.configManager.GetRepoConfig(prefix).Watch

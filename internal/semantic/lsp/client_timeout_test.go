@@ -39,6 +39,58 @@ func TestLSP_Client_CallTimesOut(t *testing.T) {
 	}
 }
 
+// TestLSP_Client_CallTimeoutSendsCancel verifies the timeout arm tells the
+// server to stop: when a Call burns its whole budget, the client sends a
+// $/cancelRequest notification carrying the abandoned request's id. Without
+// it the server keeps computing an answer nobody will read — timed-out
+// references/callHierarchy calls saturate server slots for minutes.
+func TestLSP_Client_CallTimeoutSendsCancel(t *testing.T) {
+	c, serverIn, _, cleanup := newPipedClient(t)
+	defer cleanup()
+
+	c.SetCallTimeout(50 * time.Millisecond)
+
+	// Fake server: consume the request without ever answering it, then
+	// capture the next client→server message — expected to be the cancel.
+	type cancelFrame struct {
+		Method string `json:"method"`
+		Params struct {
+			ID int64 `json:"id"`
+		} `json:"params"`
+	}
+	requestID := make(chan int64, 1)
+	next := make(chan cancelFrame, 1)
+	go func() {
+		body, ok := readFramed(serverIn)
+		if !ok {
+			return
+		}
+		var req jsonRPCRequest
+		_ = json.Unmarshal(body, &req)
+		requestID <- req.ID
+		body, ok = readFramed(serverIn)
+		if !ok {
+			return
+		}
+		var f cancelFrame
+		_ = json.Unmarshal(body, &f)
+		next <- f
+	}()
+
+	err := c.Call("test/never", nil, nil)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "timeout")
+
+	id := <-requestID
+	select {
+	case f := <-next:
+		assert.Equal(t, "$/cancelRequest", f.Method)
+		assert.Equal(t, id, f.Params.ID)
+	case <-time.After(2 * time.Second):
+		t.Fatal("no $/cancelRequest reached the server after the call timed out")
+	}
+}
+
 // TestLSP_Client_CallHonorsTimeoutHappyPath verifies the timer case does not
 // disturb the normal round-trip: a server that replies well within the bound
 // still resolves successfully.

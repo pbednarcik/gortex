@@ -3,6 +3,7 @@ package lsp
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io/fs"
 	"os"
@@ -59,6 +60,19 @@ type Provider struct {
 	// leaks per request (csharp-ls); ambiguous edges are confirmed through
 	// the definition pass at their call sites instead.
 	noHeavyRequests bool
+	// heavyDelta inverts the pass: run ONLY the request classes a
+	// defconfirm fast pass skipped — references confirms over the edges
+	// still unconfirmed, and the demand-gated incomingCalls sweep — and
+	// nothing the fast tier already paid for (hover, definitions,
+	// implementations, outgoing calls, type hierarchy). The background
+	// lane sets it on the dedicated drain instance; drained sweep nodes
+	// are stamped semantic_heavy so a later drain resumes, not restarts.
+	heavyDelta bool
+	// laneProviderFactory overrides how EnrichBackground builds its
+	// dedicated drain instance. Tests inject a factory wired to an
+	// instrumented server; production leaves it nil and spawns from the
+	// spec (see newLaneProvider).
+	laneProviderFactory func() (*Provider, error)
 	// spec is the ServerSpec this provider was built from (when the
 	// caller used NewProviderFromSpec). nil for legacy NewProvider
 	// invocations — those fall back to single-language routing.
@@ -73,6 +87,31 @@ type Provider struct {
 	altInitOptionsFunc func(repoRoot string) json.RawMessage
 
 	client *Client
+
+	// clientMu guards the client lifecycle handoff: between dialOrSpawn
+	// and the p.client publication the live server process is otherwise
+	// held only on the initializing goroutine's stack, where an external
+	// Close (the lane's readiness-budget teardown above all) cannot reach
+	// it. pendingClient is that in-flight handle; closeGen counts Close
+	// calls so a publication can detect a teardown that ran between its
+	// spawn and its publish and reap instead of publishing. See
+	// registerPendingClient / publishClient / Close.
+	clientMu      sync.Mutex
+	pendingClient *Client
+	closeGen      uint64
+	// clientsSealed permanently refuses new client registrations and
+	// publications (sealClients). Single-use lane instances seal on every
+	// teardown path: an abandoned readiness prober can still be wedged
+	// BEFORE its spawn (package restore, process start), and without the
+	// seal the client it eventually builds would register against a
+	// provider nobody will ever Close again. Foreground providers never
+	// seal — their Close stays reversible for the reconnect path.
+	clientsSealed bool
+
+	// callTimeoutFn, when set, resolves this instance's post-initialize
+	// Call bound instead of the global lspCallTimeout — the lane drain
+	// runs under a larger budget (see resolveLaneCallTimeout).
+	callTimeoutFn func() time.Duration
 
 	// sourceCache holds file contents read by openDocument so the
 	// per-symbol column-resolution lookups don't reread the file for
@@ -332,11 +371,109 @@ func (p *Provider) Available() bool {
 	return err == nil
 }
 
+// Close shuts down the published client AND any client still in the
+// spawn-to-publish window. Bumping closeGen makes a racing publication
+// observe this teardown (publishClient refuses and reaps), so no spawned
+// server can survive a Close unowned. The published pointer is left in
+// place — ensureClient's liveness probe sees its closed done channel and
+// reconnects through the normal reset path.
 func (p *Provider) Close() error {
-	if p.client != nil {
-		return p.client.Shutdown()
+	p.clientMu.Lock()
+	p.closeGen++
+	c := p.client
+	pending := p.pendingClient
+	p.pendingClient = nil
+	p.clientMu.Unlock()
+
+	var err error
+	if c != nil {
+		err = c.Shutdown()
 	}
-	return nil
+	if pending != nil && pending != c {
+		_ = pending.Shutdown()
+	}
+	return err
+}
+
+// registerPendingClient records a freshly spawned client as owned-but-
+// unpublished, returning the close generation the eventual publication
+// must present. From this call on, Close reaps the client even though
+// p.client does not reference it yet. A sealed provider refuses the
+// registration and reaps the client immediately — its owner has already
+// torn the instance down for good.
+func (p *Provider) registerPendingClient(c *Client) (uint64, bool) {
+	p.clientMu.Lock()
+	if p.clientsSealed {
+		p.clientMu.Unlock()
+		_ = c.Shutdown()
+		return 0, false
+	}
+	p.pendingClient = c
+	gen := p.closeGen
+	p.clientMu.Unlock()
+	return gen, true
+}
+
+// publishClient promotes a pending client to p.client — unless a Close or
+// seal ran since the client registered (gen mismatch / sealed), in which
+// case the client is shut down and false is returned: the provider's
+// owner already tore it down and will never Close again, so publishing
+// would orphan the server.
+func (p *Provider) publishClient(c *Client, gen uint64) bool {
+	p.clientMu.Lock()
+	if p.pendingClient == c {
+		p.pendingClient = nil
+	}
+	if p.clientsSealed || p.closeGen != gen {
+		p.clientMu.Unlock()
+		_ = c.Shutdown()
+		return false
+	}
+	p.client = c
+	p.clientMu.Unlock()
+	return true
+}
+
+// sealClients is Close for a single-use instance: shuts down the
+// published and pending clients AND permanently refuses new ones. The
+// lane calls this on every teardown path so a prober still wedged before
+// its spawn cannot later hand a live server to a provider nothing will
+// ever Close.
+func (p *Provider) sealClients() {
+	p.clientMu.Lock()
+	p.clientsSealed = true
+	p.closeGen++
+	c := p.client
+	pending := p.pendingClient
+	p.pendingClient = nil
+	p.clientMu.Unlock()
+
+	if c != nil {
+		_ = c.Shutdown()
+	}
+	if pending != nil && pending != c {
+		_ = pending.Shutdown()
+	}
+}
+
+// effectiveCallTimeout resolves this instance's post-initialize Call
+// bound: the instance override when present (the lane's larger budget),
+// the global resolution otherwise.
+func (p *Provider) effectiveCallTimeout() time.Duration {
+	if p.callTimeoutFn != nil {
+		return p.callTimeoutFn()
+	}
+	return lspCallTimeout()
+}
+
+// releasePendingClient disowns a pending client whose initialization
+// failed — the caller shuts it down itself and returns the real error.
+func (p *Provider) releasePendingClient(c *Client) {
+	p.clientMu.Lock()
+	if p.pendingClient == c {
+		p.pendingClient = nil
+	}
+	p.clientMu.Unlock()
 }
 
 // nodeRelPath strips a node's own RepoPrefix from its FilePath so the
@@ -492,6 +629,168 @@ func nodeAlreadyStamped(n *graph.Node) bool {
 		return s != ""
 	}
 	return v != nil
+}
+
+// nodeHeavyStamped is nodeAlreadyStamped for the deferred tier's own ledger
+// key: a node the background drain already swept for its heavy request
+// classes. The fast tier's semantic_type stamp deliberately does NOT count —
+// the two ledgers are independent, and an edited file re-parses into fresh
+// nodes that drop both.
+func nodeHeavyStamped(n *graph.Node) bool {
+	if n == nil || n.Meta == nil {
+		return false
+	}
+	s, ok := n.Meta["semantic_heavy"].(string)
+	return ok && s != ""
+}
+
+// markNodeHeavyStamped records a completed heavy drain on the node. Like the
+// semantic_type stamp, it must round-trip through the store (the caller
+// appends the node to its flush batch) or a disk backend discards it.
+func markNodeHeavyStamped(n *graph.Node) {
+	if n == nil {
+		return
+	}
+	if n.Meta == nil {
+		n.Meta = map[string]any{}
+	}
+	n.Meta["semantic_heavy"] = "1"
+}
+
+// nodeRefsStamped reports whether the heavy tier's references-confirm leg
+// already adjudicated this confirm target: its reference list came back
+// cleanly (or the target is statically terminal-unconfirmable) and every
+// edge it could corroborate was confirmed. Re-asking buys nothing — the
+// answer is deterministic until the file reparses, which replaces the node
+// and drops the stamp. Without this verdict a dirty-tree repo (where no
+// completion marker can land) re-pays its whole unconfirmable-candidate
+// set on every restart re-drain.
+func nodeRefsStamped(n *graph.Node) bool {
+	if n == nil || n.Meta == nil {
+		return false
+	}
+	s, ok := n.Meta["semantic_heavy_refs"].(string)
+	return ok && s != ""
+}
+
+// markNodeRefsStamped records a completed references adjudication on the
+// confirm target. Like every Meta stamp it must round-trip through the
+// store (the caller flushes the node) or a disk backend discards it.
+func markNodeRefsStamped(n *graph.Node) {
+	if n == nil {
+		return
+	}
+	if n.Meta == nil {
+		n.Meta = map[string]any{}
+	}
+	n.Meta["semantic_heavy_refs"] = "1"
+}
+
+// terminalUnconfirmable identifies confirm targets no finite references
+// budget can adjudicate: C# object-override members (ToString /
+// GetHashCode / Equals). textDocument/references on a System.Object
+// override degenerates into a solution-wide implicit-call search —
+// measured on a 118k-node solution, every other high-fan-in target
+// converts at the lane's 3-minute budget while these still time out.
+// They are identifiable up front, so a heavyDelta drain never asks:
+// their edges stay at the static tier, no drain error is recorded, and
+// the completion marker may land over them — a retry would never
+// converge, only re-pay the timeout. Matching is deliberately by name +
+// kind + language, wider than a strict override check: a custom
+// Equals(T) or ToString(format) overload on a hot type draws the same
+// solution-wide fan-in, and the cost of a false positive is one edge
+// left at its static confidence, not lost work. Only the references
+// confirm skips these targets — the sweep's prepareCallHierarchy /
+// incomingCalls legs on the same members completed cleanly in the same
+// measured runs (every drain error was references-class), so skipping
+// the sweep would only discard good incoming edges.
+func terminalUnconfirmable(n *graph.Node) bool {
+	if n == nil || n.Language != "csharp" {
+		return false
+	}
+	switch n.Kind {
+	case graph.KindMethod:
+		switch n.Name {
+		case "ToString", "GetHashCode", "Equals":
+			return true
+		case "GetFieldDeserializers":
+			// Kiota-generated IParsable member: every generated model class
+			// implements it, so the references up-symbol cascade gathers the
+			// entire generated API client before searching. Measured live on a
+			// generated swagger client: the cascade spun Roslyn for minutes
+			// per target (SymbolEquivalenceComparer recursion) and outlived
+			// the server. Kiota's name, nobody else's — the same
+			// name+kind+language contract as the object overrides above.
+			// Further generated-serializer names join ON MEASUREMENT only.
+			return true
+		}
+	case graph.KindField:
+		// Kiota-generated IAdditionalDataHolder property — the same whale as
+		// GetFieldDeserializers wearing a field kind: every generated model
+		// carries AdditionalData, so its references cascade walks the whole
+		// generated client. Measured on a true cold drain of the same
+		// generated swagger client: 44 sampled 3-minute references timeouts,
+		// every one naming this member, drain landing Partial and retrying a
+		// cost that can never converge. Same name+kind+language contract;
+		// further names join ON MEASUREMENT only.
+		if n.Name == "AdditionalData" {
+			return true
+		}
+	}
+	return false
+}
+
+// tierStamped reports whether THIS pass's tier already covered the node:
+// the fast tier's ledger is the semantic_type stamp, the deferred tier's is
+// semantic_heavy. A heavyDelta pass must not skip nodes merely because the
+// fast pass hovered them — its frontier is exactly the fast-stamped nodes
+// whose heavy legs never ran.
+func (p *Provider) tierStamped(n *graph.Node) bool {
+	if p.heavyDelta {
+		return nodeHeavyStamped(n)
+	}
+	return nodeAlreadyStamped(n)
+}
+
+// drainErrorLedger classifies heavyDelta error-shaped skips per failure
+// site and retains a bounded sample of the failing targets. An aggregate
+// count is honesty without diagnosis: a pass reporting 20 errors must also
+// say WHICH request class failed and, for the first few, on WHAT —
+// otherwise the only way to identify a deterministic failure is a
+// debug-level rerun of a multi-minute drain.
+type drainErrorLedger struct {
+	confirmAcquire atomic.Int64 // a confirm group's file acquire failed — the whole group skipped
+	references     atomic.Int64 // a target's references confirm errored (counted once per target)
+	sweepAcquire   atomic.Int64 // a sweep file's acquire failed — its frontier nodes skipped
+	prepare        atomic.Int64 // prepareCallHierarchy errored where the incoming side was wanted
+	incoming       atomic.Int64 // incomingCalls errored — the node stays unstamped
+
+	mu      sync.Mutex
+	samples []string
+}
+
+// drainErrorSampleLimit bounds the per-pass sample so a server refusing
+// every request logs a screenful, not the corpus.
+const drainErrorSampleLimit = 25
+
+func (l *drainErrorLedger) record(counter *atomic.Int64, class, target string, err error) {
+	counter.Add(1)
+	l.mu.Lock()
+	if len(l.samples) < drainErrorSampleLimit {
+		l.samples = append(l.samples, fmt.Sprintf("%s %s: %v", class, target, err))
+	}
+	l.mu.Unlock()
+}
+
+func (l *drainErrorLedger) total() int64 {
+	return l.confirmAcquire.Load() + l.references.Load() + l.sweepAcquire.Load() +
+		l.prepare.Load() + l.incoming.Load()
+}
+
+func (l *drainErrorLedger) sampleList() []string {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return append([]string(nil), l.samples...)
 }
 
 // scopedPath re-attaches repoPrefix to a repo-relative path the language
@@ -738,10 +1037,11 @@ func (p *Provider) EnrichRepoContext(ctx context.Context, g graph.Store, repoPre
 			if n.Kind == graph.KindFile || n.Kind == graph.KindImport {
 				continue
 			}
-			// Skip symbols a prior enrichment pass already stamped — hover would
-			// only re-derive the same type. An edited file re-parses into fresh
+			// Skip symbols this pass's tier already covered — hover would only
+			// re-derive the same type (fast tier), a drained node re-drains
+			// nothing (deferred tier). An edited file re-parses into fresh
 			// nodes with no Meta, so its symbols lose the stamp and re-enter here.
-			if nodeAlreadyStamped(n) {
+			if p.tierStamped(n) {
 				skippedAlreadyStamped++
 				continue
 			}
@@ -751,14 +1051,7 @@ func (p *Provider) EnrichRepoContext(ctx context.Context, g graph.Store, repoPre
 			}
 			langNodes = append(langNodes, n)
 		}
-		if len(candidateIDs) > 0 {
-			full := g.GetNodesByIDs(candidateIDs)
-			for _, id := range candidateIDs {
-				if n := full[id]; n != nil {
-					langNodes = append(langNodes, n)
-				}
-			}
-		}
+		langNodes = append(langNodes, p.fullUnstampedCandidates(g, candidateIDs)...)
 
 		// Collect AMBIGUOUS edges (confidence < 1.0) whose source is one of this
 		// repo's language nodes — the references pass below confirms / refutes
@@ -798,6 +1091,15 @@ func (p *Provider) EnrichRepoContext(ctx context.Context, g graph.Store, repoPre
 				zap.String("repo_prefix", repoPrefix),
 			)
 		}
+		// Populate the symbol counters even on the no-work return: a caller
+		// deciding whether this pass proved anything (the lane's completion
+		// marker) needs "N symbols, all covered" to stay distinguishable
+		// from "the store held no rows for this repo at all".
+		result.SymbolsTotal = skippedAlreadyStamped
+		if hasProjectedRepo {
+			result.SymbolsTotal = projectedRepo.symbolsTotal
+		}
+		result.SymbolsCovered = skippedAlreadyStamped
 		result.DurationMs = time.Since(start).Milliseconds()
 		return result, nil
 	}
@@ -912,7 +1214,12 @@ func (p *Provider) EnrichRepoContext(ctx context.Context, g graph.Store, repoPre
 	checkpointCtx, cancelCheckpoint := context.WithCancel(ctx)
 	defer cancelCheckpoint()
 	ctx = checkpointCtx
-	if window := lspProductivityWindow(); window > 0 {
+	// A heavyDelta drain is exempt: it is confirm-heavy and add-light by
+	// nature (incoming hops on an already-confirmed repo can legitimately
+	// yield near zero), its requests are individually bounded, and the
+	// targeted breaker still abandons a genuinely erroring server — the
+	// zombie-pass failure mode the checkpoint exists for.
+	if window := lspProductivityWindow(); window > 0 && !p.heavyDelta {
 		go func() {
 			t := time.NewTicker(window)
 			defer t.Stop()
@@ -1040,8 +1347,16 @@ func (p *Provider) EnrichRepoContext(ctx context.Context, g graph.Store, repoPre
 	// nothing for this workspace must not grind through the whole target and
 	// hover corpus at one timeout per request. Any successful answer disarms
 	// the phase's breaker permanently.
-	targetedBreaker := newPhaseBreaker(lspPhaseFailureStreakLimit(), p.logger, "targeted", repoPrefix)
-	hoverBreaker := newPhaseBreaker(lspPhaseFailureStreakLimit(), p.logger, "hover", repoPrefix)
+	targetedBreaker := newPhaseBreaker(lspPhaseFailureStreakLimit(), lspTimeoutFailureStreakLimit(), p.logger, "targeted", repoPrefix)
+	hoverBreaker := newPhaseBreaker(lspPhaseFailureStreakLimit(), lspTimeoutFailureStreakLimit(), p.logger, "hover", repoPrefix)
+	// drainErrs counts heavyDelta work items whose heavy fetch ERRORED
+	// (a node's incoming, a target's references confirm, or a whole file /
+	// confirm group behind a failed acquire) and so stayed undrained — per
+	// failure class, with a bounded target sample. Any non-zero total marks
+	// the pass Partial: the completion marker must never claim a tier whose
+	// drain skipped anything on an error, and the breaker cannot catch a
+	// server dying mid-sweep — any early success permanently disarms it.
+	drainErrs := &drainErrorLedger{}
 
 	// Phase boundary timestamps: the completion log breaks the pass wall time
 	// out per phase (phase_*_ms) — an aggregate duration cannot say which pass
@@ -1055,7 +1370,9 @@ func (p *Provider) EnrichRepoContext(ctx context.Context, g graph.Store, repoPre
 	interfaceMutations := newLSPMutationBatch()
 	interfacePromotions := make(map[*graph.Edge]struct{})
 	for _, n := range langNodes {
-		if degraded {
+		if degraded || p.heavyDelta {
+			// heavyDelta: the implementations pass already ran in the fast
+			// tier — the drain re-issues none of it.
 			break
 		}
 		if targetedCtx.Err() != nil {
@@ -1081,6 +1398,9 @@ func (p *Provider) EnrichRepoContext(ctx context.Context, g graph.Store, repoPre
 		impls, err := p.findImplementations(absRoot, rel, line, col)
 		release()
 		targetedBreaker.observe(err == nil)
+		if isCallTimeout(err) {
+			targetedBreaker.observeTimeout()
+		}
 		if targetedBreaker.isTripped() {
 			break
 		}
@@ -1146,6 +1466,15 @@ func (p *Provider) EnrichRepoContext(ctx context.Context, g graph.Store, repoPre
 	// same document.
 	var confirmMu sync.Mutex
 	confirmPromotions := make(map[*graph.Edge]struct{})
+	// Confirm targets whose references verdict completed this pass — IDs
+	// only, because the confirm loop resolves targets through the light
+	// location projection; the flush stamps full rows fetched fresh.
+	var refsVerdictIDs []string
+	// Confirm targets skipped by the terminal-unconfirmable policy (see
+	// terminalUnconfirmable) — surfaced on the completion log so a drain
+	// that leaves edges at the static tier says so.
+	var diagTerminalSkipped atomic.Int64
+	var diagRefsStamped atomic.Int64
 	var fallback []enrichTarget
 	if p.noHeavyRequests {
 		// This server leaks per references request (ServerSpec.NoHeavyRequests)
@@ -1189,6 +1518,11 @@ func (p *Provider) EnrichRepoContext(ctx context.Context, g graph.Store, repoPre
 				// a later phase that shares the file.
 				content, release, err := session.acquire(p.client, absPath)
 				if err != nil {
+					if p.heavyDelta {
+						// The whole group's confirms are skipped — the
+						// drain did not cover them.
+						drainErrs.record(&drainErrs.confirmAcquire, "confirm-acquire", grp.rel, err)
+					}
 					return
 				}
 				defer release()
@@ -1209,12 +1543,24 @@ func (p *Provider) EnrichRepoContext(ctx context.Context, g graph.Store, repoPre
 					ok   bool
 				}
 				refsByTarget := make(map[string]cachedRefs, len(grp.targets))
+				// Terminal targets adjudicated by policy this pass — they earn
+				// the refs verdict without a request.
+				terminalDone := map[string]struct{}{}
 				for _, t := range grp.targets {
 					if targetedCtx.Err() != nil || targetedBreaker.isTripped() {
 						return
 					}
 					toNode := view.nodesByID[t.edge.To]
 					if toNode == nil {
+						continue
+					}
+					// Policy skip, not an error: a terminal-unconfirmable
+					// target would only re-pay a guaranteed timeout. Its
+					// edges keep their static confidence and the drain
+					// stays clean.
+					if p.heavyDelta && terminalUnconfirmable(toNode) {
+						diagTerminalSkipped.Add(1)
+						terminalDone[t.edge.To] = struct{}{}
 						continue
 					}
 					line, ok := lspLine(toNode)
@@ -1226,6 +1572,14 @@ func (p *Provider) EnrichRepoContext(ctx context.Context, g graph.Store, repoPre
 						col := identifierColumn(content, toNode.StartLine, toNode.Name)
 						refs, err := p.findReferences(absRoot, grp.rel, line, col)
 						targetedBreaker.observe(err == nil)
+						if isCallTimeout(err) {
+							targetedBreaker.observeTimeout()
+						}
+						if err != nil && p.heavyDelta {
+							// This target's edges stay unconfirmed — counted
+							// once here; repeats skip through the cache.
+							drainErrs.record(&drainErrs.references, "references", t.edge.To+" @ "+grp.rel, err)
+						}
 						cr = cachedRefs{refs: refs, ok: err == nil}
 						refsByTarget[t.edge.To] = cr
 					}
@@ -1240,10 +1594,34 @@ func (p *Provider) EnrichRepoContext(ctx context.Context, g graph.Store, repoPre
 						continue
 					}
 					// Unconfirmed with a recorded site line: defer to the
-					// serial definition-rebind fallback below.
-					if t.edge.Line > 0 {
+					// serial definition-rebind fallback below. A heavyDelta
+					// drain skips the handoff — the fast tier's definition
+					// pass already asked at these sites and could not decide;
+					// re-asking buys nothing.
+					if t.edge.Line > 0 && !p.heavyDelta {
 						confirmMu.Lock()
 						fallback = append(fallback, t)
+						confirmMu.Unlock()
+					}
+				}
+				// Record the group's references verdicts only after every
+				// target was visited: a mid-group cancellation or breaker trip
+				// returns above and must not stamp a node whose remaining
+				// edges never got their share of the cached answer. An errored
+				// fetch (cr.ok false) earns no verdict — it retries next drain.
+				if p.heavyDelta {
+					var done []string
+					for id, cr := range refsByTarget {
+						if cr.ok {
+							done = append(done, id)
+						}
+					}
+					for id := range terminalDone {
+						done = append(done, id)
+					}
+					if len(done) > 0 {
+						confirmMu.Lock()
+						refsVerdictIDs = append(refsVerdictIDs, done...)
 						confirmMu.Unlock()
 					}
 				}
@@ -1251,7 +1629,25 @@ func (p *Provider) EnrichRepoContext(ctx context.Context, g graph.Store, repoPre
 		}
 		wg.Wait()
 	}
-	if len(confirmPromotions) > 0 {
+	if len(confirmPromotions) > 0 || len(refsVerdictIDs) > 0 {
+		// The confirm loop resolved its targets through the light location
+		// projection — persisting those view nodes would replace the full
+		// Meta blob and destroy every other stamp on the row (an
+		// already-swept target loses semantic_heavy and re-enters the
+		// frontier). Stamp freshly fetched full rows instead, exactly as
+		// the frontier recheck reads them.
+		var refsStamped []*graph.Node
+		if len(refsVerdictIDs) > 0 {
+			sort.Strings(refsVerdictIDs)
+			full := g.GetNodesByIDs(refsVerdictIDs)
+			for _, id := range refsVerdictIDs {
+				if n := full[id]; n != nil && !nodeRefsStamped(n) {
+					markNodeRefsStamped(n)
+					refsStamped = append(refsStamped, n)
+				}
+			}
+			diagRefsStamped.Add(int64(len(refsStamped)))
+		}
 		mutations := newLSPMutationBatch()
 		rmu.Lock()
 		for edge := range confirmPromotions {
@@ -1259,7 +1655,10 @@ func (p *Provider) EnrichRepoContext(ctx context.Context, g graph.Store, repoPre
 			mutations.stagePersist(edge)
 			result.EdgesConfirmed++
 		}
-		mutations.apply(g, nil)
+		// The refs verdicts round-trip with the promotions: on a disk
+		// backend the node is a per-call reconstruction, so an unflushed
+		// stamp is a discarded one.
+		mutations.apply(g, refsStamped)
 		rmu.Unlock()
 	}
 	confirmDone := time.Now()
@@ -1418,6 +1817,20 @@ func (p *Provider) EnrichRepoContext(ctx context.Context, g graph.Store, repoPre
 			result.Partial = true
 			result.AbortReason = ctx.Err().Error()
 		}
+		// The same pass-level honesty the normal completion applies below:
+		// the confirm pass ran and can have tripped its breaker or fed the
+		// drain-error ledger — returning clean here would let the lane
+		// record its completion marker over never-adjudicated targets.
+		result.BreakerTripped = targetedBreaker.isTripped()
+		if p.heavyDelta && drainErrs.total() > 0 {
+			result.Partial = true
+			if p.logger != nil {
+				p.logger.Warn("LSP enrich: drain errors sampled",
+					zap.String("repo", repoPrefix),
+					zap.Int64("total", drainErrs.total()),
+					zap.Strings("samples", drainErrs.sampleList()))
+			}
+		}
 		if p.logger != nil {
 			didOpens, reopenedFiles, docEvictions, peakOpenDocs := session.stats()
 			p.logger.Info("LSP enrich: degraded pass complete (reference confirmation only)",
@@ -1432,6 +1845,8 @@ func (p *Provider) EnrichRepoContext(ctx context.Context, g graph.Store, repoPre
 				zap.Int("peak_open_docs", peakOpenDocs),
 				zap.Int64("req_references", p.reqStats.references.Load()),
 				zap.Int64("req_definitions", p.reqStats.definitions.Load()),
+				zap.Bool("targeted_breaker_tripped", targetedBreaker.isTripped()),
+				zap.Int64("drain_errored", drainErrs.total()),
 			)
 		}
 		return result, nil
@@ -1445,7 +1860,7 @@ func (p *Provider) EnrichRepoContext(ctx context.Context, g graph.Store, repoPre
 	// a deadline cut sheds hover work, not the recall-bearing add.
 	if !p.noHeavyRequests &&
 		p.Supports("textDocument/references") && !p.Supports("textDocument/prepareCallHierarchy") {
-		p.referencesAddPass(targetedCtx, g, view, repoPrefix, absRoot, langNodes, rmu, session, result)
+		p.referencesAddPass(targetedCtx, g, view, repoPrefix, absRoot, langNodes, rmu, session, result, drainErrs, targetedBreaker)
 	}
 	refsAddDone := time.Now()
 
@@ -1503,6 +1918,14 @@ func (p *Provider) EnrichRepoContext(ctx context.Context, g graph.Store, repoPre
 		defer p.reconnectMu.Unlock()
 		if aborted.Load() {
 			return nil, abortErr
+		}
+		// A cancelled pass must not rebuild the server it was just torn
+		// away from: the lane watchdog seals the client on ctx death, and
+		// reconnecting would re-pay a spawn (for C# a restore + solution
+		// load) only for the pass to unwind — stalling the cancelRepo
+		// waiter or daemon shutdown behind it.
+		if err := ctx.Err(); err != nil {
+			return nil, err
 		}
 		if cur := activeClient.Load(); cur != stale {
 			return cur, nil // someone else already reconnected
@@ -1698,6 +2121,10 @@ func (p *Provider) EnrichRepoContext(ctx context.Context, g graph.Store, repoPre
 			if err != nil {
 				p.logger.Debug("LSP enrich: didOpen failed",
 					zap.String("file", ft.rel), zap.Error(err))
+				if p.heavyDelta {
+					// Every frontier node in this file is skipped unstamped.
+					drainErrs.record(&drainErrs.sweepAcquire, "sweep-acquire", ft.rel, err)
+				}
 				return
 			}
 			defer release()
@@ -1721,7 +2148,7 @@ func (p *Provider) EnrichRepoContext(ctx context.Context, g graph.Store, repoPre
 			// preserves exactly one didOpen per file.
 			if callHierOK || typeHierOK {
 				for _, n := range ft.nodes {
-					if aborted.Load() || ctx.Err() != nil {
+					if aborted.Load() || ctx.Err() != nil || hoverBreaker.isTripped() {
 						break
 					}
 					line, ok := lspLine(n)
@@ -1729,13 +2156,12 @@ func (p *Provider) EnrichRepoContext(ctx context.Context, g graph.Store, repoPre
 						continue
 					}
 					col := identifierColumn(content, n.StartLine, n.Name)
+					// drainFailed marks a node whose heavy fetch ERRORED (vs
+					// answered) — heavyDelta must not stamp it as drained.
+					drainFailed := false
 					switch n.Kind {
 					case graph.KindFunction, graph.KindMethod:
 						if !callHierOK {
-							continue
-						}
-						items, err := p.prepareCallHierarchy(absRoot, ft.rel, line, col)
-						if err != nil {
 							continue
 						}
 						// Outgoing always: the file sweep visits every caller,
@@ -1755,10 +2181,35 @@ func (p *Provider) EnrichRepoContext(ctx context.Context, g graph.Store, repoPre
 						wantIncoming := !p.noHeavyRequests &&
 							(sweepMode == sweepModeFull ||
 								nodeDispatch[n.ID] || nodeDemand[n.ID])
+						if p.heavyDelta && !wantIncoming {
+							// The drain fetches ONLY the incoming side — a
+							// mode-skipped incoming leaves no deferred work,
+							// so the prepare round trip is skipped too.
+							p.reqStats.incomingSkipped.Add(1)
+							continue
+						}
+						items, err := p.prepareCallHierarchy(absRoot, ft.rel, line, col)
+						if err != nil {
+							if isCallTimeout(err) {
+								hoverBreaker.observeTimeout()
+							}
+							if p.heavyDelta {
+								// Reaching here under heavyDelta means the
+								// incoming side was wanted — an errored
+								// prepare leaves it unfetched.
+								drainErrs.record(&drainErrs.prepare, "prepare", n.ID, err)
+							}
+							continue
+						}
+						hoverBreaker.observeAnswered()
 						for _, item := range items {
-							if outs, oerr := p.outgoingCalls(item); oerr == nil {
-								for _, oc := range outs {
-									cHops = append(cHops, callHop{n: n, other: oc.To, asOutgoing: true, fromRanges: oc.FromRanges})
+							if !p.heavyDelta {
+								// heavyDelta: outgoing hops already ran in the
+								// fast tier; the drain re-fetches none.
+								if outs, oerr := p.outgoingCalls(item); oerr == nil {
+									for _, oc := range outs {
+										cHops = append(cHops, callHop{n: n, other: oc.To, asOutgoing: true, fromRanges: oc.FromRanges})
+									}
 								}
 							}
 							if !wantIncoming {
@@ -1766,12 +2217,29 @@ func (p *Provider) EnrichRepoContext(ctx context.Context, g graph.Store, repoPre
 								continue
 							}
 							if ins, ierr := p.incomingCalls(item); ierr == nil {
+								hoverBreaker.observeAnswered()
 								for _, ic := range ins {
 									cHops = append(cHops, callHop{n: n, other: ic.From, asOutgoing: false, fromRanges: ic.FromRanges})
+								}
+							} else {
+								// The node's incoming edges are still missing —
+								// a heavyDelta pass must not stamp it drained.
+								drainFailed = true
+								if isCallTimeout(ierr) {
+									hoverBreaker.observeTimeout()
+								}
+								if p.heavyDelta {
+									drainErrs.record(&drainErrs.incoming, "incoming", n.ID, ierr)
 								}
 							}
 						}
 					case graph.KindType, graph.KindInterface:
+						if p.heavyDelta {
+							// The drain has no type-hierarchy work (the fast
+							// tier ran it) — fall through to the stamp so
+							// type-only files leave the drain frontier.
+							break
+						}
 						if !typeHierOK {
 							continue
 						}
@@ -1792,11 +2260,29 @@ func (p *Provider) EnrichRepoContext(ctx context.Context, g graph.Store, repoPre
 							}
 						}
 					}
+					// A heavyDelta drain stamps the node once its heavy
+					// interrogation completed uncancelled AND unerrored; the
+					// stamp rides this file's flush, so a cut pass keeps
+					// exactly the completed files' progress. Nodes the switch
+					// skipped via continue (mode-skipped incoming, prepare
+					// errors) stay unstamped — they re-enter the frontier at
+					// zero request cost, and the skip decision is re-made
+					// from fresh state.
+					if p.heavyDelta && !drainFailed && ctx.Err() == nil && !aborted.Load() {
+						markNodeHeavyStamped(n)
+						fileStamped = append(fileStamped, n)
+					}
 				}
 			}
 
 			var nodeWg sync.WaitGroup
 			for _, n := range ft.nodes {
+				if p.heavyDelta {
+					// hover already ran in the fast tier — the drain issues
+					// no hover traffic at all (a node whose fast hover
+					// returned nil would only re-derive the same nothing).
+					break
+				}
 				if aborted.Load() || ctx.Err() != nil {
 					break
 				}
@@ -1867,6 +2353,9 @@ func (p *Provider) EnrichRepoContext(ctx context.Context, g graph.Store, repoPre
 					}
 					if err != nil {
 						hoverBreaker.observe(false)
+						if isCallTimeout(err) {
+							hoverBreaker.observeTimeout()
+						}
 						diagHoverErr.Add(1)
 						mu.Lock()
 						if diagFirstHoverError == "" {
@@ -1961,8 +2450,31 @@ func (p *Provider) EnrichRepoContext(ctx context.Context, g graph.Store, repoPre
 		zap.String("first_node_file", diagFirstNodeFile),
 		zap.Bool("targeted_breaker_tripped", targetedBreaker.isTripped()),
 		zap.Bool("hover_breaker_tripped", hoverBreaker.isTripped()),
+		zap.Int64("drain_skipped_terminal", diagTerminalSkipped.Load()),
+		zap.Int64("drain_refs_stamped", diagRefsStamped.Load()),
+		zap.Int64("drain_errored", drainErrs.total()),
+		zap.Int64("drain_errored_confirm_acquire", drainErrs.confirmAcquire.Load()),
+		zap.Int64("drain_errored_references", drainErrs.references.Load()),
+		zap.Int64("drain_errored_sweep_acquire", drainErrs.sweepAcquire.Load()),
+		zap.Int64("drain_errored_prepare", drainErrs.prepare.Load()),
+		zap.Int64("drain_errored_incoming", drainErrs.incoming.Load()),
 	)
 
+	result.BreakerTripped = targetedBreaker.isTripped() || hoverBreaker.isTripped()
+	if p.heavyDelta && drainErrs.total() > 0 {
+		// Per-node honesty left the errored nodes unstamped; pass-level
+		// honesty keeps the completion marker away too. Partial, not an
+		// error: everything that succeeded is flushed and stamped, and the
+		// next trigger resumes from exactly the failed remainder.
+		result.Partial = true
+		// The sample is the diagnosis: without it, identifying a
+		// deterministic failure means re-running a multi-minute drain at
+		// debug level.
+		p.logger.Warn("LSP enrich: drain errors sampled",
+			zap.String("repo", repoPrefix),
+			zap.Int64("total", drainErrs.total()),
+			zap.Strings("samples", drainErrs.sampleList()))
+	}
 	if targetedBreaker.isTripped() && hoverBreaker.isTripped() &&
 		result.EdgesConfirmed == 0 && result.EdgesRebound == 0 &&
 		result.EdgesAdded == 0 && result.NodesEnriched == 0 {
@@ -2017,10 +2529,16 @@ func (p *Provider) resetForReconnect() {
 	// Drop the dead client so the next ensureClient branch builds a
 	// fresh transport. Close it best-effort first to free any
 	// pending pending-map entries; the dead read loop already closed
-	// `done` so Shutdown() is a no-op past that point.
-	if p.client != nil {
-		_ = p.client.Shutdown()
-		p.client = nil
+	// `done` so Shutdown() is a no-op past that point. The pointer write
+	// goes under clientMu: the lane watchdog's seal can run concurrently
+	// with a drain goroutine's reconnect, and Close/seal read p.client
+	// under the same lock.
+	p.clientMu.Lock()
+	c := p.client
+	p.client = nil
+	p.clientMu.Unlock()
+	if c != nil {
+		_ = c.Shutdown()
 	}
 	p.docMu.Lock()
 	p.docVersions = map[string]int{}
@@ -2121,7 +2639,45 @@ func (p *Provider) dialOrSpawn(workspaceRoot string) (*Client, error) {
 			}
 		}
 	}
-	return NewClient(p.command, args, p.env, workspaceRoot, p.logger)
+	return NewClientWithTransport(&SpawnTransport{
+		Command:       p.command,
+		Args:          args,
+		Env:           p.env,
+		WorkspaceRoot: workspaceRoot,
+		Logger:        p.logger,
+		// The lane's drain instance runs below normal priority so its
+		// server never starves foreground work (see background.go).
+		LowPriority: p.heavyDelta,
+	}, p.logger)
+}
+
+// laneCallTimeoutEnv / laneCallTimeoutDefault bound a single lane-drain
+// request. The lane has nobody waiting, and the measured whale tail —
+// solution-wide references on the highest-fan-in members of a 118k-node
+// solution — converts at a 3-minute budget where the 30s foreground
+// default times out. Resolution order: the lane env, then the global
+// GORTEX_LSP_CALL_TIMEOUT (an explicit operator bound applies to the lane
+// too), then the lane default. Same syntax as the global env
+// ("0"/"off"/"none" disables).
+const laneCallTimeoutEnv = "GORTEX_LSP_LANE_CALL_TIMEOUT"
+
+const laneCallTimeoutDefault = 3 * time.Minute
+
+func resolveLaneCallTimeout() time.Duration {
+	switch v := strings.TrimSpace(os.Getenv(laneCallTimeoutEnv)); v {
+	case "":
+		if strings.TrimSpace(os.Getenv("GORTEX_LSP_CALL_TIMEOUT")) != "" {
+			return lspCallTimeout()
+		}
+		return laneCallTimeoutDefault
+	case "0", "off", "none":
+		return 0
+	default:
+		if d, err := time.ParseDuration(v); err == nil {
+			return d
+		}
+		return laneCallTimeoutDefault
+	}
 }
 
 // defaultLSPCallTimeout bounds a single post-initialize LSP request.
@@ -2363,6 +2919,18 @@ func (p *Provider) ensureClient(workspaceRoot string) error {
 		}
 	}
 
+	// A sealed provider builds no new clients — refuse BEFORE the
+	// restore / spawn spend: reconnectWithBackoff retries this function
+	// with backoff, and a drain sealed mid-reconnect must unwind
+	// immediately instead of paying spawn cycles that registration would
+	// only reap again.
+	p.clientMu.Lock()
+	sealed := p.clientsSealed
+	p.clientMu.Unlock()
+	if sealed {
+		return errors.New("lsp: provider sealed; not building a new client")
+	}
+
 	// Reset the dynamic capability table — a fresh subprocess (or a
 	// fresh dialed connection) has no dynamic registrations until it
 	// re-announces them. Reset under the lock so any racing
@@ -2381,6 +2949,15 @@ func (p *Provider) ensureClient(workspaceRoot string) error {
 	client, err := p.dialOrSpawn(workspaceRoot)
 	if err != nil {
 		return err
+	}
+	// Own the process from the instant it exists: until the publication at
+	// the end of this function, an external Close (readiness-budget
+	// teardown, provider shutdown) can only reach it through this
+	// registration — and the initialize Call below is unbounded, so this
+	// window is where a wedged server would otherwise be orphaned.
+	spawnGen, accepted := p.registerPendingClient(client)
+	if !accepted {
+		return errors.New("lsp: provider sealed during spawn; server reaped")
 	}
 
 	// Wire diagnostic + reverse-RPC handlers before initialize so we
@@ -2519,6 +3096,7 @@ func (p *Provider) ensureClient(workspaceRoot string) error {
 
 	var initResult InitializeResult
 	if err := client.Call("initialize", initParams, &initResult); err != nil {
+		p.releasePendingClient(client)
 		_ = client.Shutdown()
 		return fmt.Errorf("initialize: %w", err)
 	}
@@ -2532,16 +3110,24 @@ func (p *Provider) ensureClient(workspaceRoot string) error {
 
 	// Send initialized notification.
 	if err := client.Notify("initialized", struct{}{}); err != nil {
+		p.releasePendingClient(client)
 		_ = client.Shutdown()
 		return fmt.Errorf("initialized: %w", err)
 	}
 
 	// The (possibly slow) cold-workspace load is done — bound every
 	// subsequent request so a server that wedges mid-session can no
-	// longer block an enrichment Call forever. See lspCallTimeout.
-	client.SetCallTimeout(lspCallTimeout())
+	// longer block an enrichment Call forever. See lspCallTimeout and,
+	// for lane instances, resolveLaneCallTimeout.
+	client.SetCallTimeout(p.effectiveCallTimeout())
 
-	p.client = client
+	if !p.publishClient(client, spawnGen) {
+		// A Close ran while this goroutine initialized: the provider's
+		// owner already tore the instance down and will never Close it
+		// again — publishing would orphan the server (publishClient reaped
+		// it instead).
+		return errors.New("lsp: provider closed during initialization; server reaped")
+	}
 	return nil
 }
 
@@ -3763,6 +4349,13 @@ func (p *Provider) repoScopedNodes(g graph.Store, repoPrefix string) []*graph.No
 // whether the light path was taken: when true, the returned nodes must not
 // be round-tripped back through AddBatch as-is (see graph.LightNodeReader);
 // the caller re-fetches in full whatever subset it intends to stamp.
+//
+// Invariant for future backends: every LightNodeReader today also serves
+// the LSP repo projection, whose endpoint resolve re-fetches confirmable
+// targets in full (blob verdicts must be visible to the confirm pass). A
+// backend that adds LightNodeReader WITHOUT the projection reader would
+// route light nodes into the non-projected enrich path — give it the
+// projection too, or refetch confirm endpoints there as well.
 func (p *Provider) repoScopedNodesLight(g graph.Store, repoPrefix string) ([]*graph.Node, bool) {
 	if lr, ok := g.(graph.LightNodeReader); ok {
 		return lr.GetRepoNodesLight(repoPrefix), true

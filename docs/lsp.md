@@ -290,19 +290,156 @@ What changes under the opt-out:
   immediately for these servers, so C# usage queries answer from the stored
   graph tiers alone.
 
-The `GORTEX_LSP_HEAVY` env var overrides the spec in both directions, with
-the same value vocabulary as `GORTEX_LSP_OPEN_DOCS`: `on` / `1` / `true`
-restores references and incomingCalls for an opted-out server, `off` / `0`
-/ `false` disables them for every server, and an empty or unrecognised
-value falls through to the spec. The knob is deliberately env-only: it
-exists to match a specific server *build*, not a workspace, and a durable
-config key would outlive the build it was set for.
+The `GORTEX_LSP_HEAVY` env var overrides the spec, sharing the on/off value
+vocabulary of `GORTEX_LSP_OPEN_DOCS` and adding a third mode:
+
+| value | fast pass | deferred drain |
+|---|---|---|
+| `on` / `1` / `true` | heavy legs run inline, even for an opted-out server | — |
+| `off` / `0` / `false` | heavy legs skipped for every server | — |
+| `background` | heavy legs skipped, exactly as `off` | drained after warmup by the background lane (next section) |
+| unset / other | spec decides (`NoHeavyRequests`) | — |
+
+The knob is deliberately env-only: it exists to match a specific server
+*build*, not a workspace, and a durable config key would outlive the build
+it was set for.
 
 > **Warning:** set `GORTEX_LSP_HEAVY=on` for C# only on a csharp-ls build
 > that carries the FindReferences leak fix
 > ([razzmatazz/csharp-language-server#410](https://github.com/razzmatazz/csharp-language-server/pull/410)).
 > On any released build up to 0.26, a full heavy pass over a large repo can
 > push ~30GB through the leak and OOM the server mid-pass.
+
+### The background lane
+
+`GORTEX_LSP_HEAVY=background` splits the difference: the fast pass skips
+the heavy legs exactly as `off` does, and the deep tier is drained
+afterwards by the background lane. The semantic manager queues one drain
+task per (repo, provider) as fast passes complete; the daemon opens the
+lane only after the `end_batch` warmup phase, so the drain never competes
+with the resolver or the fast passes. The drain is a `heavyDelta`
+enrichment pass: references confirms over the edges still unconfirmed, plus
+the demand-gated incomingCalls sweep — and nothing the fast tier already
+paid for (no hovers, definitions, implementations, outgoing calls, or type
+hierarchy).
+
+The drain runs on a **dedicated server instance**, spawned per drain at
+below-normal OS priority (Windows) and closed when the repo's tier is
+drained — sharing the foreground instance would re-poison its latency with
+exactly the cache thrash the opt-out exists to avoid. The cost is a second
+workspace load and its memory for the duration of the drain; the lane's
+request width is capped at 4.
+
+Progress is durable at two grains: drained sweep nodes are stamped
+`semantic_heavy` in node Meta (an edited file re-parses into fresh nodes and
+drops the stamp, re-entering both tiers naturally), and a clean, breaker-free
+drain records a `<provider>-background` enrichment marker at the fast tier's
+sha **as of drain start** — a fast pass finishing mid-drain re-enqueues the
+repo rather than being claimed by a marker for state the drain never
+visited. A drain cancelled by daemon shutdown resumes from the stamps at the
+next trigger (a fast pass completing, or the restart census in
+`StartBackgroundLane`, which re-enqueues repos whose fast tier is current
+but whose deep tier never finished). A drain that saw **zero symbols** for
+its languages proves nothing about the tier — the store simply held no rows
+yet — so it records no marker and defers as partial; an all-stamped repo is
+different and completes as a clean no-op. An **errored or partial drain
+retries on its own** with bounded exponential backoff (1 min doubling to a
+30 min cap, reset by a clean drain or any fresh trigger) — a server that
+was briefly unavailable or still loading recovers without waiting for the
+next mutation or restart. Retries are not unconditional: an attempt that
+yielded no edges AND shrank no frontier made no progress; five stuck
+attempts are still retried, and the sixth **abandons** the task until the
+next external trigger — a server with a persistent per-target error must not
+re-run an identical drain every backoff interval for the daemon's
+lifetime, while a converging drain (its per-node stamps shrink each next
+attempt) always keeps its heartbeat. The lane obeys the same **admission
+floor** as index-time enrichment (`GORTEX_ENRICH_MIN_NODES`, default 16): a
+language too small for a fast pass is never census-enqueued or
+mutation-requeued — with no fast marker its drain could never record
+completion and would re-spawn a server for the same incidental subtree on
+every restart. The drain waits for a readiness-probing server's workspace
+load before starting, exactly like the foreground pass — a still-loading
+server answers heavy requests empty, which must not be recorded as a
+drained tier. Lane progress is surfaced in the daemon health snapshot under
+`background_lane` (including `retries`, `abandoned`, and
+`last_abandoned_repo`) and in the `background enrichment complete` /
+`partial` / `failed` / `abandoned` log lines.
+
+The drain runs under its own per-request budget: nobody waits on the lane,
+and the expensive tail — solution-wide references on the highest-fan-in
+members — converts at a larger bound where the 30s foreground default
+times out. `GORTEX_LSP_LANE_CALL_TIMEOUT` sets it (default `3m`; same
+syntax as `GORTEX_LSP_CALL_TIMEOUT`, `0`/`off`/`none` disables); when the
+lane variable is unset but the global `GORTEX_LSP_CALL_TIMEOUT` is set
+explicitly, the global bound applies to the lane too. One target class is
+never asked at all: C# object-override members (`ToString`, `GetHashCode`,
+`Equals`), whose references request degenerates into a solution-wide
+implicit-call search no finite budget converts, and the Kiota-generated
+`GetFieldDeserializers` member and `AdditionalData` property, where the
+same cascade walks every generated model in an API client. The drain skips
+them as
+**terminal-unconfirmable** — their edges keep their static confidence, the
+skip is not an error, the completion marker may land over them, and the
+completion log counts them as `drain_skipped_terminal`.
+
+The drain instance also carries its own concurrency width. It inherits the
+foreground's resolved width but clamps it at 4: the lane optimizes for
+non-interference, and a wide foreground setting should not silently turn
+the background drain into a foreground-scale load. On a machine where the
+server converts width directly into wall time, `GORTEX_LSP_LANE_MAX_PARALLEL`
+overrides the clamp outright — a positive value wins in both directions
+(raising past 4 or narrowing below the inherited width), and zero,
+negative, or unparseable values keep the clamp, the same semantics as
+`GORTEX_LSP_MAX_PARALLEL` on the foreground. Measured on a 118k-node C#
+solution: a full re-drain's references-confirm phase ran at 10.9 requests/s
+at the default width and 49.5 requests/s at 16, with per-request server
+time unchanged — the drain was width-bound end to end.
+
+The references-confirm leg records a per-node verdict: a confirm target
+whose reference list came back cleanly (or that is statically terminal) is
+stamped `semantic_heavy_refs`, and later drains never re-ask it — the
+identical question buys nothing until the file reparses and drops the
+stamp with the node. This is what keeps restart re-drains cheap on a
+dirty working tree, where no completion marker can land and the census
+re-enqueues the repo every startup: without the verdict, the whole
+never-confirmable candidate set re-paid its references on every restart.
+An errored fetch earns no verdict and retries on the next drain; the
+completion log counts fresh verdicts as `drain_refs_stamped`.
+
+A repository mutation — a watcher batch, a branch switch, a full re-index,
+tracking a new repository — never overlaps a drain of the languages it
+touches. The mutation first parks the repo's lane queue for its whole
+duration (so even the trigger its own enrichment pass creates cannot start
+a drain mid-mutation — for a fresh track that also means the first drain
+waits until the repo's rows are durable and the repo is installed), then
+cancels the in-flight drain and waits it out before its first store
+write, revokes the lane's completion claim for the mutated languages, and
+re-enqueues the repo once the batch and its incremental enrichment
+settle. A revocation whose marker write fails is not trusted: the repo is
+enqueued anyway, bypassing the (now stale) completion claim, since a
+redundant drain is request-free for files whose stamps survived. The languages come from the files that actually changed — a
+directory scope or a full-root reconcile resolves them after
+classification, and a reconcile that finds nothing changed touches the
+lane not at all: no cancel, no claim revoked, the active drain just keeps
+running. The fast path always wins; the lane drains the delta afterwards,
+resuming from the per-node stamps so untouched files cost no requests.
+Drains of unrelated languages keep running — they write disjoint rows,
+and cancelling them would only re-pay their server spawn on every edit. A
+mutation-requeued drain waits out a quiet period first (60s, slid forward
+by every further mutation), so an editing session coalesces into one
+drain after its last save instead of spawning and cancelling a server per
+batch. Untracking a repository cancels and discards its lane work
+outright, and parks the lane for that repo until the teardown has
+detached the registry entry — a census holding a pre-teardown roots
+snapshot can otherwise enqueue after the purge and drain into the removed
+namespace. Every task is additionally validated against the live
+repository registry immediately before it drains, so a task for a repo
+that was untracked (or re-tracked at a different checkout) after the task
+was queued is dropped instead of spawning a server at an abandoned root.
+
+On-demand confirmation stays disabled under `background`, exactly as under
+`off`: `find_usages` / `get_callers` answer from the stored graph tiers,
+which the drain deepens as it lands rather than a live round trip.
 
 ### Sweep modes
 

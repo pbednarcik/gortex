@@ -22,6 +22,7 @@ import (
 // try to build an AST with an inferred compile command and churn on invalid
 // ASTs for zero graph signal.
 func TestLSP_Enrich_SkipsFilesOutsideProviderCoverage(t *testing.T) {
+	t.Setenv(HeavyRequestsEnv, "")
 	repoRoot := t.TempDir()
 	require.NoError(t, os.WriteFile(filepath.Join(repoRoot, "main.c"),
 		[]byte("void caller(void) {\n  helper();\n  useImg();\n}\n"), 0o644))

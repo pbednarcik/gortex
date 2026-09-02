@@ -2308,6 +2308,19 @@ func (idx *Indexer) IndexCtx(ctx context.Context, root string) (*IndexResult, er
 			return rootErr
 		}
 
+		// A full re-index rewrites every row — no background drain of this
+		// repository may overlap it, whatever its language. Hold first:
+		// the pass's own enrichment ends with a cooldown-free pass-end
+		// enqueue that must park until this mutation completes. No
+		// requeue needed here: that same enqueue re-enters the repo once
+		// the hold releases (and the restart census covers an interrupted
+		// run).
+		if current.semanticMgr != nil {
+			release := current.semanticMgr.HoldBackgroundMutations(current.repoPrefix)
+			defer release()
+			current.semanticMgr.CancelBackgroundDrains(current.repoPrefix, nil)
+		}
+
 		finishTopologyMutation := reach.BeginTopologyMutation(current.graph)
 		defer finishTopologyMutation(true)
 
@@ -5724,6 +5737,11 @@ type incrementalPathMode struct {
 	forceExplicitFiles        bool
 	surfaceFirstVersionChange bool
 	exactPointSemantic        bool
+	// laneBracket, when set by the owning mutation executor, receives the
+	// precise post-classification cancel (cancelForFiles) before the first
+	// store write — the only place directory scopes and full-root walks
+	// resolve to the actual stale/deleted file set.
+	laneBracket *backgroundLaneBracket
 }
 
 // indexedFilesAbsentFromDisk returns the repo-relative keys of files the graph
@@ -6068,6 +6086,10 @@ func (idx *Indexer) incrementalReindexPathsMode(
 	if len(markerBatches) > 0 && markerBatches[0] != nil {
 		markerBatch = markerBatches[0]
 	}
+	// Classification is done and the eviction below is the mutation's first
+	// store write: the exact place the lane bracket's precise cancel must
+	// wait out any drain of the languages these files hold.
+	mode.laneBracket.cancelForFiles(staleFiles, deletedFiles)
 	invalidation, reparsedFiles, failedFiles, versionChangedFiles := idx.reindexIncrementalFilesBatched(
 		sourceStaleFiles, deletedFiles, markerBatch, mode.surfaceFirstVersionChange,
 	)

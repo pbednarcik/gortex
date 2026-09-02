@@ -38,6 +38,26 @@ type lspRepoProjection struct {
 	inboundDispatchEdges     []*graph.Edge
 }
 
+// fullUnstampedCandidates re-fetches candidate nodes in full and drops any
+// the tier stamp already covers. Light scans restore only promoted Meta
+// columns, so a blob-only stamp (semantic_heavy) is invisible until this
+// batch — without the recheck every heavy drain rebuilds the whole frontier.
+func (p *Provider) fullUnstampedCandidates(g graph.Store, candidateIDs []string) []*graph.Node {
+	if len(candidateIDs) == 0 {
+		return nil
+	}
+	full := g.GetNodesByIDs(candidateIDs)
+	nodes := make([]*graph.Node, 0, len(candidateIDs))
+	for _, id := range candidateIDs {
+		node := full[id]
+		if node == nil || p.tierStamped(node) {
+			continue
+		}
+		nodes = append(nodes, node)
+	}
+	return nodes
+}
+
 // readLSPRepoProjection builds the smallest exact projection consumed by the
 // existing enrichment phases. It deliberately retains only language symbol
 // locations and LSP-adjudicable adjacency; file/import nodes and opaque Meta
@@ -83,7 +103,7 @@ func (p *Provider) readLSPRepoProjection(g graph.Store, repoPrefix string) (*lsp
 
 		candidateIDs := make([]string, 0, unstampedCount(frontier, unstampedByFile))
 		for _, node := range locations {
-			if node == nil || nodeAlreadyStamped(node) {
+			if node == nil || p.tierStamped(node) {
 				continue
 			}
 			if _, seen := candidateSeen[node.ID]; seen {
@@ -95,15 +115,7 @@ func (p *Provider) readLSPRepoProjection(g graph.Store, repoPrefix string) (*lsp
 		// The location projection intentionally omits opaque Meta. Re-fetch
 		// only the unstamped candidates that may be enriched or ranked; one
 		// bounded batch per frontier preserves receiver/trait markers exactly.
-		var fullCandidates map[string]*graph.Node
-		if len(candidateIDs) > 0 {
-			fullCandidates = g.GetNodesByIDs(candidateIDs)
-		}
-		for _, id := range candidateIDs {
-			if node := fullCandidates[id]; node != nil {
-				projection.langNodes = append(projection.langNodes, node)
-			}
-		}
+		projection.langNodes = append(projection.langNodes, p.fullUnstampedCandidates(g, candidateIDs)...)
 
 		confirmable := reader.LSPRepoConfirmableEdgesByFiles(repoPrefix, p.languages, frontier, false)
 		memberOf := reader.LSPRepoEdgesByFilesAndKinds(repoPrefix, p.languages, frontier, []graph.EdgeKind{graph.EdgeMemberOf})
@@ -167,20 +179,42 @@ func (p *Provider) readLSPRepoProjection(g graph.Store, repoPrefix string) (*lsp
 			nodesByID[node.ID] = node
 		}
 	}
-	missingIDs := make([]string, 0)
+	// Confirmation reads blob-only node state — the heavy stamp, the
+	// banked references verdict, annotation stamps — and the location
+	// projection is blob-blind: a light endpoint hides a banked verdict,
+	// so the target is re-asked on every drain as if it never earned one.
+	// Resolve EVERY confirmable endpoint in full, not only the ones the
+	// projection omitted; frontier candidates are already full and are
+	// simply refreshed by the same batch.
+	endpointIDs := make([]string, 0, len(endpointSet))
 	for id := range endpointSet {
+		endpointIDs = append(endpointIDs, id)
+	}
+	sort.Strings(endpointIDs)
+	var fullEndpoints map[string]*graph.Node
+	if len(endpointIDs) > 0 {
+		fullEndpoints = g.GetNodesByIDs(endpointIDs)
+	}
+	missingIDs := make([]string, 0)
+	for _, id := range endpointIDs {
 		if nodesByID[id] == nil {
 			missingIDs = append(missingIDs, id)
 		}
 	}
-	sort.Strings(missingIDs)
-	var missing map[string]*graph.Node
-	if len(missingIDs) > 0 {
-		missing = g.GetNodesByIDs(missingIDs)
+	// Swap the full rows into the slice too, not only the map: the enrich
+	// pass rebuilds its own view from projection.repoNodes, so a light
+	// entry left in the slice would resurface there.
+	for i, node := range projection.repoNodes {
+		if node == nil {
+			continue
+		}
+		if full := fullEndpoints[node.ID]; full != nil {
+			projection.repoNodes[i] = full
+		}
 	}
-	projection.repoNodes = append(projection.repoNodes, orderedNodes(missingIDs, missing)...)
-	for _, id := range missingIDs {
-		if node := missing[id]; node != nil {
+	projection.repoNodes = append(projection.repoNodes, orderedNodes(missingIDs, fullEndpoints)...)
+	for _, id := range endpointIDs {
+		if node := fullEndpoints[id]; node != nil {
 			nodesByID[id] = node
 		}
 	}

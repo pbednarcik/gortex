@@ -68,6 +68,12 @@ type MultiIndexer struct {
 	newIndexer func(graph.Store, *parser.Registry, config.IndexConfig, *zap.Logger) *Indexer
 	mu         sync.RWMutex
 
+	// untrackLaneWindowHook, when non-nil, runs inside UntrackRepo between the
+	// background-lane cancellation and the registry detach — the window where a
+	// concurrent census holding a pre-teardown roots snapshot can land its
+	// enqueue. Lifecycle tests use it to pin the hold-across-detach contract.
+	untrackLaneWindowHook func()
+
 	// repositoryMutations owns one stable mutation lane per repository prefix.
 	// The slot survives Indexer replacement so an explicit re-index cannot race
 	// an old watcher instance on a second lane.
@@ -401,6 +407,14 @@ func (mi *MultiIndexer) SetEmbeddingAPIConcurrency(n int) {
 	}
 }
 
+// SemanticManager returns the manager installed by SetSemanticManager, nil
+// when semantic enrichment is not wired (CLI paths without a daemon).
+func (mi *MultiIndexer) SemanticManager() *semantic.Manager {
+	mi.mu.RLock()
+	defer mi.mu.RUnlock()
+	return mi.semanticMgr
+}
+
 // SetSemanticManager installs the semantic enrichment manager every
 // per-repo Indexer this MultiIndexer constructs should use, and
 // re-applies it to every per-repo Indexer already built. Without
@@ -416,6 +430,24 @@ func (mi *MultiIndexer) SetSemanticManager(m *semantic.Manager) {
 	mi.mu.Unlock()
 	for _, idx := range live {
 		idx.SetSemanticManager(m)
+	}
+	if m != nil {
+		// The background lane validates every task against the live
+		// registry immediately before draining: an untrack can land inside
+		// the warmup census (its purge only clears tasks that already
+		// exist), and a re-tracked prefix can point at a different
+		// checkout. Called without mi.mu held on the scheduler side; the
+		// read here is a brief RLock, and no mutation path waits on drains
+		// while holding mi.mu.
+		m.SetBackgroundRepoRootResolver(func(repoName string) (string, bool) {
+			mi.mu.RLock()
+			defer mi.mu.RUnlock()
+			meta, ok := mi.repos[repoName]
+			if !ok || meta == nil {
+				return "", false
+			}
+			return meta.RootPath, true
+		})
 	}
 }
 
@@ -2263,6 +2295,20 @@ func (mi *MultiIndexer) IndexRepo(repoPrefix string) (*IndexResult, error) {
 	var result *IndexResult
 	var indexErr error
 	err := mi.repositoryMutationCoordinator(repoPrefix).runExclusive(context.Background(), func() error {
+		// A full re-index rewrites every row — no background drain of this
+		// repository may overlap it, whatever its language (the same rule
+		// IndexCtx applies on the single-indexer path). Hold first (the
+		// rebuild's own enrichment pass-end enqueue must park until the
+		// lane is handed back), then wait the drains out BEFORE taking the
+		// topology gate, so a slow cancellation never blocks graph
+		// readers. No requeue: the rebuilt index's own enrichment
+		// re-enqueues, and the restart census covers an interrupted run.
+		if semMgr := mi.SemanticManager(); semMgr != nil {
+			release := semMgr.HoldBackgroundMutations(repoPrefix)
+			defer release()
+			semMgr.CancelBackgroundDrains(repoPrefix, nil)
+		}
+
 		finishTopologyMutation := reach.BeginTopologyMutation(mi.graph)
 		defer finishTopologyMutation(true)
 		result, indexErr = mi.indexRepoRaw(repoPrefix)
@@ -2497,6 +2543,12 @@ func (mi *MultiIndexer) incrementalEvictRepoRaw(repoPrefix, path string) (nodesR
 		return 0, 0, fmt.Errorf("repository mutation executor has no live indexer: %s", repoPrefix)
 	}
 
+	// Deferred first so LIFO runs the requeue+release after the complete
+	// forced-delete resolver/derived tail below — and after the topology
+	// gate closes. The evicted file's rows resolve its languages up front.
+	laneBracket := idx.beginBackgroundLaneBracket([]string{path})
+	defer laneBracket.finish()
+
 	finishTopologyMutation := reach.BeginTopologyMutation(mi.graph)
 	topologyChanged := true
 	defer func() { finishTopologyMutation(topologyChanged) }()
@@ -2551,9 +2603,17 @@ func (mi *MultiIndexer) incrementalReindexRepoRawMode(repoPrefix string, paths [
 		return nil, fmt.Errorf("repository mutation executor has no live indexer: %s", repoPrefix)
 	}
 
-	// The stable per-repository lane is held before this executor runs. Take
-	// the global reachability topology gate second and keep it through the
-	// resolver, metadata, and derived tails to avoid lane/gate inversion.
+	// The stable per-repository lane is held before this executor runs.
+	// Hold the lane's dequeue gate for the whole mutation and cancel known
+	// file paths' languages before the topology gate; the engine cancels
+	// the classified remainder before its first write. LIFO runs the
+	// requeue+release after the complete resolver/metadata/derived tail.
+	laneBracket := idx.beginBackgroundLaneBracket(paths)
+	defer laneBracket.finish()
+	mode.laneBracket = laneBracket
+
+	// Take the global reachability topology gate second and keep it through
+	// the resolver, metadata, and derived tails to avoid lane/gate inversion.
 	finishTopologyMutation := reach.BeginTopologyMutation(mi.graph)
 	topologyChanged := true
 	defer func() { finishTopologyMutation(topologyChanged) }()
@@ -2794,6 +2854,19 @@ func (mi *MultiIndexer) TrackRepoCtx(ctx context.Context, entry config.RepoEntry
 	err = mi.coordinateRepositoryTopologyMutation(ctx, idx, func() error {
 		// Construction can precede a queued batch transition. Once the stable
 		// lane and transition generation are held, reapply the authoritative mode.
+		// The track's own inline enrichment enqueues this repo's first
+		// background drain from INSIDE the mutation, while a first index on
+		// a bulk-loading store still holds every row in the indexer's local
+		// shadow graph — invisible to the durable store the lane drains.
+		// Hold the lane until the mutation completes (shadow landed, repo
+		// installed), the same bracket every other repository mutation
+		// takes; nothing can be in flight for a not-yet-tracked prefix, so
+		// no cancel leg is needed.
+		if semMgr := mi.SemanticManager(); semMgr != nil {
+			release := semMgr.HoldBackgroundMutations(prefix)
+			defer release()
+		}
+
 		batchMode := mi.reapplyBatchModeForMutation(idx)
 		finishTopologyMutation := mi.beginRepositoryTopologyMutation(ctx)
 		topologyChanged := false
@@ -3242,6 +3315,27 @@ func (mi *MultiIndexer) UntrackRepo(repoPrefix string) (int, int) {
 		mi.logger.Warn("failed to drain repository mutation coordinator",
 			zap.String("prefix", repoPrefix), zap.Error(err))
 		return 0, 0
+	}
+
+	// The background lane must not outlive the repository: a pending or
+	// in-flight drain would spawn a server at the abandoned root and write
+	// the purged repo's nodes back into the store. Cancellation alone is not
+	// enough — the repo stays registered until the detach below, so a
+	// concurrent census holding a pre-teardown roots snapshot can enqueue
+	// AFTER the purge and still pass the drain-time live-root check. Park
+	// the lane first (the dequeue gate skips held repos), then cancel: the
+	// cancel waits out in-flight drains (all languages — the whole repo is
+	// going away) and purges queued work, while the hold parks stragglers
+	// until this teardown returns with the registry entry detached — a
+	// parked task then drops at the resolver instead of resurrecting the
+	// repo.
+	if semMgr := mi.SemanticManager(); semMgr != nil {
+		release := semMgr.HoldBackgroundMutations(repoPrefix)
+		defer release()
+		semMgr.CancelBackgroundDrains(repoPrefix, nil)
+	}
+	if mi.untrackLaneWindowHook != nil {
+		mi.untrackLaneWindowHook() // test seam: the cancel-to-detach window
 	}
 
 	// The lane is now closed and drained, so no new admission can cross this
