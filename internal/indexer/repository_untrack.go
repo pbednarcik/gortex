@@ -88,6 +88,27 @@ func (mi *MultiIndexer) untrackRepoChecked(
 		return 0, 0, fmt.Errorf("indexer: drain repository %s before teardown: %w", repoPrefix, err)
 	}
 
+	// The background lane must not outlive the repository: a pending or
+	// in-flight drain would spawn a server at the abandoned root and write
+	// the purged repo's nodes back into the store. Cancellation alone is not
+	// enough — the repo stays registered until the detach below, so a
+	// concurrent census holding a pre-teardown roots snapshot can enqueue
+	// AFTER the purge and still pass the drain-time live-root check. Park
+	// the lane first (the dequeue gate skips held repos), then cancel: the
+	// cancel waits out in-flight drains (all languages — the whole repo is
+	// going away) and purges queued work, while the hold parks stragglers
+	// until this teardown returns with the registry entry detached — a
+	// parked task then drops at the resolver instead of resurrecting the
+	// repo.
+	if semMgr := mi.SemanticManager(); semMgr != nil {
+		release := semMgr.HoldBackgroundMutations(repoPrefix)
+		defer release()
+		semMgr.CancelBackgroundDrains(repoPrefix, nil)
+	}
+	if mi.untrackLaneWindowHook != nil {
+		mi.untrackLaneWindowHook() // test seam: the cancel-to-detach window
+	}
+
 	mi.batchMutationGate.RLock()
 	defer mi.batchMutationGate.RUnlock()
 	finishTopologyMutation := reach.BeginTopologyMutation(mi.graph)

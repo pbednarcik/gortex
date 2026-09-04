@@ -1414,6 +1414,9 @@ func renderDaemonHeader(w io.Writer, st daemon.StatusResponse) {
 			t.AppendRow(table.Row{"", line})
 		}
 	}
+	if row := formatBackgroundLaneRow(st.BackgroundLane); row != "" {
+		t.AppendRow(table.Row{"lane", row})
+	}
 	rt := st.Runtime
 	if rt.Sys > 0 {
 		t.AppendRow(table.Row{"runtime", fmt.Sprintf(
@@ -1486,6 +1489,46 @@ func formatLSPLastUsed(raw string, now time.Time) string {
 		age = 0
 	}
 	return formatDuration(age.Truncate(time.Second)) + " ago"
+}
+
+// formatBackgroundLaneRow renders the deferred heavy-tier lane into one
+// status row. Empty when the lane never started and never drained, so a
+// setup without GORTEX_LSP_HEAVY=background shows nothing. While a drain
+// is in flight the row carries the provider's live phase progress and the
+// per-phase estimate, labelled rough because it is a linear extrapolation.
+func formatBackgroundLaneRow(l *daemon.BackgroundLaneStatus) string {
+	if l == nil || (!l.Started && l.Drained == 0 && l.Pending == 0 && l.Failed == 0) {
+		return ""
+	}
+	if l.InFlightRepo != "" {
+		lp := l.InFlight
+		if lp == nil {
+			return fmt.Sprintf("draining %s  starting server", l.InFlightRepo)
+		}
+		pct := 0.0
+		if lp.FilesTotal > 0 {
+			pct = float64(lp.FilesDone) / float64(lp.FilesTotal) * 100
+		}
+		row := fmt.Sprintf("draining %s  %s %d/%d (%.1f%%)  elapsed %s",
+			l.InFlightRepo, lp.Phase, lp.FilesDone, lp.FilesTotal, pct,
+			formatDuration(time.Duration(lp.ElapsedSeconds*float64(time.Second)).Truncate(time.Second)))
+		switch lp.EstimateState {
+		case "rough":
+			row += fmt.Sprintf("  ~%.1f min left (rough)", lp.EstimateMinutes)
+		case "warming":
+			row += "  estimate warming"
+		}
+		return row
+	}
+	row := fmt.Sprintf("idle  drained=%d pending=%d", l.Drained, l.Pending)
+	if l.LastRepo != "" {
+		row += fmt.Sprintf("  last=%s (%s)", l.LastRepo,
+			formatDuration((time.Duration(l.LastDurationMs) * time.Millisecond).Truncate(time.Second)))
+	}
+	if l.LastFailure != "" {
+		row += fmt.Sprintf("  last_failure=%s: %s", l.LastFailedRepo, l.LastFailure)
+	}
+	return row
 }
 
 // formatEnrichmentProgress renders the semantic-enrichment progress

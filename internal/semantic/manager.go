@@ -132,6 +132,12 @@ type Manager struct {
 	closing         bool
 	closeOnce       sync.Once
 	closeErr        error
+
+	// background drains deferred deep-tier work (BackgroundEnricher
+	// providers) one task at a time, strictly after StartBackgroundLane —
+	// tasks queue up as fast passes complete but never run before the
+	// daemon finishes warmup.
+	background *backgroundScheduler
 }
 
 // NewManager creates a Manager from configuration.
@@ -146,8 +152,357 @@ func NewManager(cfg Config, logger *zap.Logger) *Manager {
 		enrichStatus:    make(map[string]*EnrichmentStatus),
 		lifecycleCtx:    lifecycleCtx,
 		lifecycleCancel: lifecycleCancel,
+		background:      newBackgroundScheduler(logger),
 	}
 	return m
+}
+
+// StartBackgroundLane starts draining deferred deep-tier enrichment. The
+// daemon calls it once warmup is fully done (after end_batch) so the lane
+// never competes with the resolver or the fast passes; tasks enqueued by
+// earlier passes wait until then. Idempotent. The lane stops when ctx is
+// cancelled or the Manager closes, whichever comes first.
+//
+// roots (may be nil) drives the restart census: a warm restart runs no fast
+// passes for unchanged repos, so their pass-end enqueues never happen — the
+// census re-discovers undrained repos from provider state alone
+// (HasBackgroundWork reads markers and stamps, never a live server).
+func (m *Manager) StartBackgroundLane(ctx context.Context, g graph.Store, roots map[string]string) {
+	if m.config.Enabled {
+		m.backgroundCensus(g, roots)
+	}
+	m.background.start(ctx, g)
+}
+
+// BackgroundLaneStatus reports the background lane's progress for the
+// health surface.
+func (m *Manager) BackgroundLaneStatus() BackgroundLaneStatus {
+	return m.background.status()
+}
+
+// CloseBackgroundLane stops the background lane: it cancels the in-flight
+// drain (if any) and returns only after the drain observed the cancellation
+// — the mandatory-drain rule, so a store teardown can never close SQLite
+// under a lane writer. The daemon's shutdown cleanup chain calls this
+// directly (its teardown never reaches Manager.Close); Manager.Close also
+// runs it for other lifecycles. Idempotent.
+func (m *Manager) CloseBackgroundLane() {
+	m.background.close()
+}
+
+// CancelBackgroundDrains cancels any background drain of repoName whose
+// provider languages intersect langs (empty = every provider) and RETURNS
+// ONLY AFTER the drain exited, purging matching queued drains as well. A
+// repository mutation calls it before its first store write: the store's
+// node upsert is whole-row last-writer-wins, so a drain flushing stale node
+// copies behind a re-parse would clobber fresh rows and stamp state it
+// never visited. Pair with RequeueBackgroundForRepo after the mutation.
+func (m *Manager) CancelBackgroundDrains(repoName string, langs []string) {
+	m.background.cancelRepo(repoName, langKeySet(langs))
+}
+
+// HoldBackgroundMutations parks repoName's background-lane tasks at the
+// scheduler's dequeue gate until the returned release runs. A repository
+// mutation establishes its hold BEFORE CancelBackgroundDrains and releases
+// it only after its complete tail: cancellation clears the tasks that
+// exist, the hold catches the ones the mutation itself creates — above all
+// the pass-end enqueue of its own semantic tail, which is born with no
+// cooldown and would otherwise start a drain against rows the resolver and
+// derived passes are still writing. Refcounted; release is idempotent and
+// never nil.
+func (m *Manager) HoldBackgroundMutations(repoName string) func() {
+	return m.background.hold(repoName)
+}
+
+// SetBackgroundRepoRootResolver installs the live repository registry the
+// background lane consults immediately before draining a task: fn answers
+// (current root, tracked) for a repo name. A task whose stored root
+// disagrees — the repo was untracked mid-census, or its prefix re-tracked
+// at a different checkout — is dropped instead of spawning a server at an
+// abandoned root. fn must not block: it is called on the lane worker with
+// no scheduler locks held, but a drain waits on it.
+func (m *Manager) SetBackgroundRepoRootResolver(fn func(repoName string) (string, bool)) {
+	m.background.setRootResolver(fn)
+}
+
+// laneMutationCooldown is the quiet period a mutation-requeued drain waits
+// before becoming eligible; every further mutation of the repo slides the
+// window. Without it an editing session would start (and cancel) a drain —
+// a server spawn, and for C# a solution load — per save batch; with it the
+// session coalesces into one drain after its last save. Census and
+// pass-end enqueues carry no cooldown: a completed fast pass is the
+// designed trigger, not a competing writer.
+var laneMutationCooldown = 60 * time.Second
+
+// RequeueBackgroundForRepo revokes the drained claims the mutation
+// invalidated and re-enqueues the repo for the background lane. Called
+// after a repository mutation batch — its incremental enrichment included —
+// with the languages of the re-parsed / evicted files: providers whose
+// languages intersect get InvalidateBackground (the re-parse discarded
+// those files' progress stamps, so the completion marker no longer
+// describes the store) and re-enter the queue after laneMutationCooldown.
+// The re-drain is request-free for untouched files, whose stamps survive.
+// Callers pass the languages of rows that were actually cancelled or
+// rewritten — a mutation that touched nothing calls nothing.
+func (m *Manager) RequeueBackgroundForRepo(g graph.Store, repoName, repoRoot string, langs []string) {
+	if !m.config.Enabled || repoName == "" || repoRoot == "" {
+		return
+	}
+	set := langKeySet(langs)
+	if len(set) == 0 {
+		return
+	}
+	// The admission floor gates the requeue exactly as it gates the fast
+	// tier and the census: editing the lone file of an incidental language
+	// must not re-enter the lane for it (its drain could never record
+	// completion — see applyAdmissionFloor). The repo-scoped projection is
+	// the same grouped read the mutation's own semantic tail already pays;
+	// an empty projection is no evidence (a store without the capability),
+	// so it gates nothing — mirroring EnrichAll.
+	present, _, langCounts := m.repoLanguages(g, map[string]string{repoName: repoRoot})
+	if len(langCounts) > 0 {
+		applyAdmissionFloor(present, langCounts, EnrichmentAdmissionFloor())
+		for lang := range set {
+			if !present[lang] {
+				delete(set, lang)
+			}
+		}
+		if len(set) == 0 {
+			return
+		}
+	}
+	invalidateAndEnqueue := func(provider Provider) {
+		be, ok := provider.(BackgroundEnricher)
+		if !ok || !provider.Available() || m.providerDisabled(provider.Name()) {
+			return
+		}
+		if !anyLangPresent(provider.Languages(), set) {
+			return
+		}
+		// Fail OPEN on a failed revocation: the durable marker still claims
+		// the tier is drained, so HasBackgroundWork would suppress this
+		// requeue — and every restart's census after it. A conservative
+		// enqueue costs one request-free drain for files whose stamps
+		// survived; the suppressed alternative loses the mutated files'
+		// deep tier until the next commit moves the fast marker.
+		forced := false
+		if err := be.InvalidateBackground(g, repoName); err != nil {
+			// The force flag bypasses the MARKER gates, not the lane mode:
+			// a store hiccup while the lane is disabled must not spawn a
+			// drain in a mode where the lane never runs.
+			if gate, ok := be.(backgroundLaneGate); ok && !gate.BackgroundLaneEnabled() {
+				return
+			}
+			m.logger.Warn("background lane: marker invalidation failed; enqueuing conservatively",
+				zap.String("provider", provider.Name()),
+				zap.String("repo", repoName),
+				zap.Error(err))
+			// The stale claim also answers the dequeue-time re-check, so the
+			// task must carry the bypass or the scheduler drops it there.
+			forced = true
+		} else if !be.HasBackgroundWork(g, repoName) {
+			return
+		}
+		lang := ""
+		if ls := provider.Languages(); len(ls) > 0 {
+			lang = ls[0]
+		}
+		if m.background.enqueue(backgroundTask{
+			repoName: repoName, repoRoot: repoRoot, provider: provider, lang: lang,
+			notBefore: time.Now().Add(laneMutationCooldown), force: forced,
+		}) {
+			m.logger.Info("background lane: repository mutation requeued repo",
+				zap.String("provider", provider.Name()),
+				zap.String("repo", repoName),
+			)
+		}
+	}
+	for _, p := range m.providers {
+		invalidateAndEnqueue(p)
+	}
+	if !m.config.EagerLSP || m.lspRouter == nil {
+		return
+	}
+	peekRouter, canPeek := m.lspRouter.(backgroundPeekRouter)
+	if !canPeek {
+		return
+	}
+	for _, name := range m.routerCensusWinners(set, true) {
+		provider, err := peekRouter.PeekProviderForSpec(name)
+		if err != nil {
+			continue
+		}
+		invalidateAndEnqueue(provider)
+	}
+}
+
+// langKeySet lifts a language slice into the set form the scheduler and the
+// census gates share, dropping empties.
+func langKeySet(langs []string) map[string]bool {
+	set := make(map[string]bool, len(langs))
+	for _, l := range langs {
+		if l != "" {
+			set[l] = true
+		}
+	}
+	return set
+}
+
+// backgroundPeekRouter is the optional router capability the census needs:
+// a provider VALUE for a spec without pinning or lazily spawning its server.
+// The census only reads markers (HasBackgroundWork) and the drain spawns its
+// own dedicated instance, so no live server is ever required.
+type backgroundPeekRouter interface {
+	PeekProviderForSpec(name string) (Provider, error)
+}
+
+// backgroundCensus enqueues every (repo, provider) pair whose deferred tier
+// is undrained. It mirrors EnrichAll's eligibility gates (availability,
+// disablement, language presence, the admission floor) AND its per-language
+// spec arbitration — a spec the fast tier rejects (arbitration loser,
+// below-floor language) never runs a fast pass, never earns a fast marker,
+// and would therefore drain (spawning a rejected server) on every restart,
+// forever. Admission is PER REPOSITORY, matching production foreground
+// enrichment (each indexer enriches its own root): two sub-floor repos must
+// not vouch for each other's language, and a Go repo must not make the
+// census queue the Go provider for its Python neighbor. One grouped
+// projection still covers all repos — see repoLanguagesPerRepo.
+func (m *Manager) backgroundCensus(g graph.Store, roots map[string]string) {
+	if len(roots) == 0 {
+		return
+	}
+	perRepo, nodeCounts := m.repoLanguagesPerRepo(g, roots)
+	floor := EnrichmentAdmissionFloor()
+	// admitted resolves each repo's floored presence set once; gate reports
+	// whether that repo yielded any evidence at all (an evidence-free store
+	// gates nothing, mirroring EnrichAll).
+	type repoAdmission struct {
+		present map[string]bool
+		gate    bool
+	}
+	admitted := make(map[string]*repoAdmission, len(roots))
+	for repoName := range roots {
+		rc := perRepo[repoName]
+		if rc == nil {
+			admitted[repoName] = &repoAdmission{present: map[string]bool{}}
+			continue
+		}
+		if below := applyAdmissionFloor(rc.present, rc.langCounts, floor); len(below) > 0 {
+			m.logger.Info("background lane: census skipping languages below admission floor",
+				zap.String("repo", repoName),
+				zap.Any("skipped", below))
+		}
+		admitted[repoName] = &repoAdmission{present: rc.present, gate: len(rc.langCounts) > 0}
+	}
+
+	enqueue := func(repoName, repoRoot string, provider Provider) {
+		langs := provider.Languages()
+		lang := ""
+		if len(langs) > 0 {
+			lang = langs[0]
+		}
+		if m.background.enqueue(backgroundTask{repoName: repoName, repoRoot: repoRoot, provider: provider, lang: lang}) {
+			m.logger.Info("background lane: census enqueued undrained repo",
+				zap.String("provider", provider.Name()),
+				zap.String("repo", repoName),
+			)
+		}
+	}
+
+	repoNames := sortedRootNames(roots, nodeCounts)
+	for _, repoName := range repoNames {
+		adm := admitted[repoName]
+		for _, p := range m.providers {
+			be, ok := p.(BackgroundEnricher)
+			if !ok || !p.Available() || m.providerDisabled(p.Name()) {
+				continue
+			}
+			if adm.gate && !anyLangPresent(p.Languages(), adm.present) {
+				continue
+			}
+			if !be.HasBackgroundWork(g, repoName) {
+				continue
+			}
+			enqueue(repoName, repoRoot(roots, repoName), p)
+		}
+	}
+
+	// Router-backed specs, only when the operator eager-enriches: with
+	// EagerLSP off no fast tier runs, so there is no deferred delta to
+	// complement. The census goes through the spawn-free peek —
+	// ProviderForSpecWorkspace would pin AND lazily spawn a server per
+	// (spec, repo) just to read two markers. Winners are arbitrated per
+	// repo (pure metadata, no scan): the winning spec for a language can
+	// only drain the repos that contain that language.
+	if !m.config.EagerLSP || m.lspRouter == nil {
+		return
+	}
+	peekRouter, canPeek := m.lspRouter.(backgroundPeekRouter)
+	if !canPeek {
+		m.logger.Debug("background lane: router lacks the spawn-free peek; skipping router census")
+		return
+	}
+	for _, repoName := range repoNames {
+		adm := admitted[repoName]
+		for _, name := range m.routerCensusWinners(adm.present, adm.gate) {
+			provider, err := peekRouter.PeekProviderForSpec(name)
+			if err != nil {
+				continue
+			}
+			be, ok := provider.(BackgroundEnricher)
+			if !ok {
+				continue
+			}
+			if !be.HasBackgroundWork(g, repoName) {
+				continue
+			}
+			enqueue(repoName, repoRoot(roots, repoName), provider)
+		}
+	}
+}
+
+func repoRoot(roots map[string]string, name string) string { return roots[name] }
+
+// routerCensusWinners mirrors EnrichAll's pre-spawn spec arbitration: eager
+// providers own their languages, and among router specs the lowest priority
+// number wins each remaining present language (ties by name). Pure metadata
+// reads — no spawn.
+func (m *Manager) routerCensusWinners(present map[string]bool, gateOnPresence bool) []string {
+	langProviders := m.selectProviders()
+	bestSpec := make(map[string]string)
+	bestPrio := make(map[string]int)
+	for _, name := range m.lspRouter.EnabledSpecNames() {
+		if !m.lspRouter.SpecAvailable(name) {
+			continue
+		}
+		prio := m.lspRouter.SpecPriority(name)
+		if cfgPrio, ok := m.configPriorityFor(name); ok {
+			prio = cfgPrio
+		}
+		for _, lang := range m.lspRouter.SpecLanguages(name) {
+			if _, eagerCovered := langProviders[lang]; eagerCovered {
+				continue
+			}
+			if gateOnPresence && !present[lang] {
+				continue
+			}
+			cur, exists := bestSpec[lang]
+			if !exists || prio < bestPrio[lang] || (prio == bestPrio[lang] && name < cur) {
+				bestSpec[lang] = name
+				bestPrio[lang] = prio
+			}
+		}
+	}
+	seen := make(map[string]bool)
+	winners := make([]string, 0, len(bestSpec))
+	for _, name := range bestSpec {
+		if !seen[name] {
+			seen[name] = true
+			winners = append(winners, name)
+		}
+	}
+	sort.Strings(winners)
+	return winners
 }
 
 var errManagerClosed = errors.New("semantic manager is closed")
@@ -360,19 +715,10 @@ func (m *Manager) EnrichAll(g graph.Store, roots map[string]string, opts EnrichO
 	// nodeCounts (enrichable nodes per repo) feeds the size-scaled per-repo
 	// deadline — see enrichRepoTimeout.
 	present, nodeCounts, langCounts := m.repoLanguages(g, roots)
-	if floor := opts.MinLanguageNodes; floor > 0 {
-		below := make(map[string]int)
-		for lang, count := range langCounts {
-			if count < floor {
-				below[lang] = count
-				delete(present, lang)
-			}
-		}
-		if len(below) > 0 {
-			m.logger.Info("semantic enrichment: languages below admission floor",
-				zap.Int("floor", floor),
-				zap.Any("skipped", below))
-		}
+	if below := applyAdmissionFloor(present, langCounts, opts.MinLanguageNodes); len(below) > 0 {
+		m.logger.Info("semantic enrichment: languages below admission floor",
+			zap.Int("floor", opts.MinLanguageNodes),
+			zap.Any("skipped", below))
 	}
 	// A caller-supplied language set narrows what the census found. It is an
 	// intersection rather than a replacement: the list says which languages
@@ -551,11 +897,39 @@ func (m *Manager) EnrichAll(g graph.Store, roots map[string]string, opts EnrichO
 // composition signal EnrichAll orders providers by (primary language first).
 func (m *Manager) repoLanguages(g graph.Store, roots map[string]string) (map[string]bool, map[string]int, map[string]int) {
 	present := make(map[string]bool)
-	counts := make(map[string]int, len(roots))
 	// langCounts is the enrichable-node count per language across all repos —
 	// the composition signal EnrichAll ranks providers by so the dominant
 	// language enriches first.
 	langCounts := make(map[string]int)
+	perRepo, counts := m.repoLanguagesPerRepo(g, roots)
+	for _, rc := range perRepo {
+		for lang := range rc.present {
+			present[lang] = true
+		}
+		for lang, count := range rc.langCounts {
+			langCounts[lang] += count
+		}
+	}
+	return present, counts, langCounts
+}
+
+// repoLangCensus is one repository's language evidence for admission
+// decisions: which languages its own rows make present and how many
+// enrichable nodes each holds.
+type repoLangCensus struct {
+	present    map[string]bool
+	langCounts map[string]int
+}
+
+// repoLanguagesPerRepo groups the repo-language projection PER REPOSITORY
+// (plus enrichable-node totals per repo, for deadline scaling and ordering).
+// The background census keys admission off this rather than the aggregate
+// view above: presence and the admission floor are each repo's own facts —
+// aggregation would let two sub-floor repos vouch for each other, or a Go
+// repo make its neighbor's Python tree "contain" Go.
+func (m *Manager) repoLanguagesPerRepo(g graph.Store, roots map[string]string) (map[string]*repoLangCensus, map[string]int) {
+	perRepo := make(map[string]*repoLangCensus, len(roots))
+	counts := make(map[string]int, len(roots))
 	repoPrefixes := make([]string, 0, len(roots))
 	for repoPrefix := range roots {
 		repoPrefixes = append(repoPrefixes, repoPrefix)
@@ -581,11 +955,42 @@ func (m *Manager) repoLanguages(g graph.Store, roots map[string]string) (map[str
 		if IsFixtureCensusPath(row.FilePath) {
 			continue
 		}
-		present[row.Language] = true
+		rc := perRepo[row.RepoPrefix]
+		if rc == nil {
+			rc = &repoLangCensus{present: map[string]bool{}, langCounts: map[string]int{}}
+			perRepo[row.RepoPrefix] = rc
+		}
+		rc.present[row.Language] = true
+		rc.langCounts[row.Language] += row.Count
 		counts[row.RepoPrefix] += row.Count
-		langCounts[row.Language] += row.Count
 	}
-	return present, counts, langCounts
+	return perRepo, counts
+}
+
+// applyAdmissionFloor removes from present every language whose enrichable
+// node count is under floor (0 = disabled), returning the removed languages
+// with their counts for logging. Shared by the index-time EnrichAll
+// admission, the restart census, and the mutation requeue, so every
+// lane-eligibility decision applies the same size gate: a language too
+// small for the fast tier must not spawn a deferred drain either — with no
+// fast pass there is no fast marker, the drain could never record
+// completion, and the lane would re-spawn its server for the same
+// incidental subtree on every restart, forever.
+func applyAdmissionFloor(present map[string]bool, langCounts map[string]int, floor int) map[string]int {
+	if floor <= 0 {
+		return nil
+	}
+	var below map[string]int
+	for lang, count := range langCounts {
+		if count < floor {
+			if below == nil {
+				below = make(map[string]int)
+			}
+			below[lang] = count
+			delete(present, lang)
+		}
+	}
+	return below
 }
 
 // anyLangPresent reports whether any of langs is in the present set.
@@ -1293,6 +1698,19 @@ func (m *Manager) runEnrichOne(g graph.Store, repoName, repoRoot, lang string, p
 			m.recordEnrichMarker(g, repoName, provider.Name(), rs, result.CoveragePercent)
 		}
 
+		// A pass that deliberately skipped its deep tier hands the remainder
+		// to the background lane. Partial passes enqueue too — whatever the
+		// fast tier missed, the deferred tier is still undrained. The lane
+		// holds the task until the daemon's StartBackgroundLane.
+		if be, ok := provider.(BackgroundEnricher); ok && be.HasBackgroundWork(g, repoName) {
+			m.background.enqueue(backgroundTask{
+				repoName: repoName,
+				repoRoot: repoRoot,
+				provider: provider,
+				lang:     lang,
+			})
+		}
+
 		m.logger.Info("semantic enrichment complete",
 			zap.String("provider", provider.Name()),
 			zap.String("language", lang),
@@ -1576,6 +1994,12 @@ func (m *Manager) Close() error {
 		providers := append([]Provider(nil), m.providers...)
 		router := m.lspRouter
 		m.lifecycleMu.Unlock()
+
+		// Stop the background lane BEFORE closing providers — an in-flight
+		// drain runs against a provider-owned server, and close waits for
+		// the drain to observe cancellation (mandatory-drain, same rule as
+		// foreground passes).
+		m.background.close()
 
 		var errs []error
 		for _, p := range providers {

@@ -3,6 +3,7 @@ package lsp
 import (
 	"bufio"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -102,7 +103,16 @@ type SpawnTransport struct {
 	// stderr silently (no log spam, but also no visibility).
 	Logger *zap.Logger
 
+	// LowPriority starts the server at below-normal OS priority — set by
+	// the background lane's drain instance so its CPU burn never starves
+	// foreground work. No-op on platforms without the treatment.
+	LowPriority bool
+
 	cmd *exec.Cmd
+	// stopOnce / stopErr memoize the reap: cmd.Wait may only run once, and
+	// Shutdown's re-entry path calls Stop again.
+	stopOnce sync.Once
+	stopErr  error
 }
 
 // Start spawns the subprocess and returns its stdin / stdout. Errors
@@ -113,6 +123,9 @@ type SpawnTransport struct {
 func (s *SpawnTransport) Start() (io.WriteCloser, io.Reader, error) {
 	cmd := exec.Command(s.Command, s.Args...)
 	platform.ConfigureBackgroundCommand(cmd)
+	if s.LowPriority {
+		platform.ConfigureLowPriorityCommand(cmd)
+	}
 	cmd.Dir = s.WorkspaceRoot
 	if len(s.Env) > 0 {
 		cmd.Env = append(os.Environ(), s.Env...)
@@ -137,12 +150,32 @@ func (s *SpawnTransport) Start() (io.WriteCloser, io.Reader, error) {
 	return stdin, stdout, nil
 }
 
-// Stop closes stdin and waits for the subprocess to exit.
+// spawnStopGrace bounds how long Stop waits for a spawned server to exit
+// voluntarily (the shutdown/exit handshake and the stdin EOF the Client
+// delivered just before) before killing it. Teardown must ALWAYS return —
+// a background drain's cancelRepo waiter, and therefore a repository
+// mutation, can be sitting behind a Provider.Close. Var so tests shrink it.
+var spawnStopGrace = 5 * time.Second
+
+// Stop reaps the subprocess: a bounded wait for voluntary exit, then a
+// hard kill. The Wait after Kill collects the zombie either way, and the
+// pipe-reader goroutines (stdout framing, stderr watcher) unblock on the
+// dying process's EOFs. Idempotent — the first outcome is memoized.
 func (s *SpawnTransport) Stop() error {
 	if s.cmd == nil || s.cmd.Process == nil {
 		return nil
 	}
-	return s.cmd.Wait()
+	s.stopOnce.Do(func() {
+		waited := make(chan error, 1)
+		go func() { waited <- s.cmd.Wait() }()
+		select {
+		case s.stopErr = <-waited:
+		case <-time.After(spawnStopGrace):
+			_ = s.cmd.Process.Kill()
+			s.stopErr = <-waited
+		}
+	})
+	return s.stopErr
 }
 
 // SendsShutdown returns true: gortex owns the subprocess, so it must
@@ -323,6 +356,15 @@ func (c *Client) Done() <-chan struct{} { return c.done }
 // completed, leaving the (possibly slow) cold-workspace load unbounded.
 func (c *Client) SetCallTimeout(d time.Duration) { c.callTimeout.Store(int64(d)) }
 
+// errCallTimeout marks a Call that burned its whole per-request budget
+// with no reply — the failure class the timeout-streak breaker counts,
+// distinct from a server that answers with an error.
+var errCallTimeout = errors.New("timeout")
+
+// isCallTimeout reports whether err is a Call that exhausted its
+// per-request budget (Client.Call's timeout arm), through any wrapping.
+func isCallTimeout(err error) bool { return errors.Is(err, errCallTimeout) }
+
 // Call sends a request and waits for the response.
 func (c *Client) Call(method string, params any, result any) error {
 	id := c.reqID.Add(1)
@@ -365,7 +407,18 @@ func (c *Client) Call(method string, params any, result any) error {
 	case <-c.done:
 		return fmt.Errorf("LSP server exited")
 	case <-timeout:
-		return fmt.Errorf("LSP call %s: timeout after %s", method, time.Duration(c.callTimeout.Load()))
+		// Best-effort cancel: tell the server to stop computing the
+		// abandoned request ($/cancelRequest is base protocol — every
+		// server must tolerate it, though whether it aborts the work
+		// varies). Without it a slow server keeps burning CPU on an
+		// answer nobody will read, saturating its slots for minutes.
+		// Fire-and-forget on a goroutine: a server wedged hard enough
+		// to stop draining stdin must not turn the notify's blocking
+		// write into a second hang of the Call we are unblocking. The
+		// send error is ignored — the call is already failing with
+		// timeout, and a dead pipe must not mask that.
+		go func() { _ = c.Notify("$/cancelRequest", map[string]any{"id": id}) }()
+		return fmt.Errorf("LSP call %s: %w after %s", method, errCallTimeout, time.Duration(c.callTimeout.Load()))
 	}
 }
 
@@ -395,17 +448,35 @@ func (c *Client) Shutdown() error {
 		}
 		return nil
 	}
-	c.closed = true
-	close(c.done)
 	sendsShutdown := c.transport != nil && c.transport.SendsShutdown()
 	c.mu.Unlock()
 
 	if sendsShutdown {
-		// Best-effort handshake — the server may already be gone.
-		// The shutdown/exit pair tells a server we own ("we spawned
-		// it") to free per-workspace state and exit cleanly.
-		_ = c.Call("shutdown", nil, nil)
+		// Best-effort handshake, BEFORE the client refuses sends (send
+		// rejects once closed — issuing it after marking closed silently
+		// delivered nothing). Fire-and-forget: the shutdown request's
+		// reply is never awaited, so a wedged server can't block teardown
+		// — the server reads its stdin sequentially and sees the pair in
+		// order, which is all a clean exit needs.
+		_ = c.send(jsonRPCRequest{JSONRPC: "2.0", ID: c.reqID.Add(1), Method: "shutdown"})
 		_ = c.Notify("exit", nil)
+	}
+
+	c.mu.Lock()
+	if c.closed {
+		// Lost a race with a concurrent Shutdown (or the read loop's own
+		// close); that path owns the teardown.
+		c.mu.Unlock()
+		if c.transport != nil {
+			_ = c.transport.Stop()
+		}
+		return nil
+	}
+	c.closed = true
+	close(c.done)
+	c.mu.Unlock()
+
+	if sendsShutdown {
 		_ = c.stdin.Close()
 	}
 

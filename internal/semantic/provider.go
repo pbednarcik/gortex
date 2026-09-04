@@ -92,6 +92,52 @@ type ContextEnricher interface {
 	EnrichRepoContext(ctx context.Context, g graph.Store, repoPrefix, repoRoot string, deadline EnrichDeadlinePolicy) (*EnrichResult, error)
 }
 
+// BackgroundEnricher is an optional interface a Provider MAY implement to
+// declare deferred deep-tier work — enrichment deliberately skipped by the
+// fast pass (heavy request classes, expensive sweeps) that should drain
+// after the workspace is queryable, without blocking it. The background
+// lane runs one drain at a time, after warmup, on the provider's own
+// terms: EnrichBackground must honor ctx cancellation and persist progress
+// incrementally so a cancelled drain resumes where it stopped rather than
+// restarting.
+type BackgroundEnricher interface {
+	// HasBackgroundWork reports whether the repo has an undrained deep
+	// tier. Called at enqueue AND again at dequeue — the state may have
+	// drained (or the mode may have changed) between the two.
+	HasBackgroundWork(g graph.Store, repoPrefix string) bool
+	// EnrichBackground drains the deferred tier for the repo.
+	EnrichBackground(ctx context.Context, g graph.Store, repoPrefix, repoRoot string) (*EnrichResult, error)
+	// InvalidateBackground drops any recorded "tier drained" claim for the
+	// repo. Called after a repository mutation re-parsed files of the
+	// provider's languages: the re-parse discarded those files' progress
+	// stamps, so HasBackgroundWork must answer true again until a fresh
+	// drain completes — the drain itself stays cheap for untouched files,
+	// whose stamps survive. A non-nil error means the claim may STILL
+	// stand (the revoking write or its read failed) — the caller must not
+	// trust HasBackgroundWork afterwards and should enqueue conservatively,
+	// or the stale claim suppresses the repo's work across restarts.
+	InvalidateBackground(g graph.Store, repoPrefix string) error
+}
+
+// BackgroundProgressReporter is implemented by providers that can describe
+// an in-flight background drain. The scheduler type-asserts it when it
+// builds the lane status; a provider that does not implement it simply
+// shows no progress detail. The ok result is false when nothing is
+// draining, so a stale snapshot is never mistaken for a live one.
+type BackgroundProgressReporter interface {
+	LaneProgress() (LaneProgress, bool)
+}
+
+// backgroundLaneGate is an optional refinement a BackgroundEnricher MAY
+// implement: whether the lane can run for this provider AT ALL (mode and
+// construction), independent of any completion marker. The fail-open
+// requeue consults it — a forced task bypasses the marker gates because
+// the marker is untrustworthy, but must never run in a mode where the
+// lane is disabled.
+type backgroundLaneGate interface {
+	BackgroundLaneEnabled() bool
+}
+
 // PreselectionDeadlineEnricher marks a ContextEnricher whose expensive work
 // begins before it can count a post-filter candidate frontier (for example a
 // SCIP provider must first run its external indexer). The Manager gives these
@@ -185,6 +231,12 @@ type EnrichResult struct {
 	// hover types and hierarchy edges are absent. DegradedReason carries why.
 	Degraded       bool   `json:"degraded,omitempty"`
 	DegradedReason string `json:"degraded_reason,omitempty"`
+	// BreakerTripped reports that a request-failure breaker abandoned part
+	// of the pass (consecutive server errors on the targeted or hover leg).
+	// The counters reflect what landed, but the pass's silence about the
+	// rest is error-shaped, not evidence of emptiness — completion markers
+	// must not treat such a pass as having drained its tier.
+	BreakerTripped bool `json:"breaker_tripped,omitempty"`
 }
 
 // Bounding reasons for the enrichment add-phase (EnrichResult.BoundReason /

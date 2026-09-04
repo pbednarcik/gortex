@@ -20,6 +20,7 @@ import (
 // is the load-bearing fix: without it such a server confirms existing edges
 // but never adds the dispatch call sites it can enumerate (edges_added 0).
 func TestLSP_Provider_ReferencesAddPass_AddsCallEdges(t *testing.T) {
+	t.Setenv(HeavyRequestsEnv, "")
 	repoRoot := t.TempDir()
 	require.NoError(t, os.WriteFile(
 		filepath.Join(repoRoot, "handler.php"),
@@ -100,9 +101,76 @@ func TestLSP_Provider_ReferencesAddPass_AddsCallEdges(t *testing.T) {
 	}
 }
 
+// Error-shaped skips inside the references-add pass must feed the drain
+// ledger: for a references-only server this pass IS the deferred tier, and
+// a lane drain that lost targets to acquire / references failures would
+// otherwise report clean and record its completion marker over them — no
+// retry would ever revisit the failed targets.
+func TestLSP_Provider_ReferencesAddPass_ErrorsFeedDrainLedger(t *testing.T) {
+	t.Setenv(HeavyRequestsEnv, "background")
+	repoRoot := t.TempDir()
+	require.NoError(t, os.WriteFile(
+		filepath.Join(repoRoot, "handler.php"),
+		[]byte("<?php\ninterface HandlerInterface {\n    public function handle(array $record): bool;\n}\n"),
+		0o644,
+	))
+	require.NoError(t, os.WriteFile(
+		filepath.Join(repoRoot, "app.php"),
+		[]byte("<?php\nfunction run(HandlerInterface $h): void {\n    $h->handle([]);\n}\n"),
+		0o644,
+	))
+
+	server := newFakeLSPServer()
+	server.handle("textDocument/references", func(json.RawMessage) (any, *jsonRPCError) {
+		return nil, &jsonRPCError{Code: -32603, Message: "references worker crashed"}
+	})
+
+	p, cleanup := providerWithFakeServer(t, server, []string{"php"})
+	defer cleanup()
+	// References-only server: no call hierarchy → the references-add pass runs.
+	p.caps = ServerCapabilities{ReferencesProvider: true, HoverProvider: true}
+	p.heavyDelta = true
+	p.noHeavyRequests = false
+
+	g := graph.New()
+	g.AddNode(&graph.Node{
+		ID: "handler.php::HandlerInterface", Kind: graph.KindInterface, Name: "HandlerInterface",
+		FilePath: "handler.php", StartLine: 2, EndLine: 4, Language: "php",
+	})
+	g.AddNode(&graph.Node{
+		ID: "handler.php::HandlerInterface.handle", Kind: graph.KindMethod, Name: "handle",
+		FilePath: "handler.php", StartLine: 3, EndLine: 3, Language: "php",
+		Meta: map[string]any{"receiver": "HandlerInterface"},
+	})
+	g.AddNode(&graph.Node{
+		ID: "app.php::run", Kind: graph.KindFunction, Name: "run",
+		FilePath: "app.php", StartLine: 2, EndLine: 4, Language: "php",
+	})
+
+	var result *semantic.EnrichResult
+	done := make(chan error, 1)
+	go func() {
+		r, err := p.Enrich(g, repoRoot)
+		result = r
+		done <- err
+	}()
+	select {
+	case err := <-done:
+		require.NoError(t, err)
+	case <-time.After(5 * time.Second):
+		t.Fatal("Enrich timed out")
+	}
+
+	require.NotNil(t, result)
+	require.True(t, result.ReferencesAddPass, "fixture sanity: the references-add pass must have run")
+	assert.True(t, result.Partial,
+		"a heavyDelta pass whose references-add targets errored must be partial, not clean")
+}
+
 // Two reference sites from one caller collapse to a single minted edge whose
 // extra site is recorded in call_sites (so find_usages still renders both).
 func TestLSP_Provider_ReferencesAddPass_RecordsMultipleSites(t *testing.T) {
+	t.Setenv(HeavyRequestsEnv, "")
 	repoRoot := t.TempDir()
 	require.NoError(t, os.WriteFile(
 		filepath.Join(repoRoot, "handler.php"),
