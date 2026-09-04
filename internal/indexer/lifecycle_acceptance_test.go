@@ -610,9 +610,9 @@ func TestLifecycleZeroChangeReconcilePreservesLaneWork(t *testing.T) {
 // classification knows which files inside changed — so the precise cancel
 // must come from the real stale set, not the caller's path list.
 func TestLifecycleDirectoryScopeReindexCancelsLaneDrain(t *testing.T) {
-	// The graph keys subdirectory files with OS-native separators (see
-	// graphRelKey) — the watched path must match the stored form.
-	mi, bg, repo := laneBracketHarnessWith(t, "repo/"+filepath.FromSlash("sub/lib.go"), func(dir string) {
+	// Graph keys are slash-separated on every platform (see relKey) — the
+	// watched path must match the stored form, not the OS-native one.
+	mi, bg, repo := laneBracketHarnessWith(t, "repo/sub/lib.go", func(dir string) {
 		require.NoError(t, os.MkdirAll(filepath.Join(dir, "sub"), 0o755))
 		writeFile(t, filepath.Join(dir, "sub", "lib.go"), "package sub\n\nfunc Lib() {}\n")
 	})
