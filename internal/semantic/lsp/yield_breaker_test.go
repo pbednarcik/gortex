@@ -166,3 +166,25 @@ func TestPhaseBreakerTimeoutArmDisabled(t *testing.T) {
 		t.Fatal("timeoutLimit <= 0 must disable the timeout arm")
 	}
 }
+
+// The two arms are independent: with the zero-yield arm disabled
+// (GORTEX_LSP_BREAKER=0) the timeout arm still means CONSECUTIVE timeouts,
+// so an answer between two timeouts must reset its streak. Returning early
+// from observe() on a disabled zero-yield arm silently turned the streak
+// into a lifetime count.
+func TestPhaseBreakerZeroYieldArmDisabledStillResetsTimeoutStreak(t *testing.T) {
+	b := newPhaseBreaker(0, 3, nil, "targeted", "repo")
+	b.observeTimeout()
+	b.observe(true)
+	b.observeTimeout()
+	b.observe(true)
+	b.observeTimeout()
+	if b.isTripped() {
+		t.Fatal("three timeouts separated by answers are not a streak; the timeout arm must not trip")
+	}
+	b.observeTimeout()
+	b.observeTimeout()
+	if !b.isTripped() {
+		t.Fatal("an unbroken streak must still trip with the zero-yield arm disabled")
+	}
+}

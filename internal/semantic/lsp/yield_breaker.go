@@ -84,10 +84,13 @@ func newPhaseBreaker(limit, timeoutLimit int, logger *zap.Logger, phase, repo st
 }
 
 // observe records one server interaction. Any success permanently disarms the
-// breaker for this phase; failures only count while no success has ever been
-// seen. Safe for concurrent use from the phase's worker goroutines.
+// zero-yield arm for this phase; failures only count while no success has ever
+// been seen. A success also resets the timeout streak, whether or not the
+// zero-yield arm is enabled — the arms are independent, and with
+// GORTEX_LSP_BREAKER=0 the timeout arm must still mean CONSECUTIVE timeouts.
+// Safe for concurrent use from the phase's worker goroutines.
 func (b *phaseBreaker) observe(success bool) {
-	if b == nil || b.limit <= 0 || b.tripped.Load() {
+	if b == nil || b.tripped.Load() {
 		return
 	}
 	if success {
@@ -96,7 +99,7 @@ func (b *phaseBreaker) observe(success bool) {
 		b.timeoutFails.Store(0)
 		return
 	}
-	if b.everOK.Load() {
+	if b.limit <= 0 || b.everOK.Load() {
 		return
 	}
 	if b.fails.Add(1) >= b.limit && !b.everOK.Load() {
