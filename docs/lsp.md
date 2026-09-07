@@ -447,10 +447,15 @@ on a target parks that target with a timeout verdict (counted as
 until its file reparses and the node is minted afresh. Without that, the
 whales sit at the front of every retry's confirm frontier, saturate the
 server, trip the timeout-streak breaker, and a fresh index never converges.
-A timeout parks its target only when the server answered some other
-references request issued after it, which is what tells a whale from a
-wedged server: a timeout with no later answer goes on the error ledger and
-the target retries on the next drain.
+A timeout parks its target only when the server completed some other
+references answer after the request went out, which is what tells a whale
+from a wedged server: a timeout the server answered nothing after goes on
+the error ledger and the target retries on the next drain. The evidence is
+about the server, not the target: a request starved behind a busy serial
+server can time out and be parked while the server was merely slow, leaving
+that target's edges at their static confidence until its file reparses. The
+lane accepts that cost against the alternative measured on a fresh index of
+a large solution, a drain that never converges.
 
 The drain instance also carries its own concurrency width. It inherits the
 foreground's resolved width but clamps it at 4: the lane optimizes for

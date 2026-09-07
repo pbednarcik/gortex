@@ -1576,11 +1576,17 @@ func (p *Provider) EnrichRepoContext(ctx context.Context, g graph.Store, repoPre
 	}
 	var refsTimeouts []parkedRef
 	// lastRefsAnswer is the unix-nano time of the most recent references
-	// request the server ANSWERED this pass. It is the evidence that tells a
-	// whale from a wedge: a target whose request timed out while the server
-	// kept answering requests issued after it is a whale and is parked; a
-	// timeout with no later answer says nothing about the target (the
-	// server stopped answering everything) and goes on the error ledger.
+	// answer the server COMPLETED this pass. It is the evidence that tells a
+	// whale from a wedge: a request that timed out while the server went on
+	// completing other references answers was outstanding on a live server,
+	// so the request, not the server, was the problem, and its target is
+	// parked; a timeout after which the server completed nothing says
+	// nothing about the target (the server stopped answering everything)
+	// and goes on the error ledger. The evidence is about the server, not
+	// the target: a request starved behind a busy serial server can time out
+	// and park while the server was merely slow. That costs one target its
+	// upgrade until its file reparses; the alternative, measured live, is a
+	// fresh index whose drain never converges.
 	var lastRefsAnswer atomic.Int64
 	// Confirm targets skipped by the terminal-unconfirmable policy (see
 	// terminalUnconfirmable) — surfaced on the completion log so a drain
@@ -1774,12 +1780,13 @@ func (p *Provider) EnrichRepoContext(ctx context.Context, g graph.Store, repoPre
 		wg.Wait()
 	}
 	// Whale or wedge: a timed-out target is parked only when the server
-	// answered some other references request issued AFTER it — proof the
-	// server was alive and this one request was the problem. Several whales
-	// issued together trip the streak breaker exactly like a wedge does, so
-	// the breaker cannot be the discriminator; the answers can. A timeout
-	// with no later answer goes on the error ledger as before: the drain
-	// reports partial and the target retries on the next drain.
+	// completed some other references answer AFTER the request went out —
+	// proof the server was alive while this request was outstanding, so the
+	// request was the problem. Several whales issued together trip the
+	// streak breaker exactly like a wedge does, so the breaker cannot be the
+	// discriminator; the answers can. A timeout with no later answer goes on
+	// the error ledger as before: the drain reports partial and the target
+	// retries on the next drain.
 	var refsTimeoutIDs []string
 	answeredUntil := lastRefsAnswer.Load()
 	for _, pr := range refsTimeouts {
