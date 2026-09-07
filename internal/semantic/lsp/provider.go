@@ -2000,6 +2000,14 @@ func (p *Provider) EnrichRepoContext(ctx context.Context, g graph.Store, repoPre
 		// drain-error ledger — returning clean here would let the lane
 		// record its completion marker over never-adjudicated targets.
 		result.BreakerTripped = targetedBreaker.isTripped()
+		if p.heavyDelta && result.BreakerTripped {
+			// The abandoned phase left its remaining targets unvisited.
+			// Timeout parking can leave the error ledger empty (the
+			// timeouts became verdicts), so the trip itself must mark the
+			// pass partial or the scheduler counts it drained and never
+			// retries.
+			result.Partial = true
+		}
 		if p.heavyDelta && drainErrs.total() > 0 {
 			result.Partial = true
 			if p.logger != nil {
@@ -2661,6 +2669,13 @@ func (p *Provider) EnrichRepoContext(ctx context.Context, g graph.Store, repoPre
 	)
 
 	result.BreakerTripped = targetedBreaker.isTripped() || hoverBreaker.isTripped()
+	if p.heavyDelta && result.BreakerTripped {
+		// An abandoned phase is incomplete whatever the ledger says: with
+		// timeout parking the whale timeouts are verdicts, not errors, and
+		// nothing else would mark the pass partial. The marker predicate
+		// already refuses a tripped drain; the scheduler keys on Partial.
+		result.Partial = true
+	}
 	if p.heavyDelta && drainErrs.total() > 0 {
 		// Per-node honesty left the errored nodes unstamped; pass-level
 		// honesty keeps the completion marker away too. Partial, not an

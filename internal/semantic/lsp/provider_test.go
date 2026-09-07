@@ -27,19 +27,64 @@ import (
 
 type fakeLSPServer struct {
 	handlers map[string]func(params json.RawMessage) (any, *jsonRPCError)
+	// async names the methods whose handler runs on its own goroutine, so a
+	// handler that sleeps (a whale request) does not block the read loop and
+	// the server keeps answering everything else — the shape of a real server
+	// that is alive but stuck on one request. Synchronous handlers block the
+	// loop, which is the shape of a wedged server.
+	async map[string]bool
 
 	mu       sync.Mutex
 	notifLog []string
+	outMu    sync.Mutex // one framed response at a time on out
 }
 
 func newFakeLSPServer() *fakeLSPServer {
 	return &fakeLSPServer{
 		handlers: make(map[string]func(json.RawMessage) (any, *jsonRPCError)),
+		async:    make(map[string]bool),
 	}
 }
 
 func (f *fakeLSPServer) handle(method string, fn func(params json.RawMessage) (any, *jsonRPCError)) {
 	f.handlers[method] = fn
+	delete(f.async, method)
+}
+
+// handleAsync registers fn like handle but runs each invocation on its own
+// goroutine, so the read loop keeps serving other requests while fn blocks.
+func (f *fakeLSPServer) handleAsync(method string, fn func(params json.RawMessage) (any, *jsonRPCError)) {
+	f.handlers[method] = fn
+	f.async[method] = true
+}
+
+// respond runs the handler (or the null default) and writes the framed
+// response under outMu, so concurrent async handlers never interleave frames.
+func (f *fakeLSPServer) respond(out io.Writer, id int64, h func(json.RawMessage) (any, *jsonRPCError), params json.RawMessage) {
+	resp := jsonRPCResponse{JSONRPC: "2.0", ID: id}
+	if h != nil {
+		result, errResp := h(params)
+		if errResp != nil {
+			resp.Error = errResp
+		} else if result != nil {
+			raw, err := json.Marshal(result)
+			if err != nil {
+				resp.Error = &jsonRPCError{Code: -32603, Message: "marshal: " + err.Error()}
+			} else {
+				resp.Result = raw
+			}
+		}
+	} else {
+		resp.Result = json.RawMessage("null")
+	}
+	data, err := json.Marshal(resp)
+	if err != nil {
+		return
+	}
+	f.outMu.Lock()
+	defer f.outMu.Unlock()
+	fmt.Fprintf(out, "Content-Length: %d\r\n\r\n", len(data))
+	_, _ = out.Write(data)
 }
 
 func (f *fakeLSPServer) notifications() []string {
@@ -84,29 +129,12 @@ func (f *fakeLSPServer) run(in *bufio.Reader, out io.Writer) {
 			continue
 		}
 
-		resp := jsonRPCResponse{JSONRPC: "2.0", ID: req.ID}
-		if h, ok := f.handlers[req.Method]; ok {
-			result, errResp := h(req.Params)
-			if errResp != nil {
-				resp.Error = errResp
-			} else if result != nil {
-				raw, err := json.Marshal(result)
-				if err != nil {
-					resp.Error = &jsonRPCError{Code: -32603, Message: "marshal: " + err.Error()}
-				} else {
-					resp.Result = raw
-				}
-			}
-		} else {
-			resp.Result = json.RawMessage("null")
-		}
-
-		data, err := json.Marshal(resp)
-		if err != nil {
+		h := f.handlers[req.Method] // nil → null result
+		if f.async[req.Method] {
+			go f.respond(out, req.ID, h, req.Params)
 			continue
 		}
-		fmt.Fprintf(out, "Content-Length: %d\r\n\r\n", len(data))
-		_, _ = out.Write(data)
+		f.respond(out, req.ID, h, req.Params)
 	}
 }
 
