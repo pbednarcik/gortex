@@ -824,6 +824,76 @@ func TestLSP_Enrich_HeavyDelta_RefsVerdictFlushPreservesBlobMetaOnSQLite(t *test
 		"a banked verdict on a heavy-stamped (non-frontier) target must be visible through the store, never re-asked")
 }
 
+// The sweep's per-file flush must not destroy the verdict the confirm phase
+// stamped minutes earlier in the SAME drain. The sweep carries the node
+// objects it was handed at pass start and lands them through AddBatch, a
+// whole-row upsert; the confirm phase stamps its verdict onto freshly read
+// rows. On a disk backend those are different objects, so a target that is
+// both a confirm target and a swept callable loses semantic_heavy_refs the
+// moment its file flushes — and the next drain re-asks every one of them.
+// Observed on a fresh production index: 10,071 verdicts stamped, 963 left
+// in the store, all on fields the sweep never visits. Memory stores share
+// the node object and cannot catch this.
+func TestLSP_Enrich_HeavyDelta_SweepFlushPreservesRefsVerdictOnSQLite(t *testing.T) {
+	t.Setenv(SweepEnv, "full") // the target's file must be swept in the same drain
+	t.Setenv(HeavyRequestsEnv, "background")
+
+	store, err := store_sqlite.Open(filepath.Join(t.TempDir(), "sweepverdict.sqlite"))
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = store.Close() })
+
+	repoRoot, mem, _ := heavyDeltaFixture(t)
+	for _, n := range mem.AllNodes() {
+		n.RepoPrefix = "repo"
+		n.FilePath = "repo/" + n.FilePath
+		store.AddNode(n)
+	}
+	for _, e := range mem.AllEdges() {
+		e.FilePath = "repo/" + e.FilePath
+		store.AddEdge(e)
+	}
+
+	server := newFakeLSPServer()
+	rig := newHeavyDeltaRig(server.handle, repoRoot)
+	rig.refsResult = []Location{}                      // clean answer: the verdict lands
+	rig.incomingResult = []CallHierarchyIncomingCall{} // clean answer: the sweep stamps and flushes
+	p, cleanup := providerWithFakeServer(t, server, []string{"go"})
+	defer cleanup()
+	p.heavyDelta = true
+	p.noHeavyRequests = false
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	_, err = p.EnrichRepoContext(ctx, store, "repo", repoRoot, nil)
+	require.NoError(t, err)
+	require.Positive(t, rig.references.Load(), "the confirm phase must have asked")
+	require.Positive(t, rig.incoming.Load(), "the sweep must have visited the target's file")
+
+	got := store.GetNodesByIDs([]string{"svc.go::target"})["svc.go::target"]
+	require.NotNil(t, got)
+	require.NotNil(t, got.Meta)
+	assert.Equal(t, "1", got.Meta["semantic_heavy"], "the sweep stamp must land")
+	assert.Equal(t, "1", got.Meta["semantic_heavy_refs"],
+		"the sweep flush overwrote the verdict the confirm phase stamped in the same drain")
+
+	// The consequence the verdict exists to prevent: a resumed drain over
+	// the same store must not re-ask a target already adjudicated.
+	server2 := newFakeLSPServer()
+	rig2 := newHeavyDeltaRig(server2.handle, repoRoot)
+	rig2.refsResult = []Location{}
+	rig2.incomingResult = []CallHierarchyIncomingCall{}
+	p2, cleanup2 := providerWithFakeServer(t, server2, []string{"go"})
+	defer cleanup2()
+	p2.heavyDelta = true
+	p2.noHeavyRequests = false
+	ctx2, cancel2 := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel2()
+	_, err = p2.EnrichRepoContext(ctx2, store, "repo", repoRoot, nil)
+	require.NoError(t, err)
+	assert.Zero(t, rig2.references.Load(),
+		"a verdict lost to the sweep flush makes every resume re-pay the confirm phase")
+}
+
 // A server that wedges MID-pass — every call after its first success
 // burning the full budget with no reply (observed live: a Roslyn
 // references up-symbol cascade spinning forever on an interface-member

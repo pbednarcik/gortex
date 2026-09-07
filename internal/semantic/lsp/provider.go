@@ -674,6 +674,45 @@ func markNodeHeavyStamped(n *graph.Node) {
 	n.Meta["semantic_heavy"] = "1"
 }
 
+// preserveStoredMeta folds into each node every Meta key its store row
+// carries that the in-memory copy lacks. A flush lands nodes through
+// AddBatch, a whole-row upsert, and on a disk backend the copy a pass holds
+// is a reconstruction from pass start: any stamp another leg wrote to the
+// row since — the confirm phase's references verdict, stamped onto freshly
+// read rows minutes before the sweep flushes the same node — would be
+// overwritten by the stale blob. The pass's own keys win; only keys it never
+// touched are carried over. Memory stores hand out live pointers, so the
+// fold is a no-op there.
+func preserveStoredMeta(g graph.Store, nodes []*graph.Node) {
+	if g == nil || len(nodes) == 0 {
+		return
+	}
+	ids := make([]string, 0, len(nodes))
+	for _, n := range nodes {
+		if n != nil {
+			ids = append(ids, n.ID)
+		}
+	}
+	fresh := g.GetNodesByIDs(ids)
+	for _, n := range nodes {
+		if n == nil {
+			continue
+		}
+		row := fresh[n.ID]
+		if row == nil || row == n || len(row.Meta) == 0 {
+			continue
+		}
+		if n.Meta == nil {
+			n.Meta = make(map[string]any, len(row.Meta))
+		}
+		for k, v := range row.Meta {
+			if _, held := n.Meta[k]; !held {
+				n.Meta[k] = v
+			}
+		}
+	}
+}
+
 // nodeRefsStamped reports whether the heavy tier's references-confirm leg
 // already adjudicated this confirm target: its reference list came back
 // cleanly (or the target is statically terminal-unconfirmable) and every
@@ -2126,6 +2165,10 @@ func (p *Provider) EnrichRepoContext(ctx context.Context, g graph.Store, repoPre
 		if len(stamped) == 0 && len(cHops) == 0 && len(tHops) == 0 {
 			return
 		}
+		// The stamped nodes are the pass-start copies; the confirm phase
+		// has since written its verdicts onto the store rows. Fold those in
+		// before the whole-row upsert below, or the sweep erases them.
+		preserveStoredMeta(g, stamped)
 		rmu.Lock()
 		defer rmu.Unlock()
 		mutations := newLSPMutationBatch()
