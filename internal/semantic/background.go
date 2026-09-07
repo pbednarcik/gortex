@@ -701,17 +701,21 @@ func (s *backgroundScheduler) drain(ctx context.Context, g graph.Store, t backgr
 	// unavailable server (still warming, a package restore holding a lock)
 	// must not strand the repo's deep tier until the next mutation or
 	// restart. Cancellation is excluded: the canceller owns the requeue.
-	// Retries are NOT unconditional: an attempt with no edge yield and no
-	// frontier shrinkage made no progress at all, and after
-	// backgroundRetryMaxZeroProgress consecutive stuck attempts the task
-	// is abandoned until the next external trigger — a server with a
-	// persistent per-target error otherwise re-runs an identical drain
-	// every backoff interval for the daemon's lifetime.
+	// Retries are NOT unconditional: an attempt with no edge yield, no
+	// references verdict landed, and no frontier shrinkage made no progress
+	// at all, and after backgroundRetryMaxZeroProgress consecutive stuck
+	// attempts the task is abandoned until the next external trigger — a
+	// server with a persistent per-target error otherwise re-runs an
+	// identical drain every backoff interval for the daemon's lifetime.
+	// Verdicts count because a whale-dense tail converges through them
+	// alone: each attempt parks or adjudicates targets no later drain
+	// re-asks while confirming no edge and leaving the hover frontier as
+	// it was.
 	abandonedNow := false
 	if ctx.Err() == nil && (err != nil || partial) {
 		yield, frontier := 0, -1
 		if result != nil {
-			yield = result.EdgesConfirmed + result.EdgesAdded + result.EdgesRebound + result.NodesEnriched
+			yield = result.EdgesConfirmed + result.EdgesAdded + result.EdgesRebound + result.NodesEnriched + result.RefsVerdicts
 			frontier = result.HoverCandidates
 		}
 		prevFrontier, seen := s.lastFrontier[t.key()]

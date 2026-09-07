@@ -2669,6 +2669,9 @@ func (p *Provider) EnrichRepoContext(ctx context.Context, g graph.Store, repoPre
 	)
 
 	result.BreakerTripped = targetedBreaker.isTripped() || hoverBreaker.isTripped()
+	// Every confirm target adjudicated this pass — answered, terminal, or
+	// parked — is progress the scheduler's zero-progress rule must see.
+	result.RefsVerdicts = int(diagRefsStamped.Load())
 	if p.heavyDelta && result.BreakerTripped {
 		// An abandoned phase is incomplete whatever the ledger says: with
 		// timeout parking the whale timeouts are verdicts, not errors, and
