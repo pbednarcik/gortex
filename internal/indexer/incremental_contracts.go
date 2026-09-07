@@ -133,6 +133,10 @@ func (idx *Indexer) refreshIncrementalContractManifests(files []string) (Derived
 		graphPath := idx.prefixPath(relPath)
 		src, readVersion, err := idx.readFileWithVersion(absPath)
 		if err != nil || !readVersion.valid {
+			if err == nil {
+				err = errFileVersionChanged
+			}
+			idx.noteFileIndexFailure(absPath, err)
 			failed = append(failed, absPath)
 			continue
 		}

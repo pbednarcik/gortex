@@ -32,12 +32,12 @@ import (
 func (s *Server) registerCheckoutAdminTools() {
 	s.addTool(
 		mcp.NewTool("list_checkouts",
-			mcp.WithDescription("List the checkout families this daemon tracks. Each family reports its "+
+			mcp.WithDescription("List checkout families visible to this session's workspace. Unbound administrative clients see the daemon-wide inventory. Each family reports its "+
 				"primary corpus and epoch, its dedicated graphs, every registered working copy (mode, "+
 				"state, both reconciler clocks with their deadlines, path evidence, route and whether a "+
 				"build coordinator is live for it), and the named views rooted in its graphs. Reads the "+
 				"catalog only — run reconcile_checkouts for a fresh look at the filesystem."),
-			mcp.WithString("family", mcp.Description("Narrow to one family: a family id, a graph id, a repo prefix, or a path inside a tracked repository. Omit for every family.")),
+			mcp.WithString("family", mcp.Description("Narrow to one visible family: a family id, a graph id, a repo prefix, or a path inside a tracked repository. Omit for every visible family.")),
 			mcp.WithString("format", mcp.Description("Output format: json (default), gcx (GCX1 compact wire format), or toon")),
 			mcp.WithString("fields", mcp.Description("Comma-separated family fields to keep (for example family_id,primary_graph_id,checkouts). Drops the rest before response budgeting.")),
 			mcp.WithNumber("max_bytes", mcp.Description("Cap the marshaled response at this many bytes; truncation metadata rides on the response.")),
@@ -106,12 +106,64 @@ func (s *Server) handleListCheckouts(ctx context.Context, req mcp.CallToolReques
 	if err != nil {
 		return mcp.NewToolResultError(err.Error()), nil
 	}
+	repos, bound := s.sessionWorkspaceRepoSet(ctx)
+	overview = checkoutOverviewInScope(overview, repos, bound)
 	if s.isTOON(ctx, req) || s.isGCX(ctx, req) {
 		_, payload := prepareCheckoutOverviewResponseWithSizer(req, overview, checkoutOverviewTOONSize)
 		return returnTOON(payload)
 	}
 	renderReq, payload := prepareCheckoutOverviewResponse(req, overview)
 	return s.respondJSONOrTOON(ctx, renderReq, payload)
+}
+
+// checkoutOverviewInScope applies the same repository boundary as checkout
+// selection before formatting or response projection can expose path metadata.
+// A family may contain independently dedicated graphs in other workspaces, so
+// retaining an authorized family does not authorize every row nested inside it.
+// Unbound administrative clients retain the daemon-wide inventory.
+func checkoutOverviewInScope(overview indexer.FamiliesOverview, repos map[string]bool, bound bool) indexer.FamiliesOverview {
+	if !bound {
+		return overview
+	}
+	result := indexer.FamiliesOverview{Families: make([]indexer.FamilyOverview, 0)}
+	for _, family := range overview.Families {
+		visible := make(map[string]bool)
+		filtered := family
+		filtered.Graphs = nil
+		filtered.Checkouts = nil
+		filtered.RefViews = nil
+		for _, graph := range family.Graphs {
+			if repos[graph.RepoPrefix] {
+				visible[graph.GraphID] = true
+				filtered.Graphs = append(filtered.Graphs, graph)
+			}
+		}
+		if len(visible) == 0 {
+			continue
+		}
+		for _, checkout := range family.Checkouts {
+			graphID := checkout.GraphID
+			if graphID == "" {
+				graphID = family.PrimaryGraphID
+			}
+			if !visible[graphID] || (checkout.Route != nil && !visible[checkout.Route.GraphID]) {
+				continue
+			}
+			filtered.Checkouts = append(filtered.Checkouts, checkout)
+		}
+		for _, ref := range family.RefViews {
+			if visible[ref.GraphID] {
+				filtered.RefViews = append(filtered.RefViews, ref)
+			}
+		}
+		if !visible[family.PrimaryGraphID] {
+			filtered.PrimaryGraphID = ""
+			filtered.PrimaryRepoPrefix = ""
+			filtered.CommonDir = ""
+		}
+		result.Families = append(result.Families, filtered)
+	}
+	return result
 }
 
 type checkoutOverviewSizer func(any) (int, error)

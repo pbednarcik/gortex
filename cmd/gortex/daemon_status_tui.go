@@ -62,8 +62,8 @@ func (r repoItem) FilterValue() string {
 
 type repoDelegate struct{ width int }
 
-func (d repoDelegate) Height() int                         { return 1 }
-func (d repoDelegate) Spacing() int                        { return 0 }
+func (d repoDelegate) Height() int                             { return 1 }
+func (d repoDelegate) Spacing() int                            { return 0 }
 func (d repoDelegate) Update(_ tea.Msg, _ *list.Model) tea.Cmd { return nil }
 func (d repoDelegate) Render(w io.Writer, m list.Model, index int, listItem list.Item) {
 	r, ok := listItem.(repoItem)
@@ -119,6 +119,10 @@ func repoItemState(r daemon.TrackedRepoStatus) string {
 		return "MISSING — path deleted"
 	case r.Unloaded:
 		return "not indexed"
+	case r.IndexHealthError != "":
+		return "DEGRADED — file indexing health unavailable"
+	case r.FailedFiles > 0:
+		return fmt.Sprintf("DEGRADED — %d failed, %d unreadable", r.FailedFiles, r.UnreadableFiles)
 	case repoIndexIsEmpty(r):
 		return "EMPTY — 0 files indexed"
 	default:
@@ -275,9 +279,9 @@ func (m statusTUI) View() string {
 		}
 	}
 
-	gap(1)               // top breathing room
+	gap(1) // top breathing room
 	push(m.renderHeader())
-	gap(2)               // logo gets extra space below
+	gap(2) // logo gets extra space below
 	if w := m.renderWorkspaces(); w != "" {
 		push(w)
 		gap(1)
@@ -349,6 +353,8 @@ func (m statusTUI) headerRightCol() string {
 	state := tuiAccent.Render("ready")
 	if !st.Ready {
 		state = lipgloss.NewStyle().Foreground(progress.ColorWarn).Render("warming")
+	} else if st.IndexDegraded {
+		state = lipgloss.NewStyle().Foreground(progress.ColorWarn).Render("degraded")
 	}
 	row1 := tuiTitle.Render("gortex daemon")
 	row2 := strings.Join([]string{
@@ -359,6 +365,11 @@ func (m statusTUI) headerRightCol() string {
 	}, tuiHint.Render(" · "))
 	row3Cells := []string{
 		tuiKey.Render(humanizeBytes(st.Runtime.Alloc)) + tuiSub.Render(" alloc"),
+	}
+	if st.IndexHealthError != "" {
+		row3Cells = append(row3Cells, tuiSub.Render("index health unavailable"))
+	} else if st.IndexDegraded {
+		row3Cells = append(row3Cells, tuiSub.Render(fmt.Sprintf("%d failed (%d unreadable)", st.FailedFiles, st.UnreadableFiles)))
 	}
 	// Omitted entirely when the backend has no real count to report —
 	// its only figure would be a since-construction Add/Remove delta,

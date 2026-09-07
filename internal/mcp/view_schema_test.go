@@ -10,29 +10,58 @@ import (
 
 func TestViewSelectorSchemaMatchesRuntimeShapes(t *testing.T) {
 	schema := viewSelectorSchema()
+	worktreePath := t.TempDir()
 	valid := map[string]map[string]any{
 		"implicit_auto": {},
 		"explicit_auto": {"kind": "auto"},
 		"base":          {"kind": "base", "graph_id": "graph-1"},
 		"worktree":      {"kind": "worktree", "checkout_id": "checkout-1"},
+		"worktree_path": {"kind": "worktree", "path": worktreePath},
 		"git_ref":       {"kind": "git_ref", "graph_id": "graph-1", "value": "refs/heads/main"},
 		"commit":        {"kind": "commit", "value": "0123456789012345678901234567890123456789"},
 	}
 	for name, value := range valid {
 		t.Run("accepts_"+name, func(t *testing.T) {
 			require.NoError(t, validateFacadeSchema(schema, value, "$.view"))
+			req := mcpgo.CallToolRequest{}
+			req.Params.Arguments = map[string]any{"view": value}
+			_, err := takeViewSelector(&req)
+			require.NoError(t, err)
 		})
 	}
 
 	invalid := map[string]map[string]any{
-		"unknown_kind":       {"kind": "snapshot"},
-		"base_without_graph": {"kind": "base"},
-		"mixed_identifiers":  {"kind": "worktree", "checkout_id": "checkout-1", "graph_id": "graph-1"},
-		"unknown_field":      {"kind": "auto", "branch": "main"},
+		"unknown_kind":               {"kind": "snapshot"},
+		"base_without_graph":         {"kind": "base"},
+		"mixed_identifiers":          {"kind": "worktree", "checkout_id": "checkout-1", "graph_id": "graph-1"},
+		"worktree_id_and_path":       {"kind": "worktree", "checkout_id": "checkout-1", "path": worktreePath},
+		"worktree_id_and_empty_path": {"kind": "worktree", "checkout_id": "checkout-1", "path": ""},
+		"worktree_path_and_empty_id": {"kind": "worktree", "checkout_id": "", "path": worktreePath},
+		"worktree_without_identity":  {"kind": "worktree"},
+		"auto_with_path":             {"kind": "auto", "path": worktreePath},
+		"auto_with_empty_path":       {"kind": "auto", "path": ""},
+		"base_with_path":             {"kind": "base", "graph_id": "graph-1", "path": worktreePath},
+		"git_ref_with_path":          {"kind": "git_ref", "value": "refs/heads/main", "path": worktreePath},
+		"commit_with_path":           {"kind": "commit", "value": "0123456789012345678901234567890123456789", "path": worktreePath},
+		"unknown_field":              {"kind": "auto", "branch": "main"},
 	}
 	for name, value := range invalid {
 		t.Run("rejects_"+name, func(t *testing.T) {
 			require.Error(t, validateFacadeSchema(schema, value, "$.view"))
+			req := mcpgo.CallToolRequest{}
+			req.Params.Arguments = map[string]any{"view": value}
+			_, err := takeViewSelector(&req)
+			require.Error(t, err)
+		})
+	}
+	// Host-specific path semantics are enforced by the runtime parser. The
+	// compact facade validator checks schema shapes, not every string constraint.
+	for _, path := range []string{"", "worktrees/feature", " " + worktreePath, worktreePath + " "} {
+		t.Run("rejects_runtime_path_"+path, func(t *testing.T) {
+			req := mcpgo.CallToolRequest{}
+			req.Params.Arguments = map[string]any{"view": map[string]any{"kind": "worktree", "path": path}}
+			_, err := takeViewSelector(&req)
+			require.Error(t, err)
 		})
 	}
 }
@@ -66,7 +95,7 @@ func TestViewSelectorPublishedOnEveryToolSchema(t *testing.T) {
 				capability := srv.facadeCapability(spec, true)
 				schema := facadeSchemaMapForTest(t, capability["input_schema"])
 				published := requirePublishedViewSelector(t, schema["properties"].(map[string]any))
-				require.Len(t, published["oneOf"], 5, "capability must publish every selector shape")
+				require.Len(t, published["oneOf"], 6, "capability must publish every selector shape, including worktree ID and path alternatives")
 				require.Equal(t, facadeSchemaMapForTest(t, viewSelectorSchema()), facadeSchemaMapForTest(t, published))
 			})
 		}

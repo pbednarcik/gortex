@@ -35,7 +35,7 @@ func (s *Server) refreshIndexHealthInBackground() {
 	s.indexHealth.mu.Unlock()
 
 	go func() {
-		payload, err := s.buildIndexHealthPayloadCtx(context.Background())
+		payload, err := s.buildIndexHealthBasePayloadCtx(context.Background())
 		s.indexHealth.mu.Lock()
 		defer s.indexHealth.mu.Unlock()
 		s.indexHealth.refreshing = false
@@ -52,11 +52,16 @@ func (s *Server) indexHealthNeedsRefresh(updatedAt time.Time) bool {
 
 func compactIndexHealth(payload map[string]any, updatedAt time.Time, refreshing bool) string {
 	stale, _ := payload["stale_files"].([]string)
-	failures, _ := payload["parse_failures"].(map[string]string)
+	parseFailureCount := indexHealthParseFailureCount(payload["parse_failures"])
+	failedFiles, _ := payload["failed_file_count"].(int)
+	unreadableFiles, _ := payload["unreadable_file_count"].(int)
 	status := "ready"
 	if refreshing {
 		status = "refreshing"
 	}
-	return fmt.Sprintf("health=%v nodes=%v stale=%d failures=%d status=%s age=%ds\n",
-		payload["health_score"], payload["node_count"], len(stale), len(failures), status, int(time.Since(updatedAt).Seconds()))
+	if failedFiles > 0 || payload["status"] == "degraded" {
+		status = "degraded"
+	}
+	return fmt.Sprintf("health=%v nodes=%v stale=%d failures=%d status=%s age=%ds failed_files=%d unreadable_files=%d\n",
+		payload["health_score"], payload["node_count"], len(stale), parseFailureCount, status, int(time.Since(updatedAt).Seconds()), failedFiles, unreadableFiles)
 }

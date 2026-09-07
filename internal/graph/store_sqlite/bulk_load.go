@@ -314,6 +314,7 @@ func (s *Store) BeginCoordinatedBulkLoad() bool {
 		return false
 	}
 	s.coordinatedBulkLoad = true
+	s.syncBulkWindowLocked()
 	return true
 }
 
@@ -389,6 +390,7 @@ func (s *Store) beginBulkLoadLocked() {
 	}
 
 	s.bulkConn = conn
+	s.syncBulkWindowLocked()
 	s.bulkPrevSync = prevSync
 	s.bulkPrevCacheSize = prevCache
 	s.bulkPrevAutoCheckpoint = prevAutoCheckpoint
@@ -441,6 +443,7 @@ func (s *Store) EndCoordinatedBulkLoad() error {
 		return nil
 	}
 	s.coordinatedBulkLoad = false
+	s.syncBulkWindowLocked()
 	if s.deferredFTSOptimize {
 		// A full FTS5 optimize is unbounded and previously sat directly on the
 		// cold-start critical path. One bounded merge keeps segment growth in
@@ -464,6 +467,7 @@ func (s *Store) EndCoordinatedBulkLoad() error {
 		// connection here would make the failed DDL impossible to retry because
 		// sealBulkIndexesLocked intentionally requires the pinned bulk writer.
 		s.coordinatedBulkLoad = true
+		s.syncBulkWindowLocked()
 		s.writeMu.Unlock()
 		return sealErr
 	}
@@ -484,6 +488,14 @@ func (s *Store) EndCoordinatedBulkLoad() error {
 		s.emitBulkFinalizeEvent(bulkFinalizeEvent{Stage: "planner_stats", Name: "nodes_edges", Elapsed: time.Since(statsStarted), Err: statsErr})
 	}
 	closeErr := s.closeBulkConnectionLocked()
+	// The refresh above ran on the pinned writer, so readers already holding a
+	// connection would keep the pre-load statistics forever, and the runtime
+	// freshness checker would not know an ANALYZE had just run. Both are done
+	// after the pinned connection is released so neither touches it.
+	if sealErr == nil && hadBulk && statsErr == nil {
+		s.stampPlannerStatsRefresh(context.Background(), "cold_load_finalize")
+		recycleStatsReadPool(s.db, s.writerDB)
+	}
 	// The writer gate prevents a competing writer, but it cannot retire a
 	// snapshot held by the read-only pool. RESTART/TRUNCATE invokes SQLite's
 	// busy handler until every such reader leaves the WAL, which made cold
@@ -627,6 +639,10 @@ func (s *Store) sealBulkIndexesLocked(reason string) error {
 // pinned writer. Dense-index rebuilding deliberately lives in
 // sealBulkIndexesLocked so an early seal cannot end the outer window.
 func (s *Store) closeBulkConnectionLocked() error {
+	// Unconditional: every caller has just cleared coordinatedBulkLoad, and
+	// the early return below is the path where the pinned connection was
+	// already gone but that flag still has to reach the health probe.
+	defer s.syncBulkWindowLocked()
 	conn := s.bulkConn
 	if conn == nil {
 		return nil

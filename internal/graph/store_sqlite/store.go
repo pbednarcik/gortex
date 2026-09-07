@@ -205,6 +205,73 @@ type storeCore struct {
 	// synchronously under writeMu and therefore must not call back into Store.
 	bulkFinalizeObserver func(bulkFinalizeEvent)
 
+	// Planner-statistics freshness ledger (planner_stats_freshness.go). It
+	// lives on the core rather than the handle so every AtGeneration view
+	// shares one record: sqlite_stat1 describes the physical indexes, which
+	// hold every generation's rows, so "when were these statistics last
+	// rebuilt" is a property of the database and not of a view.
+	//
+	// plannerStatsMu guards the five record fields below it. The counters are
+	// atomics because the read-only health probe reports them without taking
+	// any lock.
+	//
+	// plannerStatsCursor is where an unfinished cooperative pass stopped; it
+	// is what makes a deferred pass resume at the next boundary instead of
+	// restarting at the head of its work list.
+	plannerStatsMu          sync.Mutex
+	plannerStatsLastRefresh time.Time
+	plannerStatsLastReason  string
+	plannerStatsBaseline    plannerStatsBaseline
+	plannerStatsLastAttempt plannerStatsAttempt
+	plannerStatsCursor      plannerStatsCursor
+	plannerStatsChecks      atomic.Int64
+	plannerStatsRefreshes   atomic.Int64
+
+	// plannerStatsRefreshInFlight admits ONE cooperative refresh at a time.
+	// The refresh no longer serialises on the write gate — it takes and
+	// releases it once per index — so this is what stops two pipeline
+	// boundaries from analyzing the same family at once. A caller that loses
+	// the claim returns immediately instead of waiting: it holds a wider gate
+	// of its own while it waits, and the verdict it would act on is the one
+	// already being acted on.
+	plannerStatsRefreshInFlight atomic.Bool
+
+	// plannerStatsProbeFailed suppresses the repeated probe-failure log line.
+	// The probe runs at every pipeline boundary and on every index_health
+	// rebuild, and the failure it reports (a drifted partial-index predicate)
+	// is permanent until the DDL changes. Set on the first failure, cleared by
+	// the first success after it.
+	plannerStatsProbeFailed atomic.Bool
+
+	// plannerStatsGateHolds counts write-gate ACQUISITIONS made by the
+	// cooperative refresh loop. The increment MUST stay at the acquisition
+	// site — immediately after the TryLock that succeeded, never inside the
+	// hold's body or around the loop — because the property it exists to
+	// prove is exactly "the gate was taken once per index and released
+	// between them". Counted anywhere else, a hold spanning the whole work
+	// list would still report one call per index and the test would pass over
+	// the regression it is written to catch.
+	//
+	// It is also how a test observes a RESUMED pass: a pass that restarts at
+	// the head of its work list takes the gate for every index again, and one
+	// that resumes takes it only for the remainder. No externally observable
+	// behaviour reveals either.
+	//
+	// EVERY acquisition is counted, including the one a completed pass takes
+	// after the loop to reload sqlite_schema when it deleted a stale stat row
+	// — that hold is bounded like an index hold and is paid for by the same
+	// wider gates, so leaving it out would understate the boundary's cost. So
+	// the exact count a completed pass reports is len(work), plus one when the
+	// pass removed at least one stat row (only a partial critical index whose
+	// population has gone empty can do that), and a test asserting an exact
+	// number has to know which of the two shapes its fixture produces.
+	plannerStatsGateHolds atomic.Int64
+
+	// bulkWindowOpen mirrors (bulkConn != nil || coordinatedBulkLoad) for the
+	// one reader that must not take writeMu to ask: the planner-statistics
+	// health probe. Written only under writeMu, by syncBulkWindowLocked.
+	bulkWindowOpen atomic.Bool
+
 	// Prepared statements (compiled once in Open, closed in Close).
 	stmtInsertNode          *sql.Stmt
 	stmtGetNode             *sql.Stmt
@@ -293,6 +360,12 @@ var _ graph.Store = (*Store)(nil)
 // stopped satisfying it, --exact would quietly fall back to the counters it
 // exists to check rather than failing to compile.
 var _ graph.RepoMemoryEstimateScanner = (*Store)(nil)
+
+// Runtime planner-statistics freshness. Asserted here for the same reason: the
+// indexer, the resolver and the generation publisher reach it by optional-
+// interface type assertion, so a signature drift would silently stop
+// refreshing statistics instead of failing to build.
+var _ graph.PlannerStatsFreshener = (*Store)(nil)
 
 // ResolveMutex returns the resolver-coordination mutex for the generation this
 // handle reads and writes. Held by cross-repo / temporal / external resolver
@@ -620,19 +693,23 @@ func openWithObserver(path string, current int, migrations []schemaMigration, al
 		return nil, fmt.Errorf("sqlite prepare: %w", err)
 	}
 	// A populated store opened without planner statistics would plan blind
-	// until its next cold bulk load; backfill sqlite_stat1 once here.
-	if healPlannerStats(db) && readDB != db {
-		// The repair ran on a writer connection, and SQLite bumps the schema
-		// cookie only when sqlite_stat1 is first CREATED — never when its rows
-		// are rewritten. Every reader connection already open (openSQLiteReadPool
-		// pings one into existence above) therefore keeps the pre-repair
-		// statistics for as long as it lives, which on a long-running daemon is
-		// forever. Drop the pool's idle connections so the next reader is a
-		// fresh physical connection that loads the repaired rows on open.
-		// Skipped when the two pools are the same handle: an in-memory store
-		// would lose the database with its last connection.
-		readDB.SetMaxIdleConns(0)
-		readDB.SetMaxIdleConns(sqliteMaxIdleConns)
+	// until its next cold bulk load; backfill sqlite_stat1 once here. The
+	// repair ran on a writer connection, so the read pool has to be recycled
+	// for it to reach readers at all (see recycleStatsReadPool), and the
+	// freshness ledger is stamped so the first runtime check does not pay a
+	// second ANALYZE for statistics that were just rebuilt.
+	if repaired, reason := healPlannerStats(db); repaired {
+		// Stamp first, recycle last, and the reason is the recycle's — not the
+		// stamp's. The stamp reads repo_index_state through the READ pool,
+		// which checks out a connection that predates the repair and still
+		// caches the pre-repair statistics. Running the recycle after it is
+		// what retires that connection along with every other one open at
+		// this point; ordered the other way round, the stamp's own connection
+		// would be the newest idle entry in a pool the recycle had already
+		// cleared. Nothing about the counter read itself depends on the
+		// order — repo_index_state is not one of the critical indexes.
+		s.stampPlannerStatsRefresh(context.Background(), "open_repair:"+reason)
+		recycleStatsReadPool(readDB, db)
 	}
 	// In-memory databases have no WAL file to drain, so the periodic
 	// checkpoint is pointless there (and would leak a goroutine per

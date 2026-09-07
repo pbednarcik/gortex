@@ -195,6 +195,65 @@ func TestReceiverRebindPlanLockAcrossStatisticsRegimes(t *testing.T) {
 		})
 	})
 
+	// The regime the cooperative runtime refresh actually produces: a MIXED
+	// one. A pass analyzes its work list one index per gate hold and can defer
+	// at any point — a busy writer, a spent budget, a per-index timeout — so a
+	// store spends real time with some critical indexes freshly analyzed and
+	// others still carrying whatever row they had, including the poisoned zero
+	// one. The four regimes above are all uniform, and a plan that is only
+	// correct when every row agrees would be a plan this mechanism breaks.
+	//
+	// So: refresh nodes_by_file alone (exactly what one hold of the
+	// cooperative loop does) while the receiver row stays poisoned at zero, and
+	// require the same seek-driven shape from both queries.
+	t.Run("mixed_partial_refresh", func(t *testing.T) {
+		if rebindAbandoned.Load() {
+			t.Skip("previous subtest abandoned a rebind still holding the write gate; this store is unusable")
+		}
+		withReceiverPlanLockWriter(t, s, func(ctx context.Context, conn *sql.Conn) {
+			// Re-establish the poisoned row rather than inheriting it: the
+			// subtest above may have been skipped, and a regime that is only
+			// under test when its predecessor ran is not under test.
+			if _, err := conn.ExecContext(ctx, `DELETE FROM sqlite_stat1 WHERE idx = 'nodes_go_receiver_type'`); err != nil {
+				t.Fatalf("clear receiver stat row: %v", err)
+			}
+			if _, err := conn.ExecContext(ctx, `INSERT INTO sqlite_stat1(tbl, idx, stat) VALUES ('nodes', 'nodes_go_receiver_type', '0 0 0 0 0')`); err != nil {
+				t.Fatalf("poison receiver stat row: %v", err)
+			}
+			if _, err := conn.ExecContext(ctx, `ANALYZE sqlite_schema`); err != nil {
+				t.Fatalf("reload poisoned statistics: %v", err)
+			}
+
+			// One index, on the connection the plans are read from — the unit
+			// of work the cooperative refresh holds the write gate for.
+			hasStatTable, err := preparePlannerStatsConn(ctx, conn)
+			if err != nil {
+				t.Fatalf("prepare the statistics connection: %v", err)
+			}
+			if _, err := analyzePlannerStatsIndexOnConn(ctx, conn, "nodes_by_file", hasStatTable); err != nil {
+				t.Fatalf("analyze nodes_by_file: %v", err)
+			}
+
+			// The mix is the point: one index re-analyzed over the real corpus,
+			// the receiver row still zero. Assert both halves, or a future
+			// change that made ANALYZE of one index rewrite its neighbours
+			// would leave this running the `refreshed` regime again.
+			if got := receiverStatOnConn(t, ctx, conn); got != "0 0 0 0 0" {
+				t.Fatalf("receiver stat = %q after analyzing nodes_by_file alone, want the poisoned zero row "+
+					"left untouched — the mixed regime is not under test", got)
+			}
+			var refreshed sql.NullString
+			if err := conn.QueryRowContext(ctx, `SELECT stat FROM sqlite_stat1 WHERE idx = 'nodes_by_file'`).Scan(&refreshed); err != nil {
+				t.Fatalf("read nodes_by_file stat: %v", err)
+			}
+			if !refreshed.Valid || statRowCount(t, refreshed.String) < receiverPlanLockMethods {
+				t.Fatalf("nodes_by_file stat = %q, want a row describing the whole corpus", refreshed.String)
+			}
+
+			assertReceiverRebindPlansLocked(t, ctx, conn, methodFile)
+		})
+	})
+
 	// An honest but stale row: ANALYZE captured the index while exactly one Go
 	// type existed, and the other 299 landed afterwards. Nothing about this
 	// store is corrupt — the planner is simply working from an old count.

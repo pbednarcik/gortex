@@ -2,6 +2,7 @@ package graphview
 
 import (
 	"fmt"
+	"path/filepath"
 	"slices"
 	"strings"
 )
@@ -14,7 +15,7 @@ const (
 	SelectorAuto SelectorKind = "auto"
 	// SelectorBase pins a persisted base graph by id.
 	SelectorBase SelectorKind = "base"
-	// SelectorWorktree pins a registered checkout by id, including its
+	// SelectorWorktree pins a registered checkout by id or absolute path, including its
 	// working-tree edits.
 	SelectorWorktree SelectorKind = "worktree"
 	// SelectorGitRef pins the commit a full ref points at.
@@ -30,17 +31,25 @@ type Selector struct {
 	Kind       SelectorKind `json:"kind"`
 	GraphID    string       `json:"graph_id,omitempty"`
 	CheckoutID string       `json:"checkout_id,omitempty"`
+	Path       string       `json:"path,omitempty"`
 	Value      string       `json:"value,omitempty"`
 }
 
-// ParseSelector validates a raw selector from the wire.
+// ParseSelector validates an ID-based selector from the wire. Use
+// ParseSelectorWithPath to also accept an absolute worktree path.
+func ParseSelector(kind, graphID, checkoutID, value string) (Selector, error) {
+	return ParseSelectorWithPath(kind, graphID, checkoutID, value, "")
+}
+
+// ParseSelectorWithPath validates a raw selector from the wire.
 //
 // An empty kind means auto: a caller that omits the field asks for the default
 // view. Every other kind must be one of the SelectorKind constants.
 //
 //   - auto     — takes no other field.
 //   - base     — requires graphID.
-//   - worktree — requires checkoutID.
+//   - worktree — requires exactly one of checkoutID or an absolute path on
+//     the daemon host. Path resolution and registration are checked by the server.
 //   - git_ref  — requires value: a FULL ref name under refs/heads/,
 //     refs/tags/, or refs/remotes/. Short names ("main"), HEAD, and revision
 //     expressions ("main~1", "a..b", "x@{1}") are rejected: they resolve
@@ -57,12 +66,12 @@ type Selector struct {
 // CodeSelectorConflict. Values are never trimmed — leading or trailing
 // whitespace in a ref name or an object id is a malformed value, not a typo to
 // paper over.
-func ParseSelector(kind, graphID, checkoutID, value string) (Selector, error) {
+func ParseSelectorWithPath(kind, graphID, checkoutID, value, path string) (Selector, error) {
 	k := SelectorKind(strings.TrimSpace(kind))
 	if k == "" {
 		k = SelectorAuto
 	}
-	s := Selector{Kind: k, GraphID: graphID, CheckoutID: checkoutID, Value: value}
+	s := Selector{Kind: k, GraphID: graphID, CheckoutID: checkoutID, Path: path, Value: value}
 
 	switch k {
 	case SelectorAuto:
@@ -77,11 +86,17 @@ func ParseSelector(kind, graphID, checkoutID, value string) (Selector, error) {
 			return Selector{}, err
 		}
 	case SelectorWorktree:
-		if checkoutID == "" {
-			return Selector{}, NewViewError(CodeInvalidViewSelector, "worktree selector requires a checkout id")
+		if checkoutID != "" && path != "" {
+			return Selector{}, NewViewError(CodeSelectorConflict, "worktree selector requires exactly one of checkout_id or path")
 		}
-		if err := rejectUnused(s, "checkout_id"); err != nil {
+		if checkoutID == "" && path == "" {
+			return Selector{}, NewViewError(CodeInvalidViewSelector, "worktree selector requires checkout_id or an absolute path")
+		}
+		if err := rejectUnused(s, "checkout_id", "path"); err != nil {
 			return Selector{}, err
+		}
+		if path != "" && (strings.TrimSpace(path) != path || !filepath.IsAbs(path) || strings.ContainsRune(path, 0)) {
+			return Selector{}, NewViewError(CodeInvalidViewSelector, "worktree selector path must be absolute on the daemon host without leading or trailing whitespace")
 		}
 	case SelectorGitRef:
 		if err := rejectUnused(s, "graph_id", "value"); err != nil {
@@ -113,6 +128,9 @@ func (s Selector) String() string {
 	case SelectorBase:
 		return string(s.Kind) + ":" + s.GraphID
 	case SelectorWorktree:
+		if s.Path != "" {
+			return string(s.Kind) + ":path:" + s.Path
+		}
 		return string(s.Kind) + ":" + s.CheckoutID
 	case SelectorGitRef, SelectorCommit:
 		if s.GraphID != "" {
@@ -133,6 +151,7 @@ func rejectUnused(s Selector, used ...string) error {
 	}{
 		{"graph_id", s.GraphID},
 		{"checkout_id", s.CheckoutID},
+		{"path", s.Path},
 		{"value", s.Value},
 	}
 	for _, f := range fields {

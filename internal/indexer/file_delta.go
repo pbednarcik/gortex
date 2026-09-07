@@ -49,6 +49,7 @@ type preparedExtraction struct {
 // fileDeltaProbe exposes phase timings and the three delta boundaries used by
 // the watcher: metadata-only, artifact-only, and semantic topology.
 type fileDeltaProbe struct {
+	readErr         error
 	fingerprints    fileDeltaFingerprints
 	derived         derivedFingerprints
 	read            time.Duration
@@ -90,6 +91,7 @@ func (idx *Indexer) prepareFileDeltaWithAdmission(filePath string, tryOnly bool)
 	} else {
 		parseLease, err = idx.acquireSharedParsePath(absPath)
 		if err != nil {
+			probe.readErr = err
 			return probe, false, false
 		}
 	}
@@ -115,6 +117,7 @@ func (idx *Indexer) prepareFileDeltaWithAdmission(filePath string, tryOnly bool)
 	src, readVersion, err := idx.readFileWithVersion(absPath)
 	probe.read = time.Since(started)
 	if err != nil {
+		probe.readErr = err
 		return probe, false, false
 	}
 	lang, ok := idx.effectiveLanguage(absPath, src)
@@ -581,15 +584,15 @@ func extractionFingerprints(result *parser.ExtractionResult) (fileDeltaFingerpri
 		}
 	}
 	return fileDeltaFingerprints{
-		metadata: stableFingerprintDigests(metadataRows),
-		semantic: stableFingerprintDigests(semanticRows),
-		core:     stableFingerprintDigests(coreRows),
-	}, derivedFingerprints{
-		declarations: stableFingerprintDigests(declarations),
-		imports:      stableFingerprintDigests(imports),
-		runtime:      stableFingerprintDigests(runtimeRows),
-		artifacts:    stableFingerprintDigests(artifacts),
-	}, true
+			metadata: stableFingerprintDigests(metadataRows),
+			semantic: stableFingerprintDigests(semanticRows),
+			core:     stableFingerprintDigests(coreRows),
+		}, derivedFingerprints{
+			declarations: stableFingerprintDigests(declarations),
+			imports:      stableFingerprintDigests(imports),
+			runtime:      stableFingerprintDigests(runtimeRows),
+			artifacts:    stableFingerprintDigests(artifacts),
+		}, true
 }
 
 func stampExtractionGraphFingerprints(result *parser.ExtractionResult, fingerprints fileDeltaFingerprints) {

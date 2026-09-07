@@ -522,7 +522,7 @@ func (p *Poller) finalizeGitHead(observation pollGitObservation) error {
 			return nil
 		}
 
-		idx.reconcileRepoIndexState(p.rootPath)
+		idx.reconcileRepoIndexState(context.Background(), p.rootPath)
 		p.mu.Lock()
 		// Singleflight owns Git observations, but keep this conditional so a test
 		// or future explicit reset cannot be overwritten by an older completion.

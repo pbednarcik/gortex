@@ -70,6 +70,11 @@ type GenerationSource struct {
 type RepoView struct {
 	// ID names the exact content this view reads.
 	ID RepoViewID
+	// CheckoutRouteEpoch is the catalog route snapshot pinned by this view.
+	// A checkout mutation must revalidate it after taking the coordinator lock;
+	// generation identity alone cannot detect a route that moved away and back.
+	// It is zero for immutable ref views.
+	CheckoutRouteEpoch int64
 	// Reader is the composed graph: the indexed corpus with the
 	// checkout's routed generations stacked on it.
 	Reader graph.Reader
@@ -203,6 +208,7 @@ func (m *Materializer) MaterializeCheckout(ctx context.Context, checkoutID strin
 			lease.Release()
 			return nil, err
 		}
+		view.CheckoutRouteEpoch = route.RouteEpoch
 		return view, nil
 	}
 	return nil, NewViewError(CodeViewBuilding,
@@ -488,6 +494,8 @@ func (m *Materializer) assemble(
 	open := func(generationID int64) (*store_sqlite.Store, *GenerationLayer, store_sqlite.ViewGeneration, error) {
 		handle, layer, row, openErr := m.openGeneration(ctx, generationID)
 		if openErr == nil {
+			layer.failureRepoPrefix = repoPrefix
+			layer.failureRepoScoped = true
 			handles = append(handles, handle)
 			sources = append(sources, GenerationSource{
 				Generation: generationID, Handle: handle, Layer: layer,

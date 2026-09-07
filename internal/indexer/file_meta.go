@@ -35,12 +35,18 @@ type fileReadVersion struct {
 // picks this or the content source.
 func readOSFileWithVersion(path string) ([]byte, fileReadVersion, error) {
 	before, beforeErr := os.Stat(path)
+	if beforeErr != nil {
+		return nil, fileReadVersion{}, beforeErr
+	}
 	src, err := os.ReadFile(path)
 	if err != nil {
 		return nil, fileReadVersion{}, err
 	}
 	after, afterErr := os.Stat(path)
-	if beforeErr != nil || afterErr != nil || !sameFileVersion(before, after) {
+	if afterErr != nil {
+		return src, fileReadVersion{}, afterErr
+	}
+	if !sameFileVersion(before, after) {
 		return src, fileReadVersion{}, nil
 	}
 	return src, fileReadVersion{

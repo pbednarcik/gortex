@@ -1234,6 +1234,11 @@ const contentFTSRowidTableBody = ` (
 // scoping runs through the docid maps below them.
 var viewGenSidecars = []viewGenSidecar{
 	{
+		table:   "file_index_failures",
+		body:    fileIndexFailuresTableBody,
+		columns: `repo_prefix, file_path, error, permission_denied, workspace_id, project_id`,
+	},
+	{
 		table:   "file_mtimes",
 		body:    fileMtimesTableBody,
 		columns: `repo_prefix, file_path, mtime_ns`,

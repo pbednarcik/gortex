@@ -41,6 +41,7 @@ import (
 // unlike the per-edit hot path. Vectors are repo-keyed too; deleting them by
 // repo_prefix is essential because synthetic chunk IDs are not graph node IDs.
 var purgeSidecarTables = []string{
+	"file_index_failures",
 	"file_mtimes",
 	"repo_index_state",
 	"symbol_fts_state",
@@ -149,6 +150,7 @@ func (s *Store) PurgeRepo(prefix string) error {
 // A prefix whose nodes are gone but whose sidecars remain is invisible to a
 // nodes-only scan, which is why the sidecar tables are unioned in.
 var orphanScanTables = []string{
+	"file_index_failures",
 	"nodes",
 	"file_mtimes",
 	"repo_index_state",
@@ -246,6 +248,7 @@ var rekeyMoveTables = []string{
 // too — their rows carry the old node ids, and UPDATE over an FTS5 UNINDEXED
 // column is awkward, so delete-then-reindex is the clean path.
 var rekeyDropTables = []string{
+	"file_index_failures",
 	"semantic_binding_types",
 	"clone_shingles",
 	"clone_corpus_state",

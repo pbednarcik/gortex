@@ -11,16 +11,28 @@ import (
 	"github.com/zzet/gortex/internal/graph"
 )
 
+// indexStateTarget names the store the per-repo counters are written to.
+//
+// Factored out of persistRepoIndexState because a second caller has to reach
+// the same handle: the planner-statistics freshness check reads exactly these
+// counters, and asserting it on diskTarget alone would silently skip the whole
+// direct-SQLite path, where diskTarget is nil and the counters live on
+// idx.graph. Two copies of this selection would be two chances for the reader
+// of the counters to look somewhere the writer never wrote.
+func (idx *Indexer) indexStateTarget(diskTarget graph.Store) graph.Store {
+	if diskTarget != nil {
+		return diskTarget
+	}
+	return idx.graph
+}
+
 // persistRepoIndexState records the per-repo freshness provenance at the
 // end of a (re)index. diskTarget is the durable store when indexing
 // streams to disk; nil falls back to idx.graph. Backends without durable
 // state (the in-memory graph) do not implement RepoIndexStateWriter, so
 // the write is skipped — exactly like the file-mtime ledger.
 func (idx *Indexer) persistRepoIndexState(diskTarget graph.Store, rootAbs, workspaceFP string, nodes, edges int) {
-	target := graph.Store(idx.graph)
-	if diskTarget != nil {
-		target = diskTarget
-	}
+	target := idx.indexStateTarget(diskTarget)
 	w, ok := target.(graph.RepoIndexStateWriter)
 	if !ok {
 		return
@@ -90,7 +102,7 @@ func (idx *Indexer) persistExtractorVersion(lang string) {
 // last full index is preserved — the incremental reconcile diffs against
 // it but never rebuilds it. No-op on backends without durable index
 // state (the in-memory graph is not a RepoIndexStateWriter).
-func (idx *Indexer) reconcileRepoIndexState(rootAbs string) {
+func (idx *Indexer) reconcileRepoIndexState(ctx context.Context, rootAbs string) {
 	prevFP := ""
 	if r, ok := graph.Store(idx.graph).(graph.RepoIndexStateReader); ok {
 		if prev, found, _ := r.GetRepoIndexState(idx.repoPrefix); found {
@@ -99,6 +111,47 @@ func (idx *Indexer) reconcileRepoIndexState(rootAbs string) {
 	}
 	nodes, edges := idx.repoNodeEdgeCount()
 	idx.persistRepoIndexState(nil, rootAbs, prevFP, nodes, edges)
+	// The per-commit / HEAD-move incremental path — git-watcher and poller
+	// both land here — reaches none of the other freshness call sites: it
+	// never drains a shadow and never runs the full pass that ends at the
+	// counter site. A daemon that only ever reindexes changed files would
+	// therefore keep the statistics of the cold load that created the store,
+	// which is the state issue #651 describes. Both halves of the verdict are
+	// current here: the rows are already in the physical tables and the
+	// counters describing them were written a line ago.
+	//
+	// The store's own write gate is free — SetRepoIndexState released it — but
+	// WIDER locks are held all the way down to here, and they are why the
+	// refresh has to be cooperative. Both callers arrive through
+	// coordinateRepositoryMutation, so the shared batchMutationGate is held
+	// for reading and this repository's lane is held exclusively
+	// (repository_mutation_coordinator.go). A refresh that queued on the store
+	// gate, or held it across a whole-store ANALYZE, would hold those for the
+	// same span and stall every other repository's lane behind it.
+	// EnsurePlannerStatsFresh therefore try-locks, analyzes ONE index per hold
+	// under a per-index timeout, and stops rather than waits — which is what
+	// keeps other store writers, and the bounded-gate writers that drop their
+	// batches after 15 s, alive.
+	//
+	// It bounds what this boundary pays, it does not make it free: the pass
+	// stops starting new indexes once its budget is spent, so the gates above
+	// are held for that budget, plus the one index already in flight, plus one
+	// bounded sqlite_schema reload at the end of a completed pass. The rest of
+	// the work list rides a resume cursor to the next commit or HEAD move,
+	// which is where the family finishes. Four reads sit outside that bound
+	// and are paid under these same gates — two health probes, the
+	// present-index list and the stat-row set — but all four go to the read
+	// pool and take no store lock.
+	//
+	// And ctx is not a shutdown lever on every path that reaches here. The
+	// git-watcher threads its own cancellable context, but the poller and the
+	// extractor-version restage caller both pass context.Background(), so a
+	// daemon shutting down cannot cancel a pass in flight on those. What bounds
+	// them is the budget plus one index timeout — which is the reason both
+	// numbers are small enough to sit inside a shutdown without being noticed,
+	// and the reason the cancellation branch is a deferral rather than
+	// something the caller has to react to.
+	graph.MaybeEnsurePlannerStatsFresh(ctx, idx.indexStateTarget(nil))
 }
 
 // repoHeadAndDirty returns the working tree's current commit SHA and

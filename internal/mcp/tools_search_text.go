@@ -131,6 +131,7 @@ func (s *Server) handleSearchText(ctx context.Context, req mcp.CallToolRequest) 
 	if len(enriched) == 0 && len(resolved.RepoAllow) > 0 {
 		resp["scope_note"] = scopeZeroNote(resolved, -1)
 	}
+	stampIndexFileFailureWarning(resp, s.indexFileFailureWarning(ctx, resolved, pathFilter))
 	return s.respondScopedJSONOrTOON(ctx, req, resp, resolved)
 }
 

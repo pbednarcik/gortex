@@ -462,6 +462,12 @@ func (b *SparseGenerationBuilder) Build(ctx context.Context, req BuildRequest) (
 		published = true
 		return nil
 	}()
+	// No planner-statistics check here on purpose. runPass builds a full
+	// Indexer on the generation handle, and that pass ends with the same check
+	// every other index pass does — at a point where the payload is already on
+	// disk and the generation's own repo_index_state row has been written. A
+	// second call at this tail would re-ask a question answered microseconds
+	// earlier, and a build that indexes nothing adds no payload to notice.
 	report.Duration = time.Since(started)
 	return generationID, report, buildErr
 }

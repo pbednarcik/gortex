@@ -420,7 +420,7 @@ func facadeOperationSpecs() []facadeOperationSpec {
 		Effect: facadeEffectLocalWrite, Fixed: map[string]any{"ack": true},
 	})
 	addFacadeGroup(&specs, "workspace", facadeEffectRead, map[string]string{
-		"active_project": "get_active_project", "graph": "graph_stats", "index": "index_health",
+		"active_project": "get_active_project", "checkouts": "list_checkouts", "graph": "graph_stats", "index": "index_health",
 		"info": "workspace_info", "project": "query_project", "proxy": "proxy_status",
 		"repos": "list_repos", "scopes": "list_scopes",
 	})
