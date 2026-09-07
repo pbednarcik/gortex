@@ -473,6 +473,53 @@ func TestManagerBackgroundLane_FailOpenRespectsLaneMode(t *testing.T) {
 	}
 }
 
+// The default path is unchanged by the lane's existence: when no provider
+// can run a lane in the current mode (GORTEX_LSP_HEAVY unset, on, or off),
+// StartBackgroundLane is a no-op — no census over the store, no worker
+// goroutine, and no lane row (Started stays false). The scheduler is built
+// with the Manager either way so that mutation-time calls stay total.
+func TestManagerBackgroundLane_NotStartedWhenNoProviderRunsALane(t *testing.T) {
+	p := &mockBackgroundProvider{
+		mockProvider: mockProvider{name: "go", languages: []string{"go"}, available: true},
+		drained:      make(chan string, 1),
+		laneEnabled:  func() bool { return false }, // lane mode off
+	}
+	mgr, g, roots := backgroundLaneManager(t, p)
+	defer func() { require.NoError(t, mgr.Close()) }()
+
+	mgr.StartBackgroundLane(context.Background(), g, roots)
+
+	st := mgr.BackgroundLaneStatus()
+	assert.False(t, st.Started, "no provider runs a lane in this mode: the worker must not start")
+	assert.Zero(t, st.Pending, "the census must not enqueue for a provider whose lane is disabled")
+	select {
+	case repo := <-p.drained:
+		t.Fatalf("the census drained %q with the lane mode disabled", repo)
+	case <-time.After(150 * time.Millisecond):
+	}
+}
+
+// The gate is per provider, not global: one enabled lane provider is enough
+// to open the lane for everyone who reports work.
+func TestManagerBackgroundLane_StartsWhenAnyProviderRunsALane(t *testing.T) {
+	p := &mockBackgroundProvider{
+		mockProvider: mockProvider{name: "go", languages: []string{"go"}, available: true},
+		drained:      make(chan string, 1),
+		laneEnabled:  func() bool { return true },
+	}
+	mgr, g, roots := backgroundLaneManager(t, p)
+	defer func() { require.NoError(t, mgr.Close()) }()
+
+	mgr.StartBackgroundLane(context.Background(), g, roots)
+	select {
+	case repo := <-p.drained:
+		assert.Equal(t, "default", repo)
+	case <-time.After(2 * time.Second):
+		t.Fatal("census did not drain with an enabled lane provider")
+	}
+	assert.True(t, mgr.BackgroundLaneStatus().Started)
+}
+
 // Census admission is PER REPO, matching production foreground enrichment
 // (each indexer enriches its own root): languages, floor, and winners come
 // from each repo's own rows. Aggregating across roots would let two

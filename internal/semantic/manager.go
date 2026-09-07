@@ -168,10 +168,62 @@ func NewManager(cfg Config, logger *zap.Logger) *Manager {
 // census re-discovers undrained repos from provider state alone
 // (HasBackgroundWork reads markers and stamps, never a live server).
 func (m *Manager) StartBackgroundLane(ctx context.Context, g graph.Store, roots map[string]string) {
-	if m.config.Enabled {
-		m.backgroundCensus(g, roots)
+	if !m.backgroundLaneOpen() {
+		m.logger.Debug("background lane: no provider runs a lane in this mode; lane not started")
+		return
 	}
+	m.backgroundCensus(g, roots)
 	m.background.start(ctx, g)
+}
+
+// backgroundLaneOpen reports whether any provider can run a lane at all in
+// the current mode: a registered BackgroundEnricher that is available, not
+// disabled, and passes its own mode gate when it has one — or, under eager
+// LSP, a router spec whose spawn-free peek says the same. With none, the
+// lane does not open: the default path (GORTEX_LSP_HEAVY unset, on, or off)
+// gets no census over the store, no worker goroutine, and no lane row. Pure
+// metadata — the peek constructs no server. Mutation-time enqueues stay
+// total either way; they are gated by HasBackgroundWork and the same mode
+// gate, so nothing accumulates behind a lane that never opens.
+func (m *Manager) backgroundLaneOpen() bool {
+	if !m.config.Enabled {
+		return false
+	}
+	laneCapable := func(p Provider) bool {
+		be, ok := p.(BackgroundEnricher)
+		if !ok {
+			return false
+		}
+		if gate, ok := be.(backgroundLaneGate); ok && !gate.BackgroundLaneEnabled() {
+			return false
+		}
+		return true
+	}
+	for _, p := range m.providers {
+		if p.Available() && !m.providerDisabled(p.Name()) && laneCapable(p) {
+			return true
+		}
+	}
+	if !m.config.EagerLSP || m.lspRouter == nil {
+		return false
+	}
+	peekRouter, canPeek := m.lspRouter.(backgroundPeekRouter)
+	if !canPeek {
+		return false
+	}
+	for _, name := range m.lspRouter.EnabledSpecNames() {
+		if !m.lspRouter.SpecAvailable(name) {
+			continue
+		}
+		provider, err := peekRouter.PeekProviderForSpec(name)
+		if err != nil {
+			continue
+		}
+		if laneCapable(provider) {
+			return true
+		}
+	}
+	return false
 }
 
 // BackgroundLaneStatus reports the background lane's progress for the
