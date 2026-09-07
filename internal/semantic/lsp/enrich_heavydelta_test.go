@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -933,13 +934,19 @@ func TestLSP_Enrich_HeavyDelta_FullBudgetReferencesTimeoutParksTarget(t *testing
 	}
 
 	// The whale's declaration (svc.go, 1-based line 3 → LSP line 2) answers
-	// far beyond the call budget set below; the plain target answers after a
-	// short delay so its answer lands while the whale's request is out.
+	// far beyond the call budget set below. References run async on the fake
+	// server (a synchronous sleeping handler would block its read loop and
+	// model a wedge), and the plain target answers only once the whale's
+	// request has ARRIVED, so its answer always completes while the whale's
+	// request is outstanding — the evidence, made deterministic instead of
+	// left to goroutine scheduling under load.
 	newRig := func() (*fakeLSPServer, *heavyDeltaRig, *atomic.Int64) {
 		server := newFakeLSPServer()
 		rig := newHeavyDeltaRig(server.handle, repoRoot)
 		var whaleAsks atomic.Int64
-		server.handle("textDocument/references", func(params json.RawMessage) (any, *jsonRPCError) {
+		whaleArrived := make(chan struct{})
+		var arrivedOnce sync.Once
+		server.handleAsync("textDocument/references", func(params json.RawMessage) (any, *jsonRPCError) {
 			rig.references.Add(1)
 			var req struct {
 				TextDocument struct {
@@ -950,8 +957,13 @@ func TestLSP_Enrich_HeavyDelta_FullBudgetReferencesTimeoutParksTarget(t *testing
 			_ = json.Unmarshal(params, &req)
 			if strings.HasSuffix(req.TextDocument.URI, "svc.go") && req.Position.Line == 2 {
 				whaleAsks.Add(1)
+				arrivedOnce.Do(func() { close(whaleArrived) })
 				time.Sleep(400 * time.Millisecond)
 			} else {
+				select {
+				case <-whaleArrived:
+				case <-time.After(5 * time.Second):
+				}
 				time.Sleep(20 * time.Millisecond)
 			}
 			return []Location{}, nil
@@ -1041,10 +1053,15 @@ func TestLSP_Enrich_HeavyDelta_WhaleBurstTripsBreakerYetParksAndReportsPartial(t
 	// References run async on the fake server: a whale's handler sleeps on
 	// its own goroutine while the loop keeps answering the plain target, the
 	// shape of a live server stuck on hopeless requests (a synchronous
-	// sleeping handler would block the loop and model a wedge instead).
+	// sleeping handler would block the loop and model a wedge instead). The
+	// plain target answers only once all three whale requests have arrived,
+	// so its answer always completes while the whales are outstanding — the
+	// parking evidence, independent of goroutine scheduling under load.
 	newRig := func() (*fakeLSPServer, *heavyDeltaRig) {
 		server := newFakeLSPServer()
 		rig := newHeavyDeltaRig(server.handle, repoRoot)
+		var whalesArrived sync.WaitGroup
+		whalesArrived.Add(3)
 		server.handleAsync("textDocument/references", func(params json.RawMessage) (any, *jsonRPCError) {
 			rig.references.Add(1)
 			var req struct {
@@ -1054,8 +1071,15 @@ func TestLSP_Enrich_HeavyDelta_WhaleBurstTripsBreakerYetParksAndReportsPartial(t
 			}
 			_ = json.Unmarshal(params, &req)
 			if strings.Contains(req.TextDocument.URI, "/w") {
+				whalesArrived.Done()
 				time.Sleep(400 * time.Millisecond) // whale: beyond the budget below
 			} else {
+				allIn := make(chan struct{})
+				go func() { whalesArrived.Wait(); close(allIn) }()
+				select {
+				case <-allIn:
+				case <-time.After(5 * time.Second):
+				}
 				time.Sleep(20 * time.Millisecond) // plain: answers while the whales hang
 			}
 			return []Location{}, nil
