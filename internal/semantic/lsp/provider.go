@@ -713,6 +713,21 @@ func preserveStoredMeta(g graph.Store, nodes []*graph.Node) {
 	}
 }
 
+// markNodeRefsTimedOut parks a confirm target whose references request burned
+// the full lane budget. The value distinguishes it from a clean adjudication
+// for readers of the row; nodeRefsStamped treats both as settled, so the
+// target is never re-asked until its file reparses and the node is minted
+// afresh without the stamp.
+func markNodeRefsTimedOut(n *graph.Node) {
+	if n == nil {
+		return
+	}
+	if n.Meta == nil {
+		n.Meta = map[string]any{}
+	}
+	n.Meta["semantic_heavy_refs"] = "timeout"
+}
+
 // nodeRefsStamped reports whether the heavy tier's references-confirm leg
 // already adjudicated this confirm target: its reference list came back
 // cleanly (or the target is statically terminal-unconfirmable) and every
@@ -1550,10 +1565,28 @@ func (p *Provider) EnrichRepoContext(ctx context.Context, g graph.Store, repoPre
 	// only, because the confirm loop resolves targets through the light
 	// location projection; the flush stamps full rows fetched fresh.
 	var refsVerdictIDs []string
+	// Confirm targets whose references request burned the full lane budget
+	// this pass: parked with a timeout verdict (see markNodeRefsTimedOut)
+	// unless the breaker abandoned the phase, in which case the timeouts
+	// say nothing about any one target and nothing is parked.
+	type parkedRef struct {
+		id, rel  string
+		err      error
+		issuedAt int64 // unix nanos when the request went out
+	}
+	var refsTimeouts []parkedRef
+	// lastRefsAnswer is the unix-nano time of the most recent references
+	// request the server ANSWERED this pass. It is the evidence that tells a
+	// whale from a wedge: a target whose request timed out while the server
+	// kept answering requests issued after it is a whale and is parked; a
+	// timeout with no later answer says nothing about the target (the
+	// server stopped answering everything) and goes on the error ledger.
+	var lastRefsAnswer atomic.Int64
 	// Confirm targets skipped by the terminal-unconfirmable policy (see
 	// terminalUnconfirmable) — surfaced on the completion log so a drain
 	// that leaves edges at the static tier says so.
 	var diagTerminalSkipped atomic.Int64
+	var diagTimeoutParked atomic.Int64
 	var diagRefsStamped atomic.Int64
 	var fallback []enrichTarget
 	if p.noHeavyRequests {
@@ -1657,15 +1690,39 @@ func (p *Provider) EnrichRepoContext(ctx context.Context, g graph.Store, repoPre
 					cr, seen := refsByTarget[t.edge.To]
 					if !seen {
 						col := identifierColumn(content, toNode.StartLine, toNode.Name)
+						issuedAt := time.Now().UnixNano()
 						refs, err := p.findReferences(absRoot, grp.rel, line, col)
+						if err == nil {
+							lastRefsAnswer.Store(time.Now().UnixNano())
+						}
 						targetedBreaker.observe(err == nil)
 						if isCallTimeout(err) {
 							targetedBreaker.observeTimeout()
 						}
 						if err != nil && p.heavyDelta {
-							// This target's edges stay unconfirmed — counted
-							// once here; repeats skip through the cache.
-							drainErrs.record(&drainErrs.references, "references", t.edge.To+" @ "+grp.rel, err)
+							if isCallTimeout(err) {
+								// A full-budget timeout is a verdict about the
+								// target, not a transient: a solution-wide
+								// whale no finite budget converts. Re-asking
+								// buys the same timeout, and whales at the
+								// front of every retry's frontier saturate the
+								// server and trip the streak breaker, so a
+								// fresh index never converges. Park it: the
+								// edges keep their static confidence, the drain
+								// stays clean, and the target is never asked
+								// again until its file reparses.
+								// Recorded here, not at group end: a breaker
+								// trip returns from the group early, and the
+								// candidate must reach the flush either way,
+								// where the whale-or-wedge evidence decides.
+								confirmMu.Lock()
+								refsTimeouts = append(refsTimeouts, parkedRef{id: t.edge.To, rel: grp.rel, err: err, issuedAt: issuedAt})
+								confirmMu.Unlock()
+							} else {
+								// This target's edges stay unconfirmed — counted
+								// once here; repeats skip through the cache.
+								drainErrs.record(&drainErrs.references, "references", t.edge.To+" @ "+grp.rel, err)
+							}
 						}
 						cr = cachedRefs{refs: refs, ok: err == nil}
 						refsByTarget[t.edge.To] = cr
@@ -1716,7 +1773,24 @@ func (p *Provider) EnrichRepoContext(ctx context.Context, g graph.Store, repoPre
 		}
 		wg.Wait()
 	}
-	if len(confirmPromotions) > 0 || len(refsVerdictIDs) > 0 {
+	// Whale or wedge: a timed-out target is parked only when the server
+	// answered some other references request issued AFTER it — proof the
+	// server was alive and this one request was the problem. Several whales
+	// issued together trip the streak breaker exactly like a wedge does, so
+	// the breaker cannot be the discriminator; the answers can. A timeout
+	// with no later answer goes on the error ledger as before: the drain
+	// reports partial and the target retries on the next drain.
+	var refsTimeoutIDs []string
+	answeredUntil := lastRefsAnswer.Load()
+	for _, pr := range refsTimeouts {
+		if answeredUntil > pr.issuedAt {
+			refsTimeoutIDs = append(refsTimeoutIDs, pr.id)
+			diagTimeoutParked.Add(1)
+			continue
+		}
+		drainErrs.record(&drainErrs.references, "references", pr.id+" @ "+pr.rel, pr.err)
+	}
+	if len(confirmPromotions) > 0 || len(refsVerdictIDs) > 0 || len(refsTimeoutIDs) > 0 {
 		// The confirm loop resolved its targets through the light location
 		// projection — persisting those view nodes would replace the full
 		// Meta blob and destroy every other stamp on the row (an
@@ -1724,12 +1798,19 @@ func (p *Provider) EnrichRepoContext(ctx context.Context, g graph.Store, repoPre
 		// frontier). Stamp freshly fetched full rows instead, exactly as
 		// the frontier recheck reads them.
 		var refsStamped []*graph.Node
-		if len(refsVerdictIDs) > 0 {
+		if len(refsVerdictIDs) > 0 || len(refsTimeoutIDs) > 0 {
 			sort.Strings(refsVerdictIDs)
-			full := g.GetNodesByIDs(refsVerdictIDs)
+			sort.Strings(refsTimeoutIDs)
+			full := g.GetNodesByIDs(append(append([]string(nil), refsVerdictIDs...), refsTimeoutIDs...))
 			for _, id := range refsVerdictIDs {
 				if n := full[id]; n != nil && !nodeRefsStamped(n) {
 					markNodeRefsStamped(n)
+					refsStamped = append(refsStamped, n)
+				}
+			}
+			for _, id := range refsTimeoutIDs {
+				if n := full[id]; n != nil && !nodeRefsStamped(n) {
+					markNodeRefsTimedOut(n)
 					refsStamped = append(refsStamped, n)
 				}
 			}
@@ -2569,6 +2650,7 @@ func (p *Provider) EnrichRepoContext(ctx context.Context, g graph.Store, repoPre
 		zap.Bool("targeted_breaker_tripped", targetedBreaker.isTripped()),
 		zap.Bool("hover_breaker_tripped", hoverBreaker.isTripped()),
 		zap.Int64("drain_skipped_terminal", diagTerminalSkipped.Load()),
+		zap.Int64("drain_parked_timeout", diagTimeoutParked.Load()),
 		zap.Int64("drain_refs_stamped", diagRefsStamped.Load()),
 		zap.Int64("drain_errored", drainErrs.total()),
 		zap.Int64("drain_errored_confirm_acquire", drainErrs.confirmAcquire.Load()),
