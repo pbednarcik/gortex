@@ -439,7 +439,17 @@ same cascade walks every generated model in an API client. The drain skips
 them as
 **terminal-unconfirmable** — their edges keep their static confidence, the
 skip is not an error, the completion marker may land over them, and the
-completion log counts them as `drain_skipped_terminal`.
+completion log counts them as `drain_skipped_terminal`. The same verdict is
+reached by measurement: a references request that burns the full lane budget
+on a target parks that target with a timeout verdict (counted as
+`drain_parked_timeout`, not as a drain error), so later drains never re-ask it
+until its file reparses and the node is minted afresh. Without that, the
+whales sit at the front of every retry's confirm frontier, saturate the
+server, trip the timeout-streak breaker, and a fresh index never converges.
+A timeout parks its target only when the server answered some other
+references request issued after it, which is what tells a whale from a
+wedged server: a timeout with no later answer goes on the error ledger and
+the target retries on the next drain.
 
 The drain instance also carries its own concurrency width. It inherits the
 foreground's resolved width but clamps it at 4: the lane optimizes for

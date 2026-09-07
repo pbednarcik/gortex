@@ -894,6 +894,112 @@ func TestLSP_Enrich_HeavyDelta_SweepFlushPreservesRefsVerdictOnSQLite(t *testing
 		"a verdict lost to the sweep flush makes every resume re-pay the confirm phase")
 }
 
+// A references request that burns the FULL lane budget on a target is a
+// verdict about that target, not a transient: it is a solution-wide whale
+// (an interface member with hundreds of implementations, a collection
+// `Count`, a generated client's `Dispose`) whose references walk no finite
+// budget converts. Retrying it buys the same timeout. Worse, whales sit at
+// the front of every retry's confirm frontier (the biggest groups go
+// first): several at once saturate the server, neighbouring requests time
+// out too, the timeout-streak breaker trips, and each retry advances a few
+// files before the next abandon — a fresh index never converges. So a
+// full-budget timeout parks the target with a timeout verdict: counted as a
+// terminal skip, not a drain error, never re-asked until its file reparses.
+func TestLSP_Enrich_HeavyDelta_FullBudgetReferencesTimeoutParksTarget(t *testing.T) {
+	t.Setenv(SweepEnv, "off")
+	t.Setenv(HeavyRequestsEnv, "background")
+
+	// The whale and the plain target live in different files, so they form
+	// two confirm groups that run concurrently — the production shape, where
+	// the plain target's answer lands while the whale's request is still
+	// out. That later answer is the evidence that parks the whale: it tells
+	// a whale (server alive, this one request hopeless) from a wedged server
+	// (nothing answers), which the timeout-streak breaker cannot.
+	repoRoot := t.TempDir()
+	require.NoError(t, os.WriteFile(filepath.Join(repoRoot, "svc.go"), []byte(
+		"package p\n\nfunc whale() {}\n\nfunc caller() { whale(); plain() }\n"), 0o644))
+	require.NoError(t, os.WriteFile(filepath.Join(repoRoot, "other.go"), []byte(
+		"package p\n\nfunc plain() {}\n"), 0o644))
+	g := graph.New()
+	g.AddNode(&graph.Node{ID: "svc.go::whale", Kind: graph.KindFunction, Name: "whale",
+		FilePath: "svc.go", StartLine: 3, EndLine: 3, Language: "go"})
+	g.AddNode(&graph.Node{ID: "svc.go::caller", Kind: graph.KindFunction, Name: "caller",
+		FilePath: "svc.go", StartLine: 5, EndLine: 5, Language: "go"})
+	g.AddNode(&graph.Node{ID: "other.go::plain", Kind: graph.KindFunction, Name: "plain",
+		FilePath: "other.go", StartLine: 3, EndLine: 3, Language: "go"})
+	for _, to := range []string{"svc.go::whale", "other.go::plain"} {
+		g.AddEdge(&graph.Edge{From: "svc.go::caller", To: to, Kind: graph.EdgeCalls, FilePath: "svc.go", Line: 5,
+			Confidence: 0.7, ConfidenceLabel: "INFERRED", Origin: graph.OriginTextMatched})
+	}
+
+	// The whale's declaration (svc.go, 1-based line 3 → LSP line 2) answers
+	// far beyond the call budget set below; the plain target answers after a
+	// short delay so its answer lands while the whale's request is out.
+	newRig := func() (*fakeLSPServer, *heavyDeltaRig, *atomic.Int64) {
+		server := newFakeLSPServer()
+		rig := newHeavyDeltaRig(server.handle, repoRoot)
+		var whaleAsks atomic.Int64
+		server.handle("textDocument/references", func(params json.RawMessage) (any, *jsonRPCError) {
+			rig.references.Add(1)
+			var req struct {
+				TextDocument struct {
+					URI string `json:"uri"`
+				} `json:"textDocument"`
+				Position Position `json:"position"`
+			}
+			_ = json.Unmarshal(params, &req)
+			if strings.HasSuffix(req.TextDocument.URI, "svc.go") && req.Position.Line == 2 {
+				whaleAsks.Add(1)
+				time.Sleep(400 * time.Millisecond)
+			} else {
+				time.Sleep(20 * time.Millisecond)
+			}
+			return []Location{}, nil
+		})
+		return server, rig, &whaleAsks
+	}
+
+	server, rig, whaleAsks := newRig()
+	p, cleanup := providerWithFakeServer(t, server, []string{"go"})
+	defer cleanup()
+	p.heavyDelta = true
+	p.noHeavyRequests = false
+	p.client.SetCallTimeout(80 * time.Millisecond)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	res, err := p.EnrichRepoContext(ctx, g, "", repoRoot, nil)
+	require.NoError(t, err)
+	require.NotNil(t, res)
+	require.Equal(t, int64(1), whaleAsks.Load(), "the whale is asked exactly once")
+	require.Positive(t, rig.references.Load())
+
+	nodes := g.GetNodesByIDs([]string{"svc.go::whale", "other.go::plain"})
+	require.NotNil(t, nodes["svc.go::whale"])
+	require.NotNil(t, nodes["other.go::plain"])
+	assert.Equal(t, "timeout", nodes["svc.go::whale"].Meta["semantic_heavy_refs"],
+		"a full-budget references timeout must park the target with a timeout verdict")
+	assert.Equal(t, "1", nodes["other.go::plain"].Meta["semantic_heavy_refs"],
+		"a cleanly answered target keeps the ordinary verdict")
+	assert.False(t, res.Partial,
+		"a parked whale is a verdict, not a drain error: the drain stays clean and its marker may land")
+
+	// Resume: neither target is asked again — the whale is parked, the
+	// plain target adjudicated.
+	server2, rig2, whaleAsks2 := newRig()
+	p2, cleanup2 := providerWithFakeServer(t, server2, []string{"go"})
+	defer cleanup2()
+	p2.heavyDelta = true
+	p2.noHeavyRequests = false
+	p2.client.SetCallTimeout(80 * time.Millisecond)
+	ctx2, cancel2 := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel2()
+	_, err = p2.EnrichRepoContext(ctx2, g, "", repoRoot, nil)
+	require.NoError(t, err)
+	assert.Zero(t, whaleAsks2.Load(), "a parked whale must never be re-asked")
+	assert.Zero(t, rig2.references.Load(), "a resumed drain over adjudicated targets asks nothing")
+}
+
 // A server that wedges MID-pass — every call after its first success
 // burning the full budget with no reply (observed live: a Roslyn
 // references up-symbol cascade spinning forever on an interface-member
