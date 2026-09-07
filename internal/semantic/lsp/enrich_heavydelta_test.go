@@ -1000,6 +1000,110 @@ func TestLSP_Enrich_HeavyDelta_FullBudgetReferencesTimeoutParksTarget(t *testing
 	assert.Zero(t, rig2.references.Load(), "a resumed drain over adjudicated targets asks nothing")
 }
 
+// Several whales issued together time out one after another and trip the
+// timeout-streak breaker, which abandons the confirm phase. Their timeouts
+// are parked (the server kept answering other requests issued after them),
+// so the drain-error ledger stays empty — and nothing else would mark the
+// pass partial. The abandoned phase left most of the frontier unvisited, so
+// the pass MUST report partial regardless of the ledger: the marker predicate
+// already refuses a breaker-tripped drain, and the scheduler must retry it.
+// The retry then finds the whales parked and runs the phase through.
+func TestLSP_Enrich_HeavyDelta_WhaleBurstTripsBreakerYetParksAndReportsPartial(t *testing.T) {
+	t.Setenv(SweepEnv, "off")
+	t.Setenv(HeavyRequestsEnv, "background")
+
+	repoRoot := t.TempDir()
+	g := graph.New()
+	var callBody strings.Builder
+	callBody.WriteString("package p\n\nfunc caller() {")
+	// Three whales, each in its own file (its own confirm group, so the
+	// three requests go out together), plus one plain target.
+	for i := 0; i < 3; i++ {
+		name := fmt.Sprintf("whale%d", i)
+		file := fmt.Sprintf("w%d.go", i)
+		require.NoError(t, os.WriteFile(filepath.Join(repoRoot, file), []byte("package p\n\nfunc "+name+"() {}\n"), 0o644))
+		g.AddNode(&graph.Node{ID: file + "::" + name, Kind: graph.KindFunction, Name: name,
+			FilePath: file, StartLine: 3, EndLine: 3, Language: "go"})
+		callBody.WriteString(" " + name + "();")
+	}
+	require.NoError(t, os.WriteFile(filepath.Join(repoRoot, "other.go"), []byte("package p\n\nfunc plain() {}\n"), 0o644))
+	g.AddNode(&graph.Node{ID: "other.go::plain", Kind: graph.KindFunction, Name: "plain",
+		FilePath: "other.go", StartLine: 3, EndLine: 3, Language: "go"})
+	callBody.WriteString(" plain() }\n")
+	require.NoError(t, os.WriteFile(filepath.Join(repoRoot, "svc.go"), []byte(callBody.String()), 0o644))
+	g.AddNode(&graph.Node{ID: "svc.go::caller", Kind: graph.KindFunction, Name: "caller",
+		FilePath: "svc.go", StartLine: 3, EndLine: 3, Language: "go"})
+	for _, to := range []string{"w0.go::whale0", "w1.go::whale1", "w2.go::whale2", "other.go::plain"} {
+		g.AddEdge(&graph.Edge{From: "svc.go::caller", To: to, Kind: graph.EdgeCalls, FilePath: "svc.go", Line: 3,
+			Confidence: 0.7, ConfidenceLabel: "INFERRED", Origin: graph.OriginTextMatched})
+	}
+
+	// References run async on the fake server: a whale's handler sleeps on
+	// its own goroutine while the loop keeps answering the plain target, the
+	// shape of a live server stuck on hopeless requests (a synchronous
+	// sleeping handler would block the loop and model a wedge instead).
+	newRig := func() (*fakeLSPServer, *heavyDeltaRig) {
+		server := newFakeLSPServer()
+		rig := newHeavyDeltaRig(server.handle, repoRoot)
+		server.handleAsync("textDocument/references", func(params json.RawMessage) (any, *jsonRPCError) {
+			rig.references.Add(1)
+			var req struct {
+				TextDocument struct {
+					URI string `json:"uri"`
+				} `json:"textDocument"`
+			}
+			_ = json.Unmarshal(params, &req)
+			if strings.Contains(req.TextDocument.URI, "/w") {
+				time.Sleep(400 * time.Millisecond) // whale: beyond the budget below
+			} else {
+				time.Sleep(20 * time.Millisecond) // plain: answers while the whales hang
+			}
+			return []Location{}, nil
+		})
+		return server, rig
+	}
+
+	server, rig := newRig()
+	p, cleanup := providerWithFakeServerParallel(t, server, []string{"go"}, 8)
+	defer cleanup()
+	p.heavyDelta = true
+	p.noHeavyRequests = false
+	p.client.SetCallTimeout(80 * time.Millisecond)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	res, err := p.EnrichRepoContext(ctx, g, "", repoRoot, nil)
+	require.NoError(t, err)
+	require.NotNil(t, res)
+	require.Positive(t, rig.references.Load())
+	require.True(t, res.BreakerTripped, "three consecutive whale timeouts must trip the streak breaker")
+
+	parked := 0
+	for _, id := range []string{"w0.go::whale0", "w1.go::whale1", "w2.go::whale2"} {
+		if n := g.GetNodesByIDs([]string{id})[id]; n != nil && n.Meta["semantic_heavy_refs"] == "timeout" {
+			parked++
+		}
+	}
+	assert.Equal(t, 3, parked, "every whale that timed out while the server answered others is parked")
+	assert.True(t, res.Partial,
+		"a breaker-abandoned phase left the frontier unvisited: the pass is partial even with an empty error ledger")
+
+	// The retry: whales parked, the phase runs through, clean.
+	server2, rig2 := newRig()
+	p2, cleanup2 := providerWithFakeServerParallel(t, server2, []string{"go"}, 8)
+	defer cleanup2()
+	p2.heavyDelta = true
+	p2.noHeavyRequests = false
+	p2.client.SetCallTimeout(80 * time.Millisecond)
+	ctx2, cancel2 := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel2()
+	res2, err := p2.EnrichRepoContext(ctx2, g, "", repoRoot, nil)
+	require.NoError(t, err)
+	assert.Zero(t, rig2.references.Load(), "parked whales and the adjudicated plain target are not re-asked")
+	assert.False(t, res2.Partial, "with the whales parked the retry completes clean")
+	assert.False(t, res2.BreakerTripped)
+}
+
 // A server that wedges MID-pass — every call after its first success
 // burning the full budget with no reply (observed live: a Roslyn
 // references up-symbol cascade spinning forever on an interface-member

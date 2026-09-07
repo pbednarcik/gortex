@@ -676,7 +676,12 @@ func (s *backgroundScheduler) drain(ctx context.Context, g graph.Store, t backgr
 	s.mu.Unlock()
 	startedAt := time.Now()
 	result, err := be.EnrichBackground(ctx, g, t.repoName, t.repoRoot)
-	partial := result != nil && result.Partial
+	// A breaker-tripped drain is incomplete even when the provider did not
+	// say Partial: the abandoned phase left work unvisited and its silence
+	// is error-shaped. The marker predicate refuses it; so must the retry
+	// decision, or the repo is counted drained and waits for the next
+	// external trigger.
+	partial := result != nil && (result.Partial || result.BreakerTripped)
 	s.mu.Lock()
 	s.inFlightRepo = ""
 	switch {

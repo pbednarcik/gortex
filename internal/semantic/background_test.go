@@ -866,6 +866,37 @@ func TestBackgroundScheduler_RetryBackoff(t *testing.T) {
 		assert.Equal(t, 1, st.Retries)
 	})
 
+	t.Run("BreakerTrippedDrainRetriesLikePartial", func(t *testing.T) {
+		// A drain whose breaker abandoned a phase is incomplete even when
+		// its error ledger is empty: timeout parking turns the whale
+		// timeouts into verdicts, so nothing else marks the pass partial.
+		// The marker predicate already refuses such a drain; the scheduler
+		// must refuse it too, or the repo is logged complete, counted
+		// drained, and never retried until the next external trigger.
+		setBackoff(t, 250*time.Millisecond, 2*time.Second)
+		p := &mockBackgroundProvider{
+			mockProvider: mockProvider{name: "mock-bg", languages: []string{"go"}, available: true},
+			drained:      make(chan string, 8),
+			drainFunc: func(attempt int) (*EnrichResult, error) {
+				if attempt == 1 {
+					return &EnrichResult{Provider: "mock-bg", Language: "go", BreakerTripped: true}, nil
+				}
+				return &EnrichResult{Provider: "mock-bg", Language: "go", EdgesConfirmed: 1}, nil
+			},
+		}
+		s := newBackgroundScheduler(zap.NewNop())
+		defer s.close()
+		s.start(context.Background(), graph.New())
+
+		require.True(t, s.enqueue(task(p, "repo-a")))
+		assert.Equal(t, "repo-a", recv(t, p.drained), "first attempt")
+		assert.Equal(t, "repo-a", recv(t, p.drained), "a breaker-tripped drain must retry like a partial one")
+		assert.Eventually(t, func() bool { return s.status().Drained == 1 },
+			2*time.Second, 10*time.Millisecond)
+		st := s.status()
+		assert.Equal(t, 1, st.Retries, "the abandoned attempt counts as a retry, not a completion")
+	})
+
 	t.Run("RetryDelayDoublesUpToTheCap", func(t *testing.T) {
 		setBackoff(t, 100*time.Millisecond, 350*time.Millisecond)
 		assert.Equal(t, 100*time.Millisecond, backgroundRetryDelay(1))
