@@ -107,3 +107,91 @@ func TestSpawnTransport_StopKillsAStubbornServer(t *testing.T) {
 	// Idempotent: a second Stop returns the memoized result immediately.
 	require.NotPanics(t, func() { _ = tr.Stop() })
 }
+
+// stuckTransport models a server that stopped reading its stdin with the
+// pipe full, on an OS whose pipe Close waits for the in-flight Write
+// (Windows): a frame write blocks until the process is killed, and closing
+// the write end blocks behind it. Stop plays the kill — it releases the
+// writer with a broken-pipe error and EOFs the read side.
+type stuckTransport struct {
+	entered chan struct{} // closed when the first Write is in flight
+	release chan struct{} // closed by Stop: the kill that frees the pipe
+	once    sync.Once
+	stopped sync.Once
+	rd      *io.PipeReader
+	wr      *io.PipeWriter
+}
+
+func newStuckTransport() *stuckTransport {
+	return &stuckTransport{entered: make(chan struct{}), release: make(chan struct{})}
+}
+
+func (t *stuckTransport) Start() (io.WriteCloser, io.Reader, error) {
+	t.rd, t.wr = io.Pipe()
+	return t, t.rd, nil
+}
+
+func (t *stuckTransport) Write(p []byte) (int, error) {
+	t.once.Do(func() { close(t.entered) })
+	<-t.release
+	return 0, io.ErrClosedPipe
+}
+
+func (t *stuckTransport) Close() error {
+	<-t.release // a synchronous pipe's Close waits for the in-flight write
+	return nil
+}
+
+func (t *stuckTransport) Stop() error {
+	t.stopped.Do(func() {
+		close(t.release)
+		if t.wr != nil {
+			_ = t.wr.Close()
+		}
+	})
+	return nil
+}
+
+func (t *stuckTransport) SendsShutdown() bool { return true }
+func (t *stuckTransport) Description() string { return "stuck" }
+
+// A Call whose frame write blocks on a full stdin pipe must not wedge
+// teardown. The write used to run under the client's state mutex, so
+// Shutdown — and through it the lane's sealClients, the watchdog, and the
+// repository mutation waiting on cancelRepo — could never mark the client
+// closed, never close stdin, and never reach the transport kill that is the
+// only thing able to free the write. Shutdown must return within its
+// bounded handshake grace plus the transport's own stop, and the stuck Call
+// must fail once the transport is gone.
+func TestClientShutdown_ReturnsWhenAFrameWriteIsStuck(t *testing.T) {
+	prev := clientShutdownHandshakeGrace
+	clientShutdownHandshakeGrace = 100 * time.Millisecond
+	defer func() { clientShutdownHandshakeGrace = prev }()
+
+	tr := newStuckTransport()
+	c, err := NewClientWithTransport(tr, zap.NewNop())
+	require.NoError(t, err)
+	c.SetCallTimeout(50 * time.Millisecond)
+
+	callDone := make(chan error, 1)
+	go func() { callDone <- c.Call("textDocument/references", map[string]any{}, nil) }()
+	select {
+	case <-tr.entered:
+	case <-time.After(3 * time.Second):
+		t.Fatal("the Call never reached the frame write")
+	}
+
+	shut := make(chan error, 1)
+	go func() { shut <- c.Shutdown() }()
+	select {
+	case <-shut:
+	case <-time.After(3 * time.Second):
+		t.Fatal("Shutdown wedged behind a Call blocked on a full stdin pipe")
+	}
+	select {
+	case err := <-callDone:
+		require.Error(t, err, "a Call whose write the kill freed must fail, not report success")
+	case <-time.After(3 * time.Second):
+		t.Fatal("the stuck Call never returned after the transport was stopped")
+	}
+}

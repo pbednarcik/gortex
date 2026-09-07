@@ -49,6 +49,13 @@ type Client struct {
 
 	mu     sync.Mutex
 	closed bool
+	// writeMu serializes frames on stdin, SEPARATELY from mu: a write that
+	// blocks on a full pipe (the server stopped reading its stdin) must not
+	// hold the state lock, or Shutdown could never mark the client closed
+	// and reach the transport stop that is the only thing able to free the
+	// write — and with it the lane's sealClients, the watchdog, and the
+	// repository mutation waiting on cancelRepo.
+	writeMu sync.Mutex
 
 	// notifHandlers route server → client notifications. Keyed by
 	// LSP method name. Each handler receives the raw params and
@@ -432,6 +439,14 @@ func (c *Client) Notify(method string, params any) error {
 	return c.send(notif)
 }
 
+// clientShutdownHandshakeGrace bounds how long Shutdown waits for the LSP
+// shutdown/exit handshake to reach the wire. A healthy pipe takes it in
+// microseconds; a pipe whose reader stopped draining holds the frame writer
+// blocked, and the handshake must not hold teardown behind it — the
+// transport's stop (kill after its own grace) is what frees the writer.
+// Var so tests shrink it.
+var clientShutdownHandshakeGrace = time.Second
+
 // Shutdown closes the client. The transport decides whether the LSP
 // shutdown/exit handshake is sent first — spawned subprocesses get the
 // full sequence (we own their lifetime); dialed servers do not (the
@@ -457,9 +472,20 @@ func (c *Client) Shutdown() error {
 		// delivered nothing). Fire-and-forget: the shutdown request's
 		// reply is never awaited, so a wedged server can't block teardown
 		// — the server reads its stdin sequentially and sees the pair in
-		// order, which is all a clean exit needs.
-		_ = c.send(jsonRPCRequest{JSONRPC: "2.0", ID: c.reqID.Add(1), Method: "shutdown"})
-		_ = c.Notify("exit", nil)
+		// order, which is all a clean exit needs. Bounded: the frame
+		// writer may be stuck behind a pipe nobody drains, and the
+		// handshake must not hold teardown behind it; the transport stop
+		// below frees the writer, and the late frames then fail harmlessly.
+		handshake := make(chan struct{})
+		go func() {
+			defer close(handshake)
+			_ = c.send(jsonRPCRequest{JSONRPC: "2.0", ID: c.reqID.Add(1), Method: "shutdown"})
+			_ = c.Notify("exit", nil)
+		}()
+		select {
+		case <-handshake:
+		case <-time.After(clientShutdownHandshakeGrace):
+		}
 	}
 
 	c.mu.Lock()
@@ -477,7 +503,11 @@ func (c *Client) Shutdown() error {
 	c.mu.Unlock()
 
 	if sendsShutdown {
-		_ = c.stdin.Close()
+		// Off the critical path: on a synchronous pipe (Windows) Close waits
+		// for an in-flight write, and a stuck write is freed only by the
+		// transport stop below. A healthy pipe closes in microseconds either
+		// way, and the process sees its stdin EOF as before.
+		go func() { _ = c.stdin.Close() }()
 	}
 
 	if c.transport == nil {
@@ -494,11 +524,17 @@ func (c *Client) send(msg any) error {
 	}
 
 	c.mu.Lock()
-	defer c.mu.Unlock()
-
-	if c.closed {
+	closed := c.closed
+	c.mu.Unlock()
+	if closed {
 		return fmt.Errorf("client is closed")
 	}
+
+	// The frame goes out under its own lock (see writeMu): a Shutdown that
+	// races this write marks the client closed without waiting for it, and
+	// the write then fails on the closed pipe instead of holding teardown.
+	c.writeMu.Lock()
+	defer c.writeMu.Unlock()
 
 	header := fmt.Sprintf("Content-Length: %d\r\n\r\n", len(data))
 	if _, err := io.WriteString(c.stdin, header); err != nil {
