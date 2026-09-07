@@ -406,12 +406,13 @@ retries on its own** with bounded exponential backoff (1 min doubling to a
 30 min cap, reset by a clean drain or any fresh trigger) — a server that
 was briefly unavailable or still loading recovers without waiting for the
 next mutation or restart. Retries are not unconditional: an attempt that
-yielded no edges AND shrank no frontier made no progress; five stuck
-attempts are still retried, and the sixth **abandons** the task until the
-next external trigger — a server with a persistent per-target error must not
-re-run an identical drain every backoff interval for the daemon's
-lifetime, while a converging drain (its per-node stamps shrink each next
-attempt) always keeps its heartbeat. The lane obeys the same **admission
+yielded no edges, landed no references verdict, AND shrank no frontier made
+no progress; five stuck attempts are still retried, and the sixth
+**abandons** the task until the next external trigger — a server with a
+persistent per-target error must not re-run an identical drain every backoff
+interval for the daemon's lifetime, while a converging drain (its per-node
+stamps or references verdicts shrink each next attempt, even one that
+confirms no edge over a whale-dense tail) always keeps its heartbeat. The lane obeys the same **admission
 floor** as index-time enrichment (`GORTEX_ENRICH_MIN_NODES`, default 16): a
 language too small for a fast pass is never census-enqueued or
 mutation-requeued — with no fast marker its drain could never record

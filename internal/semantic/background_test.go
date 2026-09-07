@@ -204,6 +204,43 @@ func TestBackgroundScheduler_ShrinkingFrontierKeepsRetrying(t *testing.T) {
 	assert.Zero(t, s.status().Abandoned)
 }
 
+// References verdicts are progress too. A drain over a whale-dense tail can
+// confirm no edge and leave the hover frontier untouched (the sweep is off,
+// or every sweep node is already stamped) while still adjudicating confirm
+// targets — answered or parked — that no later drain re-asks. Counting only
+// edge yield and hover-frontier shrinkage abandoned exactly that converging
+// shape after the zero-progress cap.
+func TestBackgroundScheduler_RefsVerdictsCountAsProgress(t *testing.T) {
+	prevBase := backgroundRetryBase
+	prevMax := backgroundRetryMaxZeroProgress
+	backgroundRetryBase = 5 * time.Millisecond
+	backgroundRetryMaxZeroProgress = 1
+	defer func() {
+		backgroundRetryBase = prevBase
+		backgroundRetryMaxZeroProgress = prevMax
+	}()
+
+	p := &mockBackgroundProvider{
+		mockProvider: mockProvider{name: "mock-bg", languages: []string{"go"}, available: true},
+		drainFunc: func(attempt int) (*EnrichResult, error) {
+			if attempt < 5 {
+				// Zero edge yield, same hover frontier, a few verdicts landed.
+				return &EnrichResult{Partial: true, HoverCandidates: 40, RefsVerdicts: 3}, nil
+			}
+			return &EnrichResult{}, nil
+		},
+	}
+	s := newBackgroundScheduler(zap.NewNop())
+	defer s.close()
+	s.start(context.Background(), graph.New())
+
+	require.True(t, s.enqueue(backgroundTask{repoName: "repo", repoRoot: "/tmp/repo", provider: p, lang: "go"}))
+	require.Eventually(t, func() bool { return s.status().Drained == 1 }, 2*time.Second, 5*time.Millisecond,
+		"a drain that lands references verdicts every attempt is converging and must retry to completion")
+	assert.EqualValues(t, 5, p.attempts.Load())
+	assert.Zero(t, s.status().Abandoned)
+}
+
 // Abandonment is not a tombstone: the next external trigger (mutation
 // requeue, restart census, pass-end enqueue) revives the task with a
 // fresh zero-progress allowance.

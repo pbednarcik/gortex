@@ -237,6 +237,13 @@ type EnrichResult struct {
 	// rest is error-shaped, not evidence of emptiness — completion markers
 	// must not treat such a pass as having drained its tier.
 	BreakerTripped bool `json:"breaker_tripped,omitempty"`
+	// RefsVerdicts counts the confirm targets this pass adjudicated durably
+	// — a references answer recorded, a terminal-unconfirmable skip, or a
+	// full-budget timeout parked — so no later drain re-asks them. It is
+	// progress in its own right: a heavy-delta drain over a whale-dense tail
+	// can confirm no edge and shrink no hover frontier while still landing
+	// verdicts, and the scheduler's zero-progress abandonment must see that.
+	RefsVerdicts int `json:"refs_verdicts,omitempty"`
 }
 
 // Bounding reasons for the enrichment add-phase (EnrichResult.BoundReason /
