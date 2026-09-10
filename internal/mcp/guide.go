@@ -126,7 +126,11 @@ The session CWD selects an automatically discovered checkout overlay. Do not cal
 
 Every response carries freshness metadata. ` + "`exact:false`" + ` means the requested view was not served, and every fallback is read-only. Set ` + "`require_exact:true`" + ` to reject fallback, ` + "`require_fresh:true`" + ` to wait for current filesystem state, and bound waiting with an absolute RFC3339 ` + "`wait_deadline`" + `.
 
-When CWD is not the target, select it explicitly: ` + "`view:{kind:\"worktree\",checkout_id:\"…\"}`" + ` or ` + "`view:{kind:\"git_ref\",value:\"refs/heads/release\",graph_id:\"…\"}`" + `. Inactive ref/commit views have committed source and structural graph only—no working-copy LSP, ` + "`search.text`" + `, or edits. Exact worktree edits are allowed only through the approved coordinator-backed path; fallback and ref/commit views are read-only.
+An existing session keeps its CWD when another worktree is created. To use the new worktree, select its absolute root on the daemon host: ` + "`view:{kind:\"worktree\",path:\"/absolute/path/to/worktree\"}`" + `. Automatic discovery may still be pending immediately after creation; retry the request once discovery completes. Do not track or restart the daemon to make the worktree visible.
+
+For checkout IDs and discovery state, use ` + "`workspace(operation:\"checkouts\")`" + `. You can also select ` + "`view:{kind:\"worktree\",checkout_id:\"…\"}`" + `, where checkout_id is the opaque identifier from that inventory, not a filesystem path. Supply exactly one of path or checkout_id.
+
+For an inactive ref, use ` + "`view:{kind:\"git_ref\",value:\"refs/heads/release\",graph_id:\"…\"}`" + `. Inactive ref/commit views have committed source and structural graph only—no working-copy LSP, ` + "`search.text`" + `, or edits. Exact worktree edits are allowed only through the approved coordinator-backed path; fallback and ref/commit views are read-only.
 
 Checkout administration previews destructive effects by default. Before primary closure, family forget, or set-primary, inspect the preview and obtain explicit user confirmation before sending confirm.`
 

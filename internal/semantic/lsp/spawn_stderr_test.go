@@ -34,11 +34,7 @@ func TestSpawnTransport_RoutesStderrThroughLogger(t *testing.T) {
 	core, obs := observer.New(zapcore.DebugLevel)
 	logger := zap.New(core)
 
-	tr := &SpawnTransport{
-		Command: "/bin/sh",
-		Args:    []string{"-c", "echo err1 >&2; echo err2 >&2; echo stdout-line"},
-		Logger:  logger,
-	}
+	tr := helperTransport(t, helperStderrLines, 2, logger)
 	_, stdout, err := tr.Start()
 	require.NoError(t, err)
 
@@ -56,7 +52,7 @@ func TestSpawnTransport_RoutesStderrThroughLogger(t *testing.T) {
 	var lines []string
 	for _, e := range entries {
 		require.Equal(t, "subprocess stderr", e.Message)
-		require.Equal(t, "/bin/sh", e.ContextMap()["tag"])
+		require.Equal(t, tr.Command, e.ContextMap()["tag"])
 		line, _ := e.ContextMap()["line"].(string)
 		lines = append(lines, line)
 	}
@@ -68,10 +64,7 @@ func TestSpawnTransport_RoutesStderrThroughLogger(t *testing.T) {
 // with no Logger still drains stderr (rather than leaving the pipe
 // buffer to fill and the child to block on writing to it).
 func TestSpawnTransport_NilLoggerDoesNotBlock(t *testing.T) {
-	tr := &SpawnTransport{
-		Command: "/bin/sh",
-		Args:    []string{"-c", "for i in $(seq 1 500); do echo spam line $i >&2; done; echo done"},
-	}
+	tr := helperTransport(t, helperStderrLines, 500, nil)
 	_, stdout, err := tr.Start()
 	require.NoError(t, err)
 
@@ -98,11 +91,7 @@ func TestSpawnTransport_StderrBurstIsSuppressed(t *testing.T) {
 	core, obs := observer.New(zapcore.DebugLevel)
 	logger := zap.New(core)
 
-	tr := &SpawnTransport{
-		Command: "/bin/sh",
-		Args:    []string{"-c", "for i in $(seq 1 300); do echo boom $i >&2; done"},
-		Logger:  logger,
-	}
+	tr := helperTransport(t, helperStderrLines, 300, logger)
 	_, stdout, err := tr.Start()
 	require.NoError(t, err)
 	_, _ = io.Copy(io.Discard, stdout)

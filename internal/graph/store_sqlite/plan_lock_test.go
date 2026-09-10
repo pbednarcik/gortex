@@ -34,6 +34,12 @@ import (
 //     the index: those queries run under four statistics regimes because a
 //     tiny sqlite_stat1 row inverts the order INDEXED BY cannot pin)
 //
+// Those EXPLAIN locks bind the receiver queries' CROSS JOIN keywords only
+// conjunctively — no statistics regime flips a plan when just one keyword is
+// reverted — so method_receiver_rebind_join_order_test.go adds a static lock
+// on the join order the SQL text itself declares, binding each keyword
+// individually.
+//
 // A new hot query lands with a row in this table. Rows run against a
 // realistically-shaped fixture WITH planner statistics (ANALYZE), because
 // that is the state production stores run in after the bulk-finalize /

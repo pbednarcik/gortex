@@ -982,6 +982,21 @@ func (c *realController) status(ctx context.Context, waitForAggregate bool) (dae
 		ToolPresetMode:     agg.toolPresetMode,
 		LearnedTools:       agg.learnedTools,
 	}
+	if g != nil {
+		applyIndexFailureStatus(&resp, func(prefix string) (int, int, error) {
+			failures, err := indexer.LoadFileIndexFailuresWithError(g, prefix)
+			if err != nil {
+				return 0, 0, err
+			}
+			unreadable := 0
+			for _, failure := range failures {
+				if failure.PermissionDenied {
+					unreadable++
+				}
+			}
+			return len(failures), unreadable, nil
+		})
+	}
 	if cached {
 		// Say which half is a snapshot. Without the marker a stale repo
 		// table is indistinguishable from a current one, and an empty one

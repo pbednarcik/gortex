@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"runtime"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -563,6 +564,9 @@ func TestImportLegacy_FlushLaggedTotalsFlooredByEvents(t *testing.T) {
 // renaming, so the next open retries instead of permanently losing the
 // unread tail.
 func TestImportLegacy_UnreadableEventsAborts(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("windows has no POSIX mode bits: a 0000 file is still readable, so the read cannot be made to fail")
+	}
 	if os.Getuid() == 0 {
 		t.Skip("permission bits don't bind as root")
 	}

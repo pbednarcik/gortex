@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -175,7 +176,10 @@ func TestLoadEmbeddedMCPGlobalConfig(t *testing.T) {
 				if cfg != nil {
 					t.Fatalf("denied config = %#v, want nil", cfg)
 				}
-				if !strings.Contains(err.Error(), path) {
+				// The message Go-quotes the path, which doubles the
+				// separators of a Windows path; compare against the
+				// rendered spelling rather than the raw one.
+				if !strings.Contains(err.Error(), fmt.Sprintf("%q", path)) {
 					t.Fatalf("error %q does not identify config path %q", err, path)
 				}
 				return
@@ -205,7 +209,7 @@ func TestRunMCPDefaultDenyIgnoresRepoConfig(t *testing.T) {
 		t.Fatalf("runMCP error = %v, want default-deny guidance", err)
 	}
 	globalPath := filepath.Join(dirs.Config, "gortex", "config.yaml")
-	if !strings.Contains(err.Error(), globalPath) {
+	if !strings.Contains(err.Error(), fmt.Sprintf("%q", globalPath)) {
 		t.Fatalf("runMCP error %q does not identify machine-global config %q", err, globalPath)
 	}
 }

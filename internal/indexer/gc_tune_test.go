@@ -2,6 +2,7 @@ package indexer
 
 import (
 	"errors"
+	"math"
 	"os"
 	"runtime"
 	"runtime/debug"
@@ -238,11 +239,19 @@ func TestApplyIndexGCTuningRestores(t *testing.T) {
 	defer debug.SetGCPercent(originalPct)
 	originalLimit := debug.SetMemoryLimit(-1)
 	defer debug.SetMemoryLimit(originalLimit)
+	// Pin both inputs the GC-percent knob keys on instead of inheriting them
+	// from the host: an unbounded standing limit, and a budget the window can
+	// own. Reading the budget from the machine makes the assertion below a
+	// property of the runner — a host with no physical-memory reader (Windows)
+	// derives no budget at all, and the knob is then never installed.
+	standingLimit := int64(math.MaxInt64)
+	debug.SetMemoryLimit(standingLimit)
+	const windowBudget = int64(2) << 30
 
 	t.Setenv("GORTEX_INDEX_GC_TUNE", "1")
 	t.Setenv("GORTEX_INDEX_GC_PERCENT", "275")
 
-	restore := applyIndexGCTuning(nil)
+	restore := applyIndexGCTuningWithBudget(nil, windowBudget)
 
 	// While tuned, the GC percent must be the configured value, not the prior.
 	if cur := debug.SetGCPercent(275); cur != 275 {
@@ -262,9 +271,9 @@ func TestApplyIndexGCTuningRestores(t *testing.T) {
 	}
 	debug.SetGCPercent(priorPct)
 
-	// And the memory limit is back to its captured prior.
-	if cur := debug.SetMemoryLimit(-1); cur != originalLimit {
-		t.Fatalf("expected memory limit restored to %d, got %d", originalLimit, cur)
+	// And the memory limit is back to the standing limit the window captured.
+	if cur := debug.SetMemoryLimit(-1); cur != standingLimit {
+		t.Fatalf("expected memory limit restored to %d, got %d", standingLimit, cur)
 	}
 }
 

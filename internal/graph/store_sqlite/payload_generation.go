@@ -370,13 +370,39 @@ func (s *Store) PublishAndRoute(ctx context.Context, generationID int64, checkou
 	if err := s.PublishPayloadGeneration(ctx, generationID, publishedAt); err != nil {
 		return err
 	}
-	return s.Catalog().FlipCheckoutRouteSlot(ctx, FlipCheckoutRouteSlotRequest{
+	if err := s.Catalog().FlipCheckoutRouteSlot(ctx, FlipCheckoutRouteSlotRequest{
 		CheckoutID:         checkoutID,
 		Slot:               slot,
 		GenerationID:       generationID,
 		ExpectedRouteEpoch: expectRouteEpoch,
 		State:              RouteActive,
-	})
+	}); err != nil {
+		return err
+	}
+	// Publishing a generation adds a whole repository's payload in one step,
+	// so it is a boundary worth asking at — for a DIRECT caller of this API.
+	// It is not one of the daemon's four live boundaries: the checkout
+	// coordinator flips through FlipCheckoutRouteSlot rather than through
+	// here, and reaches the indexer's own boundaries via the generation
+	// builder's IndexCtx. Keeping the call is what makes this API safe for
+	// callers that do not go through the builder.
+	//
+	// Asked here rather than at the publish tail: between the publish and the
+	// flip the generation is ready but unrouted, and an ANALYZE holding the
+	// write gate inside that window would widen a documented transient state
+	// and stall a coordinator waiting behind it. The refresh is cooperative,
+	// so what this boundary pays is bounded at the pass budget plus one
+	// index's ANALYZE plus one bounded sqlite_schema reload — with the two
+	// health probes, the present-index list and the stat-row set read outside
+	// that bound, on the read pool and under no gate.
+	//
+	// Called directly rather than through graph.MaybeEnsurePlannerStatsFresh:
+	// the receiver IS the implementation, so the helper's type assertion would
+	// only hide a signature drift that should be a compile error here. The
+	// error is discarded for the helper's own reason — a store that could not
+	// refresh its statistics still routes the generation.
+	_, _ = s.EnsurePlannerStatsFresh(ctx)
+	return nil
 }
 
 // publishTimestamp is the published_at PublishAndRoute stamps. It reads

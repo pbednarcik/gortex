@@ -15,6 +15,7 @@ import (
 	"github.com/zzet/gortex/internal/config"
 	"github.com/zzet/gortex/internal/daemon"
 	"github.com/zzet/gortex/internal/pathkey"
+	"github.com/zzet/gortex/internal/testenv"
 )
 
 func TestBeforeTrackDeadlineBoundsDaemonReadiness(t *testing.T) {
@@ -35,7 +36,7 @@ func TestBeforeTrackDeadlineBoundsDaemonReadiness(t *testing.T) {
 }
 
 func TestNotifyDaemonTrackUsesRemainingDeadline(t *testing.T) {
-	socket := filepath.Join("/tmp", filepath.Base(filepath.Dir(t.TempDir()))+".sock")
+	socket := filepath.Join(testenv.ShortTempDir(t), "s")
 	listener, err := net.Listen("unix", socket)
 	if err != nil {
 		t.Fatalf("listen: %v", err)

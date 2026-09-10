@@ -187,11 +187,24 @@ func matchRepo(repos []config.RepoEntry, target string) (int, error) {
 		}
 		// Allow short suffix matches like "tuck-api" against
 		// "/Users/x/code/work/tuck-api".
-		if strings.HasSuffix(r.Path, string(filepath.Separator)+target) {
+		if hasTrailingComponent(r.Path, target) {
 			return i, nil
 		}
 	}
 	return -1, fmt.Errorf("no tracked repo matches %q (try `gortex daemon status` for the list)", target)
+}
+
+// hasTrailingComponent reports whether name is the last path component of p.
+// Both separators are accepted because a configured repo path is a string a
+// human (or a Git-for-Windows tool) wrote: on Windows the same entry turns up
+// as `C:\code\tuck-api` and `C:/code/tuck-api`, and a short-name lookup must
+// find either. On POSIX the two branches are the same test.
+func hasTrailingComponent(p, name string) bool {
+	if name == "" {
+		return false
+	}
+	return strings.HasSuffix(p, "/"+name) ||
+		strings.HasSuffix(p, string(filepath.Separator)+name)
 }
 
 // workspaceListEntry is one repo's resolved workspace/project view —

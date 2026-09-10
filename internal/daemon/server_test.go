@@ -14,6 +14,8 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"go.uber.org/zap"
+
+	"github.com/zzet/gortex/internal/testenv"
 )
 
 // osStat is an alias so fileExists() reads linearly without import rearrangement.
@@ -152,9 +154,7 @@ func (f *fakeController) EnrichCochange(_ context.Context, p EnrichCochangeParam
 // our own short directory under /tmp/gx-<random>.
 func newDaemon(t *testing.T, ctrl Controller) (*Server, string) {
 	t.Helper()
-	dir, err := os.MkdirTemp("/tmp", "gx")
-	require.NoError(t, err, "short tmp dir for unix socket")
-	t.Cleanup(func() { _ = os.RemoveAll(dir) })
+	dir := testenv.ShortTempDir(t)
 
 	socket := filepath.Join(dir, "s")
 	t.Setenv("GORTEX_DAEMON_SOCKET", socket)
@@ -307,20 +307,16 @@ func TestDaemon_ProtocolMismatchRejected(t *testing.T) {
 }
 
 func TestDial_NoDaemon_ReturnsErrUnavailable(t *testing.T) {
-	dir, err := os.MkdirTemp("/tmp", "gx")
-	require.NoError(t, err)
-	defer func() { _ = os.RemoveAll(dir) }()
+	dir := testenv.ShortTempDir(t)
 	missing := filepath.Join(dir, "missing")
-	_, err = DialTo(missing, Handshake{Mode: ModeControl})
+	_, err := DialTo(missing, Handshake{Mode: ModeControl})
 	require.Error(t, err)
 	assert.True(t, errors.Is(err, ErrDaemonUnavailable),
 		"Dial against missing socket must wrap ErrDaemonUnavailable; got %v", err)
 }
 
 func TestIsRunningAt(t *testing.T) {
-	dir, err := os.MkdirTemp("/tmp", "gx")
-	require.NoError(t, err)
-	defer func() { _ = os.RemoveAll(dir) }()
+	dir := testenv.ShortTempDir(t)
 	missing := filepath.Join(dir, "nope")
 	assert.False(t, IsRunningAt(missing))
 

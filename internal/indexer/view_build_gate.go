@@ -47,6 +47,9 @@ type viewBuildWaiter struct {
 	enqueuedAt time.Time
 	granted    bool
 	canceled   bool
+	// demand and promotionRequested are guarded by the gate mutex.
+	demand             <-chan struct{}
+	promotionRequested bool
 }
 
 // ViewBuildGateStats is a fixed-cardinality process-local snapshot. Queue
@@ -89,6 +92,8 @@ type ViewBuildGate struct {
 
 	interactive []*viewBuildWaiter
 	background  []*viewBuildWaiter
+	// Avoid scanning ordinary Acquire queues which contain no demand signals.
+	promotableQueued int
 
 	interactiveBurst int
 	interactiveLimit int
@@ -175,6 +180,17 @@ func (g *ViewBuildGate) Open() {
 // Acquire waits for the one physical build lane. Capacity applies only while a
 // caller must wait: even a zero-capacity gate admits an idle open lane.
 func (g *ViewBuildGate) Acquire(ctx context.Context, priority ViewBuildPriority) (func(), error) {
+	return g.AcquirePromotable(ctx, priority, nil)
+}
+
+// AcquirePromotable is Acquire with a coalesced demand signal. A signal promotes
+// a queued background waiter to the interactive tail; it never preempts an
+// active build. If the interactive queue is full, the waiter retains its
+// background place and promotion is retried as capacity becomes available.
+// Demand is consumed under the gate mutex before admission decisions; queue
+// statistics may still classify it as background until that scheduling point.
+// The caller owns demand; a buffered channel of capacity one coalesces signals.
+func (g *ViewBuildGate) AcquirePromotable(ctx context.Context, priority ViewBuildPriority, demand <-chan struct{}) (func(), error) {
 	if g == nil {
 		return func() {}, nil
 	}
@@ -185,12 +201,31 @@ func (g *ViewBuildGate) Acquire(ctx context.Context, priority ViewBuildPriority)
 		return nil, err
 	}
 	priority = normalizeViewBuildPriority(priority)
+	promotionRequested := false
 
 	g.mu.Lock()
 	// Restore the invariant before evaluating the immediate path. Normally all
 	// state transitions already call grantNextLocked.
 	g.grantNextLocked()
-	if g.open && !g.active && len(g.interactive) == 0 && len(g.background) == 0 {
+	idle := g.open && !g.active && len(g.interactive) == 0 && len(g.background) == 0
+	canWait := len(g.interactive) < g.interactiveLimit
+	if priority == ViewBuildBackground {
+		canWait = canWait || len(g.background) < g.backgroundLimit
+	}
+	// Leave demand buffered when admission must reject; a caller can retry
+	// without losing the selection which gave the request priority.
+	if idle || canWait {
+		select {
+		case <-demand:
+			promotionRequested = true
+			demand = nil
+		default:
+		}
+	}
+	if idle {
+		if promotionRequested {
+			priority = ViewBuildInteractive
+		}
 		g.active = true
 		g.recordPriorityLocked(priority)
 		g.recordAdmittedLocked(priority)
@@ -200,6 +235,14 @@ func (g *ViewBuildGate) Acquire(ctx context.Context, priority ViewBuildPriority)
 	if err := ctx.Err(); err != nil {
 		g.mu.Unlock()
 		return nil, err
+	}
+
+	if promotionRequested && priority == ViewBuildBackground && len(g.interactive) < g.interactiveLimit {
+		priority = ViewBuildInteractive
+	}
+	if priority == ViewBuildInteractive {
+		demand = nil
+		promotionRequested = false
 	}
 
 	limit, queued := g.backgroundLimit, len(g.background)
@@ -213,9 +256,11 @@ func (g *ViewBuildGate) Acquire(ctx context.Context, priority ViewBuildPriority)
 	}
 
 	waiter := &viewBuildWaiter{
-		ready:      make(chan struct{}),
-		priority:   priority,
-		enqueuedAt: time.Now(),
+		ready:              make(chan struct{}),
+		priority:           priority,
+		enqueuedAt:         time.Now(),
+		demand:             demand,
+		promotionRequested: promotionRequested,
 	}
 	if priority == ViewBuildInteractive {
 		g.interactive = append(g.interactive, waiter)
@@ -224,6 +269,9 @@ func (g *ViewBuildGate) Acquire(ctx context.Context, priority ViewBuildPriority)
 		}
 	} else {
 		g.background = append(g.background, waiter)
+		if waiter.demand != nil || waiter.promotionRequested {
+			g.promotableQueued++
+		}
 		if len(g.background) > g.backgroundHighWater {
 			g.backgroundHighWater = len(g.background)
 		}
@@ -279,6 +327,7 @@ func (g *ViewBuildGate) release() {
 }
 
 func (g *ViewBuildGate) grantNextLocked() {
+	g.promoteDemandedLocked()
 	if !g.open || g.active {
 		return
 	}
@@ -312,6 +361,42 @@ func (g *ViewBuildGate) grantNextLocked() {
 	}
 }
 
+// promoteDemandedLocked also samples signals in the granting goroutine, so
+// a release cannot overlook buffered demand merely because the waiting
+// goroutine has not been scheduled yet. Compaction preserves background FIFO;
+// promotions join the interactive tail and keep their original wait start.
+func (g *ViewBuildGate) promoteDemandedLocked() {
+	if g.promotableQueued == 0 {
+		return
+	}
+	kept := g.background[:0]
+	for _, waiter := range g.background {
+		if waiter.demand != nil {
+			select {
+			case <-waiter.demand:
+				waiter.demand = nil
+				waiter.promotionRequested = true
+			default:
+			}
+		}
+		if waiter.promotionRequested && len(g.interactive) < g.interactiveLimit {
+			g.promotableQueued--
+			waiter.promotionRequested = false
+			waiter.priority = ViewBuildInteractive
+			g.interactive = append(g.interactive, waiter)
+			if len(g.interactive) > g.interactiveHighWater {
+				g.interactiveHighWater = len(g.interactive)
+			}
+			viewmetrics.AddGauge(viewmetrics.ViewBuildQueue, -1, viewBuildPriorityLabel(ViewBuildBackground))
+			viewmetrics.AddGauge(viewmetrics.ViewBuildQueue, 1, viewBuildPriorityLabel(ViewBuildInteractive))
+			continue
+		}
+		kept = append(kept, waiter)
+	}
+	clear(g.background[len(kept):])
+	g.background = kept
+}
+
 func (g *ViewBuildGate) recordPriorityLocked(priority ViewBuildPriority) {
 	if priority == ViewBuildInteractive {
 		if g.interactiveBurst < maxInteractiveBuildBurst {
@@ -323,6 +408,9 @@ func (g *ViewBuildGate) recordPriorityLocked(priority ViewBuildPriority) {
 }
 
 func (g *ViewBuildGate) recordDequeuedLocked(waiter *viewBuildWaiter) {
+	if waiter.priority == ViewBuildBackground && (waiter.demand != nil || waiter.promotionRequested) {
+		g.promotableQueued--
+	}
 	priority := viewBuildPriorityLabel(waiter.priority)
 	viewmetrics.AddGauge(viewmetrics.ViewBuildQueue, -1, priority)
 	waited := time.Since(waiter.enqueuedAt)

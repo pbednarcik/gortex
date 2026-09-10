@@ -160,9 +160,14 @@ func TestDeferredIncrementalGoFrontierUsesOneBatchAndNoRepoPass(t *testing.T) {
 			assert.Zero(t, provider.singleCalls)
 			assert.Zero(t, provider.fullCalls, "known Go files must not fall back to repo enrichment")
 			require.Len(t, provider.batches, 1)
+			// A deferred batch carries graph paths, not OS paths: the indexer
+			// keys them with pathkey.Normalize(filepath.ToSlash(rel)), so the
+			// fixture's own '/' spelling is the expectation verbatim on every
+			// platform. FromSlash here would want `pkg\a.go` on Windows and
+			// match nothing.
 			wantGraphPaths := make([]string, 0, len(tc.files))
 			for _, fixture := range tc.files {
-				wantGraphPaths = append(wantGraphPaths, filepath.FromSlash(fixture.relPath))
+				wantGraphPaths = append(wantGraphPaths, fixture.relPath)
 			}
 			assert.ElementsMatch(t, wantGraphPaths, provider.batches[0])
 			assert.False(t, idx.pendingEnrich.Load())

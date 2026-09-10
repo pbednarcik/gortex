@@ -446,9 +446,26 @@ func TestCheckpointBusyResultIsRetriedAndNeverReportedAsSuccess(t *testing.T) {
 	require.NoError(t, readTx.QueryRow(`SELECT COUNT(*) FROM nodes`).Scan(&count))
 	store.AddNode(&graph.Node{ID: "repo/b.go::B", Kind: graph.KindFunction, Name: "B"})
 
+	// PASSIVE never waits for a reader: SQLite documents the busy handler as
+	// never invoked in that mode, and the read-slot lock the checkpointer wants
+	// is attempted exactly once and abandoned the moment it is refused. What
+	// PASSIVE does do is back-fill every frame below the reader's mark, and
+	// that copy is ordinary file I/O which the context deadline cannot
+	// interrupt mid-syscall. Here it is 408 frames: under a millisecond on a
+	// warm local disk, seconds on a contended CI disk. Timing that first drain
+	// measures the disk rather than the contention rule, so it is given room to
+	// finish and the rule is measured on the pass after it — with nothing left
+	// below the reader's mark that pass copies nothing at all, so it can only
+	// be slow by waiting for the long reader.
+	store.passiveCheckpointTimeout = 30 * time.Second
+	require.True(t, store.checkpointWALPassive(), "draining up to the reader's mark leaves an incomplete checkpoint")
+
 	started := time.Now()
-	store.checkpointWALPassive()
-	assert.Less(t, time.Since(started), time.Second, "PASSIVE maintenance must not wait for the long reader")
+	retryUnderReader := store.checkpointWALPassive()
+	passiveElapsed := time.Since(started)
+	store.passiveCheckpointTimeout = 0
+	assert.Less(t, passiveElapsed, time.Second, "PASSIVE maintenance must not wait for the long reader")
+	assert.True(t, retryUnderReader, "PASSIVE must report the frames the long reader still pins as an incomplete drain")
 
 	setWriterBusyTimeout(t, store, 0)
 	store.busyRetryTimeout = 80 * time.Millisecond

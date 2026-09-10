@@ -2,8 +2,11 @@ package embedding
 
 import (
 	"context"
+	"errors"
 	"testing"
+	"time"
 
+	"github.com/knights-analytics/hugot"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -121,6 +124,13 @@ func TestStaticProvider_SemanticSimilarity(t *testing.T) {
 	assert.Greater(t, dot, 0.3, "semantically similar queries should have cosine > 0.3")
 }
 
+// testDownloadBudget bounds the cold model download this test triggers.
+// The fetch takes ~26s on a healthy runner, so three minutes is many
+// times the honest cost while still failing fast: without a bound, a
+// Hugging Face transfer that stalls parks the whole package until the
+// go test timeout kills it (a 45-minute CI kill, observed on Windows).
+const testDownloadBudget = 3 * time.Minute
+
 func TestNewLocalProvider_ReturnsWorkingProvider(t *testing.T) {
 	if raceEnabled {
 		// NewLocalProvider falls through to Hugot on a fresh machine,
@@ -133,8 +143,21 @@ func TestNewLocalProvider_ReturnsWorkingProvider(t *testing.T) {
 		// patch. Non-race builds still exercise the full fallback.
 		t.Skip("upstream data race in go-huggingface/hub.DownloadFilesCtx — skipping under -race")
 	}
-	p, err := NewLocalProvider()
-	require.NoError(t, err)
+	t.Setenv(embeddingDownloadBudgetEnv, testDownloadBudget.String())
+
+	// The report variant is the same chain NewLocalProvider runs — it
+	// just keeps the per-backend errors instead of discarding them, and
+	// those errors are the only place a stalled download is visible: a
+	// Hugot that gave up on the network falls through to the static
+	// provider, so the constructor succeeds either way.
+	p, report := NewLocalProviderWithReport()
+	for _, attempt := range report.Attempts {
+		if errors.Is(attempt.Err, context.DeadlineExceeded) {
+			t.Skipf("embedding model %s did not download within %s — network conditions, not a defect (%s backend: %v)",
+				miniLMRepo, testDownloadBudget, attempt.Backend, attempt.Err)
+		}
+	}
+	require.NotNil(t, p, "no backend constructed, not even the static fallback: %+v", report.Attempts)
 	defer p.Close()
 
 	// Default build walks ONNX → GoMLX → Hugot → Static and returns
@@ -142,8 +165,56 @@ func TestNewLocalProvider_ReturnsWorkingProvider(t *testing.T) {
 	// onnx/model.onnx, Hugot succeeds when the model is cached or
 	// the network is reachable. Either is fine — the invariant is
 	// "NewLocalProvider returns a working provider."
-	assert.NotNil(t, p)
 	assert.Greater(t, p.Dimensions(), 0, "provider must report positive dimensions")
+}
+
+// TestDownloadHugotModelAbandonsAStalledFetch pins the watchdog the test
+// above leans on. Nothing inside the download honours a deadline —
+// hugot.DownloadModel hands its context only to the post-fetch copy, and
+// go-huggingface's worker pool waits on a context-blind sync.Cond — so
+// the budget has to expire out in our own code. The stub stands in for a
+// transfer that never progresses.
+func TestDownloadHugotModelAbandonsAStalledFetch(t *testing.T) {
+	stalled := make(chan struct{})
+	defer close(stalled)
+	restore := hugotDownloadModel
+	t.Cleanup(func() { hugotDownloadModel = restore })
+	hugotDownloadModel = func(context.Context, string, string, hugot.DownloadOptions) (string, error) {
+		<-stalled // context-blind, exactly like the upstream semaphore wait
+		return "", nil
+	}
+	t.Setenv(embeddingDownloadBudgetEnv, "50ms")
+
+	spec, ok := LookupHugotVariant(DefaultHugotVariant)
+	require.True(t, ok)
+	start := time.Now()
+	path, err := downloadHugotModel(spec, t.TempDir(), hugot.NewDownloadOptions())
+
+	require.Error(t, err, "a stalled download returned a path (%q) instead of giving up", path)
+	require.ErrorIs(t, err, context.DeadlineExceeded, "the error must name the deadline so callers can tell a stall from a broken model")
+	assert.Less(t, time.Since(start), 10*time.Second, "the budget did not bind")
+}
+
+// TestDownloadBudgetHonoursTheEnvOverride pins both halves of the budget
+// resolution: a generous default for a real cold fetch, and an override
+// a test or an operator on a slow link can dial in.
+func TestDownloadBudgetHonoursTheEnvOverride(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		value string
+		want  time.Duration
+	}{
+		{"unset", "", defaultDownloadBudget},
+		{"override", "90s", 90 * time.Second},
+		{"unparseable", "soon", defaultDownloadBudget},
+		{"zero", "0s", defaultDownloadBudget},
+		{"negative", "-1m", defaultDownloadBudget},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Setenv(embeddingDownloadBudgetEnv, tc.value)
+			assert.Equal(t, tc.want, downloadBudget())
+		})
+	}
 }
 
 func TestTokenizeForEmbedding(t *testing.T) {

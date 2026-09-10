@@ -3,7 +3,6 @@ package hooks
 import (
 	"encoding/json"
 	"fmt"
-	"io"
 	"os"
 	"path/filepath"
 	"strings"
@@ -1012,22 +1011,35 @@ func configureLocalizationTerminalTestHome(t *testing.T) {
 	testenv.Sandbox(t)
 }
 
+// captureHookStdout runs fn with os.Stdout on a pipe and returns what it
+// wrote.
+//
+// The read has to run concurrently with fn, which is why this delegates to
+// captureStdout rather than reading after fn returns: an OS pipe holds only a
+// bounded amount of unread data, and the writer blocks once it is full. The
+// buffer is 64KiB on Linux/macOS but only 4KiB on Windows (Go's os.Pipe asks
+// CreatePipe for the system default), and the SessionStart briefing this
+// helper captures is ~4.7KiB — so a drain-after-fn helper deadlocked the
+// whole hooks test binary on Windows and only there. It was killed by the
+// go test timeout at 49m30s, which is the package's entire reported runtime.
 func captureHookStdout(t *testing.T, fn func()) string {
 	t.Helper()
-	original := os.Stdout
-	reader, writer, err := os.Pipe()
-	if err != nil {
-		t.Fatal(err)
+	return captureStdout(t, fn)
+}
+
+// TestCaptureHookStdoutOutlivesThePipeBuffer guards the property above against
+// a future helper that reads only after fn returns. A hook that writes more
+// than the pipe holds must still complete, so the assertion is that this test
+// finishes at all — a helper without a concurrent drain deadlocks here and
+// takes the whole package down with the go test timeout, which is how the
+// SessionStart briefing (~4.7KiB, over the 4KiB Windows pipe buffer) hung the
+// Windows shard.
+func TestCaptureHookStdoutOutlivesThePipeBuffer(t *testing.T) {
+	const size = 128 << 10 // over every platform's pipe buffer
+	out := captureHookStdout(t, func() {
+		_, _ = os.Stdout.WriteString(strings.Repeat("x", size))
+	})
+	if len(out) != size {
+		t.Fatalf("captured %d bytes, want %d", len(out), size)
 	}
-	os.Stdout = writer
-	defer func() { os.Stdout = original }()
-	fn()
-	if err := writer.Close(); err != nil {
-		t.Fatal(err)
-	}
-	data, err := io.ReadAll(reader)
-	if err != nil {
-		t.Fatal(err)
-	}
-	return string(data)
 }

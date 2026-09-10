@@ -151,6 +151,7 @@ func TestLoadHistory_SinceZeroUsesCumulative(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	t.Cleanup(func() { _ = store.Close() })
 	store.AddObservation(savings.Observation{Repo: "/r", Language: "go", Tool: "get_symbol_source", Returned: 50, Saved: 500})
 	h, err := loadHistory(dir, 0)
 	if err != nil {
@@ -167,6 +168,7 @@ func TestLoadHistory_WindowFiltersEvents(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	t.Cleanup(func() { _ = store.Close() })
 	store.AddObservation(savings.Observation{Repo: "/r", Language: "go", Tool: "read_file", Returned: 10, Saved: 90})
 
 	h, err := loadHistory(dir, 24*time.Hour)

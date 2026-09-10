@@ -3,6 +3,7 @@ package hooks
 import (
 	"encoding/json"
 	"fmt"
+	"path/filepath"
 	"strings"
 	"testing"
 
@@ -293,7 +294,8 @@ func TestRenderTestTargets_CapsBytes(t *testing.T) {
 // incidentChangeSet mirrors the reported failure: a session that edited one Go
 // file while a sibling session on the same checkout left three release-config
 // files dirty.
-const incidentChangeSet = `{
+func incidentChangeSet() string {
+	return `{
 	"changed_files":["internal/hooks/posttask.go",".goreleaser.yml",".github/workflows/ci.yml",".github/workflows/release.yml"],
 	"changed_symbols":[
 		{"id":"gortex/internal/hooks/posttask.go::runPostTask","name":"runPostTask","kind":"function","file_path":"gortex/internal/hooks/posttask.go"},
@@ -302,27 +304,28 @@ const incidentChangeSet = `{
 		{"id":"gortex/.github/workflows/release.yml::jobs","name":"jobs","kind":"config","file_path":"gortex/.github/workflows/release.yml"}
 	],
 	"risk":"HIGH","summary":"4 symbols touched",
-	"scope":"all","repo":"gortex","repo_root":"/repo"
+	"scope":"all","repo":"gortex","repo_root":"` + jsonPathFixture(repoFixtureRoot) + `"
 }`
+}
 
 // TestRunPostTask_AttributesOnlyThisSessionsEdits is the regression test for
 // the reported bug: session A's Stop hook reported session B's in-flight edits
 // and told A to run tests for files it never touched.
 func TestRunPostTask_AttributesOnlyThisSessionsEdits(t *testing.T) {
 	withSessionDir(t)
-	withTrackedRepos(t, daemon.TrackedRepoStatus{Prefix: "gortex", Path: "/repo"})
+	withTrackedRepos(t, daemon.TrackedRepoStatus{Prefix: "gortex", Path: repoFixtureRoot})
 	saveSessionState("sess-a", sessionState{
-		WrittenPaths: []string{"/repo/internal/hooks/posttask.go"},
+		WrittenPaths: []string{filepath.Join(repoFixtureRoot, "internal", "hooks", "posttask.go")},
 	})
 
 	srv := newRecordingFakeServer(map[string]string{
-		"detect_changes":        incidentChangeSet,
+		"detect_changes":        incidentChangeSet(),
 		"get_test_targets":      "internal/hooks/posttask_test.go TestRunPostTask\nrun: go test ./internal/hooks/\n",
 		"explain_change_impact": `{"risk":"LOW","summary":"1 symbol","total_affected":2}`,
 	})
 	defer srv.Close()
 
-	data := []byte(`{"hook_event_name":"Stop","stop_hook_active":false,"session_id":"sess-a","cwd":"/repo"}`)
+	data := mustJSON(t, map[string]any{"hook_event_name": "Stop", "stop_hook_active": false, "session_id": "sess-a", "cwd": repoFixtureRoot})
 	out := captureStdout(t, func() { runPostTask(data, portFromURL(t, srv.URL)) })
 	if out == "" {
 		t.Fatal("expected a briefing for the session's own edit")
@@ -370,19 +373,19 @@ func TestRunPostTask_AttributesOnlyThisSessionsEdits(t *testing.T) {
 // Stop fires every turn, so this must be silent rather than a repeated notice.
 func TestRunPostTask_SessionOwnsNothing_Silent(t *testing.T) {
 	withSessionDir(t)
-	withTrackedRepos(t, daemon.TrackedRepoStatus{Prefix: "gortex", Path: "/repo"})
+	withTrackedRepos(t, daemon.TrackedRepoStatus{Prefix: "gortex", Path: repoFixtureRoot})
 	// The session wrote only outside the repo — scratchpad and memory files.
 	saveSessionState("sess-a", sessionState{
-		WrittenPaths: []string{"/tmp/scratch/report.html", "/Users/dev/.claude/memory/MEMORY.md"},
+		WrittenPaths: []string{fixtureAbs("/tmp/scratch/report.html"), fixtureAbs("/Users/dev/.claude/memory/MEMORY.md")},
 	})
 
 	srv := newRecordingFakeServer(map[string]string{
-		"detect_changes":   incidentChangeSet,
+		"detect_changes":   incidentChangeSet(),
 		"get_test_targets": "should-never-be-called\n",
 	})
 	defer srv.Close()
 
-	data := []byte(`{"hook_event_name":"Stop","stop_hook_active":false,"session_id":"sess-a","cwd":"/repo"}`)
+	data := mustJSON(t, map[string]any{"hook_event_name": "Stop", "stop_hook_active": false, "session_id": "sess-a", "cwd": repoFixtureRoot})
 	out := captureStdout(t, func() { runPostTask(data, portFromURL(t, srv.URL)) })
 
 	if out != "" {
@@ -398,20 +401,20 @@ func TestRunPostTask_SessionOwnsNothing_Silent(t *testing.T) {
 // own risk already describes it.
 func TestRunPostTask_OwnsAll_SkipsImpactCall(t *testing.T) {
 	withSessionDir(t)
-	withTrackedRepos(t, daemon.TrackedRepoStatus{Prefix: "gortex", Path: "/repo"})
-	saveSessionState("sess-a", sessionState{WrittenPaths: []string{"/repo/internal/foo.go"}})
+	withTrackedRepos(t, daemon.TrackedRepoStatus{Prefix: "gortex", Path: repoFixtureRoot})
+	saveSessionState("sess-a", sessionState{WrittenPaths: []string{filepath.Join(repoFixtureRoot, "internal", "foo.go")}})
 
 	srv := newRecordingFakeServer(map[string]string{
 		"detect_changes": `{
 			"changed_files":["internal/foo.go"],
 			"changed_symbols":[{"id":"gortex/internal/foo.go::Foo","name":"Foo","kind":"function","file_path":"gortex/internal/foo.go"}],
-			"risk":"MEDIUM","summary":"1","scope":"all","repo":"gortex","repo_root":"/repo"
+			"risk":"MEDIUM","summary":"1","scope":"all","repo":"gortex","repo_root":"` + jsonPathFixture(repoFixtureRoot) + `"
 		}`,
 		"get_test_targets": "internal/foo_test.go TestFoo\n",
 	})
 	defer srv.Close()
 
-	data := []byte(`{"hook_event_name":"Stop","stop_hook_active":false,"session_id":"sess-a","cwd":"/repo"}`)
+	data := mustJSON(t, map[string]any{"hook_event_name": "Stop", "stop_hook_active": false, "session_id": "sess-a", "cwd": repoFixtureRoot})
 	out := captureStdout(t, func() { runPostTask(data, portFromURL(t, srv.URL)) })
 
 	if n := srv.callCount("explain_change_impact"); n != 0 {

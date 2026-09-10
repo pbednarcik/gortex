@@ -3,7 +3,9 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"path/filepath"
+	"runtime"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -62,6 +64,15 @@ func TestDispatcher_CaseMismatchedCWD_Tracked(t *testing.T) {
 // rejected — the fold must not over-merge on genuinely case-sensitive
 // volumes.
 func TestDispatcher_CaseSensitiveCWD_RejectsVariant(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		// CanonicalHasPathPrefix's fallback re-spells both operands
+		// through filepath.EvalSymlinks, and Windows resolves a handle
+		// to the directory's true on-disk casing — so the case-toggled
+		// variant canonicalizes back to the tracked root no matter what
+		// CaseInsensitivePaths says. The fixture cannot stand in for a
+		// case-sensitive volume here.
+		t.Skip("Windows path canonicalization erases the case difference the fixture relies on")
+	}
 	forceCaseInsensitivePaths(t, false)
 	tracked := t.TempDir()
 	d, _ := trackedPathMCPSetup(t, tracked)
@@ -95,6 +106,9 @@ func TestDispatcher_UntrackedInstructions_IncludeTrackedRoots(t *testing.T) {
 	assert.Contains(t, instr, "INACTIVE")
 	assert.Contains(t, instr, "Tracked repository roots",
 		"instructions must list tracked roots for self-diagnosis")
-	assert.Contains(t, instr, tracked,
+	// The diagnostic Go-quotes each root so a case-only or trailing-space
+	// difference is visible, which doubles the separators of a Windows
+	// path; compare against the rendered spelling, not the raw one.
+	assert.Contains(t, instr, fmt.Sprintf("%q", tracked),
 		"instructions must name the actual tracked root path")
 }

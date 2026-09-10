@@ -369,8 +369,8 @@ func resolveLaunchCWD() (string, error) {
 }
 
 // isAmbiguousLaunchCWD returns true when `p` is an editor-launch cwd
-// we can't trust to point at the active project — empty, `/`, or the
-// user's home directory.
+// we can't trust to point at the active project — empty, a filesystem
+// root, or the user's home directory.
 //
 // The home comparison goes through filepath.EvalSymlinks so the
 // macOS `/var → /private/var` redirect (and similar symlinks) don't
@@ -378,6 +378,13 @@ func resolveLaunchCWD() (string, error) {
 // then Getwd reports the resolved form.
 func isAmbiguousLaunchCWD(p string) bool {
 	if p == "" || p == "/" {
+		return true
+	}
+	// A root directory is as uninformative as `/`, and on Windows a root
+	// is spelled with a volume — `D:\`, or a UNC share root — so the `/`
+	// literal above never matches what os.Getwd reports there. Every root
+	// is its own filepath.Dir; no other absolute path is.
+	if clean := filepath.Clean(p); filepath.IsAbs(clean) && clean == filepath.Dir(clean) {
 		return true
 	}
 	home, err := os.UserHomeDir()

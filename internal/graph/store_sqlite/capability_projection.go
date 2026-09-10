@@ -1,42 +1,22 @@
 package store_sqlite
 
-import "github.com/zzet/gortex/internal/graph"
+import (
+	"strings"
 
-// ScanRepoCapabilityEdges reads only source repository and logical identity
-// columns needed by capability synthesis. nil repoPrefixes scans all sources;
-// a non-nil empty slice scans none. The id keyset freezes the generation and
-// bounds every allocation; each cursor is closed before yield runs so the
-// callback may safely re-enter the store.
-func (s *Store) ScanRepoCapabilityEdges(
-	repoPrefixes []string,
-	pageSize int,
-	yield func([]graph.RepoCapabilityEdge) bool,
-) {
-	if yield == nil || (repoPrefixes != nil && len(repoPrefixes) == 0) {
-		return
-	}
-	allRepos := repoPrefixes == nil
-	var reposJSON string
-	if !allRepos {
-		var ok bool
-		reposJSON, ok = projectionJSON(repoPrefixes)
-		if !ok {
-			return
-		}
-	}
-	if pageSize <= 0 {
-		pageSize = 4096
-	}
+	"github.com/zzet/gortex/internal/graph"
+)
 
-	var highWater int64
-	if err := s.db.QueryRow(`SELECT COALESCE(MAX(id), 0) FROM edges WHERE view_gen = ?`, s.viewGen).Scan(&highWater); err != nil {
-		panicOnFatal(err)
-		return
+// capabilityProjectionHighWaterQuery keeps the legacy base-corpus access path,
+// but makes the partial (view_gen, id) index eligible for derived generations.
+func capabilityProjectionHighWaterQuery(viewGen int64) string {
+	const query = `SELECT COALESCE(MAX(id), 0) FROM edges WHERE view_gen = ?`
+	if viewGen > 0 {
+		return query + ` AND view_gen > 0`
 	}
-	if highWater == 0 {
-		return
-	}
+	return query
+}
 
+func capabilityProjectionPageQuery(viewGen int64, allRepos bool) string {
 	const scopedQuery = `
 WITH requested_repos(repo_prefix) AS (
     SELECT CAST(value AS TEXT) FROM json_each(?)
@@ -67,7 +47,54 @@ LIMIT ?`
 	if allRepos {
 		query = allQuery
 	}
-	stmt, err := s.db.Prepare(query)
+	if viewGen > 0 {
+		// A sparse generation can sit behind millions of unrelated corpus
+		// rows in this shared table. Do not force a global row-id traversal.
+		// The explicit positive predicate proves eligibility for the existing
+		// partial edges_by_generation index; equality to a parameter does not.
+		// This is not INDEXED BY: an optional index being absent remains safe.
+		query = strings.Replace(query, "edges AS e NOT INDEXED", "edges AS e", 1)
+		query = strings.Replace(query, "e.view_gen = ?", "e.view_gen = ? AND e.view_gen > 0", 1)
+	}
+	return query
+}
+
+// ScanRepoCapabilityEdges reads only source repository and logical identity
+// columns needed by capability synthesis. nil repoPrefixes scans all sources;
+// a non-nil empty slice scans none. The id keyset freezes the generation and
+// bounds every allocation; each cursor is closed before yield runs so the
+// callback may safely re-enter the store.
+func (s *Store) ScanRepoCapabilityEdges(
+	repoPrefixes []string,
+	pageSize int,
+	yield func([]graph.RepoCapabilityEdge) bool,
+) {
+	if yield == nil || (repoPrefixes != nil && len(repoPrefixes) == 0) {
+		return
+	}
+	allRepos := repoPrefixes == nil
+	var reposJSON string
+	if !allRepos {
+		var ok bool
+		reposJSON, ok = projectionJSON(repoPrefixes)
+		if !ok {
+			return
+		}
+	}
+	if pageSize <= 0 {
+		pageSize = 4096
+	}
+
+	var highWater int64
+	if err := s.db.QueryRow(capabilityProjectionHighWaterQuery(s.viewGen), s.viewGen).Scan(&highWater); err != nil {
+		panicOnFatal(err)
+		return
+	}
+	if highWater == 0 {
+		return
+	}
+
+	stmt, err := s.db.Prepare(capabilityProjectionPageQuery(s.viewGen, allRepos))
 	if err != nil {
 		panicOnFatal(err)
 		return

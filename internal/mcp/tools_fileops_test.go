@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"runtime"
 	"testing"
 
 	mcplib "github.com/mark3labs/mcp-go/mcp"
@@ -181,6 +182,9 @@ func TestEditFile_NonexistentFile(t *testing.T) {
 }
 
 func TestWriteFile_PreservesExistingMode(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("POSIX permission bits: Windows has no exec bit and reports every file as 0666 or 0444")
+	}
 	srv, dir := setupTestServer(t)
 	target := filepath.Join(dir, "exec.sh")
 	require.NoError(t, os.WriteFile(target, []byte("old"), 0o755))

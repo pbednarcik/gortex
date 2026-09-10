@@ -76,7 +76,7 @@ func ResolvePascalForms(g graph.Store) int {
 // pascalFormKey is the directory plus lowercased extension-less basename that a
 // paired unit and form share.
 func pascalFormKey(path string) string {
-	dir := filepath.ToSlash(filepath.Dir(path))
+	dir := filePathDir(path)
 	base := filepath.Base(path)
 	base = strings.TrimSuffix(base, filepath.Ext(base))
 	return dir + "/" + strings.ToLower(base)

@@ -389,16 +389,18 @@ func TestPassiveProvider_DialFailsSpawnFallback(t *testing.T) {
 	deadAddr := ln.Addr().String()
 	require.NoError(t, ln.Close())
 
-	// /bin/cat with no args blocks on stdin without writing anything,
-	// so the spawn succeeds but the (immediate) initialize Call we
-	// don't make would have blocked indefinitely. We don't invoke
-	// initialize here — dialOrSpawn just constructs the Client.
-	// /bin/cat exits cleanly when we close stdin during Shutdown,
-	// so the deferred Close is fast.
+	// The helper's cat mode blocks on stdin without writing anything, so
+	// the spawn succeeds but the (immediate) initialize Call we don't make
+	// would have blocked indefinitely. We don't invoke initialize here —
+	// dialOrSpawn just constructs the Client. It exits cleanly when we
+	// close stdin during Shutdown, so the deferred Close is fast. This is
+	// the test binary rather than /bin/cat because Windows has neither
+	// /bin/cat nor a shell at a fixed path.
+	useHelper(t, helperCat, 0)
 	spec := &ServerSpec{
 		Name:      "fake-passive-spawn-fallback",
-		Command:   "/bin/cat",
-		Args:      nil,
+		Command:   helperCommand(t),
+		Args:      helperArgs,
 		Languages: []string{"go"},
 		Connect: &ConnectSpec{
 			Network:       "tcp",
@@ -409,7 +411,7 @@ func TestPassiveProvider_DialFailsSpawnFallback(t *testing.T) {
 	p := NewProviderFromSpec(spec, zap.NewNop())
 	defer p.Close()
 
-	// We don't await initialize success — /bin/sleep is not a real
+	// We don't await initialize success — the helper is not a real
 	// LSP server, so the handshake will eventually time out. The
 	// dialOrSpawn helper is what we're verifying: it must succeed
 	// on the spawn fallback. Run it directly to keep the test fast.

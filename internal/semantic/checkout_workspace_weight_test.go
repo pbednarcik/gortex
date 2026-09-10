@@ -39,16 +39,16 @@ func TestCheckoutWorkspacesChargesAHeavyServerSeveralSlots(t *testing.T) {
 	t.Run("two heavy pairs spend the whole default budget", func(t *testing.T) {
 		w := NewCheckoutWorkspaces(0, zap.NewNop())
 
-		holdFirst := acquire(t, w, "java", "/family/first")
-		holdSecond := acquire(t, w, "java", "/family/second")
+		holdFirst := acquire(t, w, "java", famRoot("first"))
+		holdSecond := acquire(t, w, "java", famRoot("second"))
 
-		if _, ok := w.Acquire("java", "/family/third"); ok {
+		if _, ok := w.Acquire("java", famRoot("third")); ok {
 			t.Error("a third heavy workspace was admitted over a budget two of them spend")
 		}
 		// Nor does an ordinary server fit behind them: the budget is spent and
 		// every pair holding it is mid-pass, so this is the refusal that skips
 		// a stage rather than an eviction.
-		if _, ok := w.Acquire("go", "/family/third"); ok {
+		if _, ok := w.Acquire("go", famRoot("third")); ok {
 			t.Error("an ordinary workspace was admitted over a spent budget")
 		}
 
@@ -60,12 +60,12 @@ func TestCheckoutWorkspacesChargesAHeavyServerSeveralSlots(t *testing.T) {
 		w := NewCheckoutWorkspaces(0, zap.NewNop())
 
 		holds := []func(){
-			acquire(t, w, "go", "/family/first"),
-			acquire(t, w, "go", "/family/second"),
-			acquire(t, w, "go", "/family/third"),
-			acquire(t, w, "go", "/family/fourth"),
+			acquire(t, w, "go", famRoot("first")),
+			acquire(t, w, "go", famRoot("second")),
+			acquire(t, w, "go", famRoot("third")),
+			acquire(t, w, "go", famRoot("fourth")),
 		}
-		if _, ok := w.Acquire("go", "/family/fifth"); ok {
+		if _, ok := w.Acquire("go", famRoot("fifth")); ok {
 			t.Error("a fifth ordinary workspace was admitted over a budget of four slots")
 		}
 
@@ -86,26 +86,26 @@ func TestCheckoutWorkspacesEvictionFreesTheWholeHeavyWeight(t *testing.T) {
 		w := NewCheckoutWorkspaces(4, zap.NewNop())
 		w.SetStopper(stopper)
 
-		acquire(t, w, "java", "/family/first")()
-		acquire(t, w, "java", "/family/second")()
+		acquire(t, w, "java", famRoot("first"))()
+		acquire(t, w, "java", famRoot("second"))()
 		// The budget is spent, so the ordinary pair displaces the heavy one
 		// used longest ago — and the two slots that pair held are more than
 		// this admission needs.
-		acquire(t, w, "go", "/family/third")()
+		acquire(t, w, "go", famRoot("third"))()
 
 		wantLive := []CheckoutWorkspaceRef{
-			{Language: "java", Root: "/family/second"},
-			{Language: "go", Root: "/family/third"},
+			{Language: "java", Root: famRoot("second")},
+			{Language: "go", Root: famRoot("third")},
 		}
 		if live := w.Live(); !reflect.DeepEqual(live, wantLive) {
 			t.Errorf("live = %v, want %v", live, wantLive)
 		}
 		// The leftover slot is real: a second ordinary pair fits without
 		// costing the surviving heavy one its server.
-		acquire(t, w, "go", "/family/fourth")()
+		acquire(t, w, "go", famRoot("fourth"))()
 
 		synctest.Wait()
-		want := []CheckoutWorkspaceRef{{Language: "java", Root: "/family/first"}}
+		want := []CheckoutWorkspaceRef{{Language: "java", Root: famRoot("first")}}
 		if got := stopper.calls(); !reflect.DeepEqual(got, want) {
 			t.Errorf("stopped %v, want %v", got, want)
 		}
@@ -128,10 +128,10 @@ func TestCheckoutWorkspacesEvictRootFreesTheWholeHeavyWeight(t *testing.T) {
 		// Two of the four slots go to the checkout that is about to depart,
 		// and the third to one that stays — held, so nothing below can reach
 		// its slot by evicting it.
-		acquire(t, w, "java", "/family/departing")()
-		staying := acquire(t, w, "go", "/family/staying")
+		acquire(t, w, "java", famRoot("departing"))()
+		staying := acquire(t, w, "go", famRoot("staying"))
 
-		if got := w.EvictRoot("/family/departing"); got != 1 {
+		if got := w.EvictRoot(famRoot("departing")); got != 1 {
 			t.Fatalf("EvictRoot dropped %d pairs, want the departed checkout's one", got)
 		}
 
@@ -140,9 +140,9 @@ func TestCheckoutWorkspacesEvictRootFreesTheWholeHeavyWeight(t *testing.T) {
 		// departed pair — or none — leaves the last of them nothing to be
 		// admitted into.
 		holds := []func(){
-			acquire(t, w, "go", "/family/first"),
-			acquire(t, w, "go", "/family/second"),
-			acquire(t, w, "go", "/family/third"),
+			acquire(t, w, "go", famRoot("first")),
+			acquire(t, w, "go", famRoot("second")),
+			acquire(t, w, "go", famRoot("third")),
 		}
 		if got := w.Live(); len(got) != 4 {
 			t.Errorf("live = %v, want the held pair and three admitted beside it", got)
@@ -151,7 +151,7 @@ func TestCheckoutWorkspacesEvictRootFreesTheWholeHeavyWeight(t *testing.T) {
 		synctest.Wait()
 		// The readmissions came out of the freed budget, so none of them cost
 		// a surviving workspace its server.
-		want := []CheckoutWorkspaceRef{{Language: "java", Root: "/family/departing"}}
+		want := []CheckoutWorkspaceRef{{Language: "java", Root: famRoot("departing")}}
 		if got := stopper.calls(); !reflect.DeepEqual(got, want) {
 			t.Errorf("stopped %v, want %v", got, want)
 		}
@@ -172,11 +172,11 @@ func TestCheckoutWorkspaceCapRaiseWidensTheWeightedBudget(t *testing.T) {
 	w := NewManager(Config{CheckoutLSPMaxWorkspaces: 6}, zap.NewNop()).CheckoutWorkspaces()
 
 	holds := []func(){
-		acquire(t, w, "java", "/family/first"),
-		acquire(t, w, "java", "/family/second"),
-		acquire(t, w, "java", "/family/third"),
+		acquire(t, w, "java", famRoot("first")),
+		acquire(t, w, "java", famRoot("second")),
+		acquire(t, w, "java", famRoot("third")),
 	}
-	if _, ok := w.Acquire("java", "/family/fourth"); ok {
+	if _, ok := w.Acquire("java", famRoot("fourth")); ok {
 		t.Error("a fourth heavy workspace was admitted over a raised budget three of them spend")
 	}
 
@@ -201,13 +201,13 @@ func TestCheckoutWorkspacesStarveWithoutStoppingWhatCannotHelp(t *testing.T) {
 		// Three slots are held by in-flight passes and out of reach; the
 		// fourth is a warm pair, so eviction can free one slot and no more.
 		holds := []func(){
-			acquire(t, w, "go", "/family/first"),
-			acquire(t, w, "go", "/family/second"),
-			acquire(t, w, "go", "/family/third"),
+			acquire(t, w, "go", famRoot("first")),
+			acquire(t, w, "go", famRoot("second")),
+			acquire(t, w, "go", famRoot("third")),
 		}
-		acquire(t, w, "go", "/family/fourth")()
+		acquire(t, w, "go", famRoot("fourth"))()
 
-		if _, ok := w.Acquire("java", "/family/fifth"); ok {
+		if _, ok := w.Acquire("java", famRoot("fifth")); ok {
 			t.Fatal("a heavy workspace was admitted into a single reachable slot")
 		}
 
@@ -236,9 +236,9 @@ func TestCheckoutWorkspacesRefuseAServerHeavierThanTheWholeBudget(t *testing.T) 
 		w := NewCheckoutWorkspaces(1, zap.NewNop())
 		w.SetStopper(stopper)
 
-		acquire(t, w, "go", "/family/first")()
+		acquire(t, w, "go", famRoot("first"))()
 
-		if _, ok := w.Acquire("java", "/family/second"); ok {
+		if _, ok := w.Acquire("java", famRoot("second")); ok {
 			t.Error("a heavy workspace was admitted into a budget smaller than its weight")
 		}
 

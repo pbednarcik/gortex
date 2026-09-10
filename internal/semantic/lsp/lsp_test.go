@@ -16,9 +16,23 @@ import (
 	"go.uber.org/zap"
 )
 
+// TestLSP_PathToURI checks the shape every LSP server requires — the
+// `file://` scheme with three slashes, forward slashes throughout, and a
+// lossless round trip back to the native path. The expectation is derived
+// from a native absolute path because "/repo/main.go" is NOT absolute on
+// Windows: pathToURI absolutizes first, so it would pick up the current
+// drive and produce "file:///D:/repo/main.go". The exact per-platform
+// literals (drive letter inside the path, percent-encoding) are
+// table-tested in internal/lspuri.
 func TestLSP_PathToURI(t *testing.T) {
-	uri := pathToURI("/repo/main.go")
-	assert.Equal(t, "file:///repo/main.go", uri)
+	abs, err := filepath.Abs(filepath.FromSlash("/repo/main.go"))
+	require.NoError(t, err)
+
+	uri := pathToURI(abs)
+	assert.True(t, strings.HasPrefix(uri, "file:///"), "uri = %q", uri)
+	assert.NotContains(t, uri, `\`, "a file URI never carries a backslash")
+	assert.True(t, strings.HasSuffix(uri, "/repo/main.go"), "uri = %q", uri)
+	assert.Equal(t, abs, uriToAbsPath(uri))
 }
 
 func TestLSP_URIToPath(t *testing.T) {
@@ -78,12 +92,24 @@ func TestLSP_NewClient_FailsForBadCommand(t *testing.T) {
 }
 
 func TestBuildWorkspaceFolders(t *testing.T) {
+	// The roots are native absolute paths: on Windows a "/repo" fixture has
+	// no volume, so buildWorkspaceFolders would absolutize it against the
+	// current drive and the URI literal would not be predictable.
+	abs := func(slash string) string {
+		t.Helper()
+		p, err := filepath.Abs(filepath.FromSlash(slash))
+		require.NoError(t, err)
+		return p
+	}
+	repo := abs("/repo")
+
 	// Always include the primary root. Pyright relies on this to build
 	// workspace context for textDocument/definition even when rootUri is set.
-	require.Equal(t, []WorkspaceFolder{{URI: "file:///repo", Name: "repo"}}, buildWorkspaceFolders("/repo", nil))
-	require.Equal(t, []WorkspaceFolder{{URI: "file:///repo", Name: "repo"}}, buildWorkspaceFolders("/repo", []string{}))
+	want := []WorkspaceFolder{{URI: pathToURI(repo), Name: "repo"}}
+	require.Equal(t, want, buildWorkspaceFolders(repo, nil))
+	require.Equal(t, want, buildWorkspaceFolders(repo, []string{}))
 
-	folders := buildWorkspaceFolders("/repo/app", []string{"/repo/shared", "/repo/types"})
+	folders := buildWorkspaceFolders(abs("/repo/app"), []string{abs("/repo/shared"), abs("/repo/types")})
 	require.Len(t, folders, 3) // primary + 2 additional
 	require.Equal(t, "app", folders[0].Name)
 	require.Equal(t, "shared", folders[1].Name)

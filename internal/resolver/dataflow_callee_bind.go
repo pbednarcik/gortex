@@ -1,7 +1,6 @@
 package resolver
 
 import (
-	"path/filepath"
 	"strconv"
 	"strings"
 
@@ -66,7 +65,7 @@ func (r *Resolver) buildCalleeIndex() *calleeIndex {
 		}
 		indexName(idx.byFile, node.FilePath, node.Name, node.ID)
 		if node.Kind == graph.KindFunction {
-			indexName(idx.byDir, filepath.Dir(node.FilePath), node.Name, node.ID)
+			indexName(idx.byDir, filePathDir(node.FilePath), node.Name, node.ID)
 		}
 	}
 	return idx
@@ -109,7 +108,7 @@ func (r *Resolver) bindDataflowCalleeRefsForFile(filePath string) {
 	}
 	// Same-package functions: r.dirIndex[dir] carries one KindFile node per
 	// file in the directory, so each package file is visited exactly once.
-	dir := filepath.Dir(filePath)
+	dir := filePathDir(filePath)
 	for _, fileNode := range r.dirIndex[dir] {
 		for _, n := range r.incrementalFileNodes(fileNode.FilePath) {
 			if n != nil && n.Kind == graph.KindFunction && n.Name != "" && n.FilePath != "" {
@@ -199,7 +198,7 @@ func bindDataflowCalleeEdge(e *graph.Edge, idx *calleeIndex) string {
 		if ids := idx.byFile[e.FilePath][name]; len(ids) == 1 {
 			chosen = ids[0]
 		} else if len(ids) == 0 {
-			if ids := idx.byDir[filepath.Dir(e.FilePath)][name]; len(ids) == 1 {
+			if ids := idx.byDir[filePathDir(e.FilePath)][name]; len(ids) == 1 {
 				chosen = ids[0]
 			}
 		}

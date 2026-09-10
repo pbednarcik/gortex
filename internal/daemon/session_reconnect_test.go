@@ -12,6 +12,8 @@ import (
 	"time"
 
 	"go.uber.org/zap"
+
+	"github.com/zzet/gortex/internal/testenv"
 )
 
 func TestSessionRegistryRebindsLogicalSession(t *testing.T) {
@@ -132,11 +134,7 @@ func TestDaemonRebindsLogicalMCPStateAcrossRealSocketReconnect(t *testing.T) {
 	}
 	t.Setenv("XDG_CACHE_HOME", t.TempDir())
 
-	socketDir, err := os.MkdirTemp("/tmp", "gxr")
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { _ = os.RemoveAll(socketDir) })
+	socketDir := testenv.ShortTempDir(t)
 	socket := filepath.Join(socketDir, "s")
 	dispatcher := &reconnectDispatcher{}
 	server := New(socket, "test", zap.NewNop())
@@ -220,11 +218,7 @@ func TestDaemonReplaysCanonicalIDAfterRealSocketLoss(t *testing.T) {
 		t.Skip("Unix socket reconnect test")
 	}
 	t.Setenv("XDG_CACHE_HOME", t.TempDir())
-	socketDir, err := os.MkdirTemp("/tmp", "gxrc")
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { _ = os.RemoveAll(socketDir) })
+	socketDir := testenv.ShortTempDir(t)
 
 	dispatcher := &reconnectDispatcher{}
 	server := New(filepath.Join(socketDir, "s"), "test", zap.NewNop())

@@ -222,7 +222,15 @@ func (nm *notesManager) Query(f NoteQueryFilter) []persistence.NoteEntry {
 		out = append(out, e)
 	}
 
-	sort.Slice(out, func(i, j int) bool {
+	// Newest first. UpdatedAt alone is not a total order: two notes saved
+	// inside one wall-clock tick carry the same stamp, and the Windows
+	// clock is coarse enough that back-to-back Save calls routinely do —
+	// there sort.Slice's unstable pivot decided the tie arbitrarily and a
+	// caller reading out[0] got the older note. Entries only ever grows by
+	// append, so out is in save order; reversing it makes insertion order
+	// the newest-first tiebreak, and a stable sort then preserves it.
+	slices.Reverse(out)
+	sort.SliceStable(out, func(i, j int) bool {
 		return out[i].UpdatedAt.After(out[j].UpdatedAt)
 	})
 	if f.Limit > 0 && len(out) > f.Limit {

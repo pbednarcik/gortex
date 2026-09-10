@@ -36,7 +36,10 @@ var defaultPricing = []Price{
 	{"claude-opus-4-8", 5.00},
 	{"claude-opus-4-7", 5.00},
 	{"claude-opus-4-6", 5.00},
-	{"claude-sonnet-5", 3.00},
+	// claude-sonnet-5 bills at its $2/M introductory input rate, which
+	// Anthropic made permanent on 2026-08-10 (the planned $3/$15 increase
+	// was withdrawn), unlike sonnet-4-6 which lists at $3.
+	{"claude-sonnet-5", 2.00},
 	{"claude-sonnet-4-6", 3.00},
 	{"claude-haiku-4-5", 1.00},
 	// OpenAI (also reachable via Azure). The gpt-5.6 tiers are the slugs the

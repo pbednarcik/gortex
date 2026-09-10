@@ -159,6 +159,7 @@ func (s *Server) handleSearchText(ctx context.Context, req mcp.CallToolRequest) 
 	if len(enriched) == 0 && len(resolved.RepoAllow) > 0 {
 		resp["scope_note"] = scopeZeroNote(resolved, -1)
 	}
+	stampIndexFileFailureWarning(resp, s.indexFileFailureWarning(ctx, resolved, pathFilter))
 	return s.respondScopedJSONOrTOON(ctx, req, resp, resolved)
 }
 
@@ -265,12 +266,11 @@ func (s *Server) filterTextMatchesByResolvedScope(ctx context.Context, matches [
 		}
 		n := reader.GetNode(m.Path)
 		if n == nil {
-			// A trigram match path is always forward-slash, but node IDs
-			// keep the repo-relative remainder in the OS separator. The two
-			// spellings agree only for a file at the repo root, so on
-			// Windows every match below the root failed attribution here and
-			// the fail-closed drop below emptied the entire result set.
-			if key := graphMatchPathKey(m.Path, knownRepo); key != m.Path {
+			// Both spellings are forward-slash — a trigram match path by
+			// construction, a graph node ID because the indexer folds every
+			// key through filepath.ToSlash — so this retry only catches a
+			// natively-spelled path that reached the batch from elsewhere.
+			if key := graphPathKey(m.Path); key != m.Path {
 				n = reader.GetNode(key)
 			}
 		}
@@ -288,23 +288,16 @@ func (s *Server) filterTextMatchesByResolvedScope(ctx context.Context, matches [
 	return out
 }
 
-// graphMatchPathKey spells a trigram match path the way graph node IDs
-// spell it. Match paths are always forward-slash; a node ID joins the repo
-// prefix with "/" but keeps the repo-relative remainder in the OS separator,
-// so the two forms diverge on Windows for every file below the repo root.
-// repoPrefixed says whether the first segment names a tracked repo rather
-// than an ordinary directory. Returns path unchanged where the separators
-// already agree, so POSIX callers pay nothing.
-func graphMatchPathKey(path string, repoPrefixed bool) string {
-	if filepath.Separator == '/' {
-		return path
-	}
-	if repoPrefixed {
-		if repo, rest, ok := strings.Cut(path, "/"); ok {
-			return repo + "/" + filepath.FromSlash(rest)
-		}
-	}
-	return filepath.FromSlash(path)
+// graphPathKey spells a repo-relative path the way graph node IDs spell it:
+// forward slashes on every platform, because the indexer folds every key it
+// mints through filepath.ToSlash (Indexer.relKey). The repo prefix and the
+// remainder therefore share one separator, so no prefix-aware split is
+// needed. Identity on POSIX, where a backslash is an ordinary filename byte
+// and must survive; on Windows it converts a natively-spelled path
+// (filepath.Rel / filepath.Join output) into the graph's spelling, which is
+// where the two vocabularies actually meet.
+func graphPathKey(path string) string {
+	return filepath.ToSlash(path)
 }
 
 // enrichTextMatchesContext decorates every trigram match with its enclosing
@@ -327,7 +320,7 @@ func (s *Server) enrichTextMatchesContext(
 			exactSeen[match.Path] = struct{}{}
 			exactPaths = append(exactPaths, match.Path)
 		}
-		if alias := graphMatchPathKey(match.Path, true); alias != match.Path {
+		if alias := graphPathKey(match.Path); alias != match.Path {
 			if _, duplicate := aliasSeen[alias]; !duplicate {
 				aliasSeen[alias] = struct{}{}
 				aliasPaths = append(aliasPaths, alias)
@@ -357,7 +350,7 @@ func fileSymbolIndexForPath(indexes map[string]*fileSymbolIndex, path string) *f
 	if index := indexes[path]; index != nil {
 		return index
 	}
-	if key := graphMatchPathKey(path, true); key != path {
+	if key := graphPathKey(path); key != path {
 		return indexes[key]
 	}
 	return nil

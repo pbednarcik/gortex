@@ -600,26 +600,17 @@ func (s *Server) resolveGraphPath(ctx context.Context, graphPath string) (string
 // behaviour callers had before, never worse. Use it before GetFileSymbols
 // / FileEditingContext so a repo-relative path doesn't silently miss the
 // prefixed nodes in multi-repo mode.
+//
+// The result is spelled the way graph keys are — forward slashes on every
+// platform (graphPathKey). resolveFilePath derives the relative form with
+// filepath.Rel / filepath.Join, so on Windows it hands back
+// `alpha/svc\a.go`, which matches no node: get_file_summary answered
+// file_not_indexed for an indexed file.
 func (s *Server) graphRelPath(ctx context.Context, fp string) string {
 	if _, rel, err := s.resolveFilePath(ctx, fp); err == nil && rel != "" {
-		return s.graphPathSpelling(rel)
+		return graphPathKey(rel)
 	}
 	return fp
-}
-
-// graphPathSpelling renders a repo-relative path the way graph node IDs
-// spell it: the repo prefix joined with "/", the repo-relative remainder in
-// the OS separator. resolveFilePath echoes a caller-supplied relative path
-// back verbatim, so without this a forward-slash path — the spelling every
-// agent writes — missed every node below the repo root on Windows and the
-// read tools answered file_not_indexed for an indexed file. Identity on
-// POSIX, where the two separators already agree.
-func (s *Server) graphPathSpelling(rel string) string {
-	prefixed := false
-	if s.multiIndexer != nil {
-		prefixed = matchedRepoPrefix(s.multiIndexer, rel) != ""
-	}
-	return graphMatchPathKey(rel, prefixed)
 }
 
 // fileAttributionNode synthesizes a node carrying just the repo prefix
@@ -1424,6 +1415,16 @@ func (s *Server) handleReadFile(ctx context.Context, req mcp.CallToolRequest) (*
 		// The URI stands in for the absolute path in the language probe: it
 		// carries the extension, and nothing can open it.
 		absPath = viewURI
+	} else if installedSkillPath(rawPath) {
+		// Gortex installs its own skills outside repository roots. Read those
+		// exact files without widening the resolver shared by mutation tools.
+		absPath = filepath.Clean(rawPath)
+		relPath = absPath
+		diskContent, physicalEvidence, err = s.readInstalledSkillFile(absPath)
+		if err != nil {
+			return mcp.NewToolResultError(err.Error()), nil
+		}
+		content = diskContent
 	} else {
 		var resolveErr error
 		absPath, relPath, resolveErr = s.resolveFilePath(ctx, rawPath)

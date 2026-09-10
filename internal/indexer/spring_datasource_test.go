@@ -14,6 +14,13 @@ import (
 	"github.com/zzet/gortex/internal/parser/languages"
 )
 
+// springJavaGraphPath is the graph path of the fixture's Java file. The
+// indexer keys graph paths — and therefore the symbol IDs built from them —
+// with pathkey.Normalize(filepath.ToSlash(rel)), so a node ID carries forward
+// slashes on every platform. filepath.Join here would spell `src\main\...`
+// on Windows and match no node.
+const springJavaGraphPath = "src/main/java/com/example/JdbcConfig.java"
+
 func TestIndex_SpringDatasourceConditionalOnPropertyReadsConfig(t *testing.T) {
 	dir := t.TempDir()
 	javaDir := filepath.Join(dir, "src", "main", "java", "com", "example")
@@ -46,7 +53,7 @@ spring:
 	_, err := idx.Index(dir)
 	require.NoError(t, err)
 
-	javaGraphPath := filepath.Join("src", "main", "java", "com", "example", "JdbcConfig.java")
+	javaGraphPath := springJavaGraphPath
 	cfgID := javaGraphPath + "::JdbcConfig"
 	keyID := "cfg::spring::spring.datasource.url"
 	if g.GetNode(keyID) == nil {
@@ -90,7 +97,7 @@ public class JdbcConfig {
 	_, err := idx.Index(dir)
 	require.NoError(t, err)
 
-	javaGraphPath := filepath.Join("src", "main", "java", "com", "example", "JdbcConfig.java")
+	javaGraphPath := springJavaGraphPath
 	classID := javaGraphPath + "::JdbcConfig"
 	dataSourceID := classID + ".dataSource"
 	if !hasEdge(g, classID, dataSourceID, graph.EdgeCalls) {
@@ -130,7 +137,7 @@ public class JdbcConfig {
 	_, err := idx.Index(dir)
 	require.NoError(t, err)
 
-	javaGraphPath := filepath.Join("src", "main", "java", "com", "example", "JdbcConfig.java")
+	javaGraphPath := springJavaGraphPath
 	classID := javaGraphPath + "::JdbcConfig"
 	dataSourceID := classID + ".dataSource"
 	if hasEdge(g, classID, dataSourceID, graph.EdgeCalls) {

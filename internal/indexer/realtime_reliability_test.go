@@ -469,11 +469,11 @@ func TestWatcher_NewSubdirScanIndexesPreWatchFile(t *testing.T) {
 	require.NoError(t, os.MkdirAll(subdir, 0o755))
 	ext.setFuncs("Buried")
 	writeFile(t, filepath.Join(subdir, "buried.fk"), "buried body")
-	// The graph keys file nodes under OS-native separators (see
-	// graphRelKey), so build the expected key with filepath.Join instead
-	// of a hard-coded "pkg/buried.fk" — the slash form only matches on
-	// POSIX and would spuriously fail this test on Windows.
-	buriedKey := filepath.Join("pkg", "buried.fk")
+	// The graph keys file nodes under the slash-separated repo-relative
+	// spelling relKey mints, on every platform — never filepath.Join's
+	// native form, which would key this file as "pkg\buried.fk" on
+	// Windows and hide it from every other lookup.
+	const buriedKey = "pkg/buried.fk"
 	require.Empty(t, g.GetFileNodes(buriedKey),
 		"the pre-watch file must be absent before the directory scan")
 

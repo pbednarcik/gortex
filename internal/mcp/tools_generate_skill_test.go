@@ -264,3 +264,25 @@ func TestMatchPathPattern(t *testing.T) {
 	assert.True(t, matchPathPattern("vendor/*", "vendor/x.go"))
 	assert.False(t, matchPathPattern("*.ts", "foo.go"))
 }
+
+func TestValidateSkillNameComponent(t *testing.T) {
+	valid := []string{"gortex-explore", "a", "skill_1", "...", "-leading-dash"}
+	for _, name := range valid {
+		require.NoError(t, validateSkillNameComponent(name), "%q should be a valid component", name)
+	}
+
+	invalid := []string{
+		"",
+		"..",
+		".",
+		"../escape",
+		"../../../../etc/gortex",
+		"nested/skill",
+		"trailing/",
+		`back\slash`,
+		"/absolute",
+	}
+	for _, name := range invalid {
+		require.Error(t, validateSkillNameComponent(name), "%q must be refused", name)
+	}
+}

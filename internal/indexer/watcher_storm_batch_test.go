@@ -347,10 +347,11 @@ func TestWatcherStormBatchDeletionFailureIsolationAndOneResolve(t *testing.T) {
 
 	bumpMtime(t, good, "package storm\n\nfunc Good() {}\nfunc GoodCommitted() { MissingTarget() }\n")
 	require.NoError(t, os.Remove(deleted))
-	require.NoError(t, os.Chmod(bad, 0o000))
-	t.Cleanup(func() { _ = os.Chmod(bad, 0o644) })
+	// Stale first, unreadable second: denyFileRead may hold the file open
+	// exclusively, and Chtimes needs its own write handle.
 	future := time.Now().Add(4 * time.Second)
 	require.NoError(t, os.Chtimes(bad, future, future))
+	denyFileRead(t, bad)
 
 	resolveCalls := 0
 	var resolvedFiles []string

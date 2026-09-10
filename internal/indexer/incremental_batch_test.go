@@ -316,10 +316,11 @@ func TestIncrementalMultiFileBatchKeepsFailedFileAndCommitsSiblings(t *testing.T
 	oldBadMtime := idx.FileMtimes()[idx.relKey(bad)]
 
 	bumpMtime(t, good, "package isolation\n\nfunc Good() {}\nfunc GoodCommitted() {}\n")
-	require.NoError(t, os.Chmod(bad, 0o000))
-	t.Cleanup(func() { _ = os.Chmod(bad, 0o644) })
+	// Stale first, unreadable second: denyFileRead may hold the file open
+	// exclusively, and Chtimes needs its own write handle.
 	future := time.Now().Add(4 * time.Second)
 	require.NoError(t, os.Chtimes(bad, future, future))
+	allowBadRead := denyFileRead(t, bad)
 
 	result, err := idx.IncrementalReindexPaths(dir, []string{good, bad})
 	require.NoError(t, err)
@@ -331,7 +332,7 @@ func TestIncrementalMultiFileBatchKeepsFailedFileAndCommitsSiblings(t *testing.T
 	require.Equal(t, oldBadMtime, idx.FileMtimes()[idx.relKey(bad)],
 		"failed file must not advance its durable retry watermark")
 
-	require.NoError(t, os.Chmod(bad, 0o644))
+	allowBadRead()
 	recovered, err := idx.IncrementalReindexPaths(dir, []string{bad})
 	require.NoError(t, err)
 	require.Empty(t, recovered.FailedFiles)

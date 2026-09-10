@@ -322,7 +322,15 @@ func TestRunCodexHardDenyRequiresIndexedWorkspaceMatch(t *testing.T) {
 		return []grepSymbolHit{{Name: "Foo", FilePath: "internal/a.go", Line: 1}}, nil
 	}
 	t.Cleanup(func() { grepProbe = oldProbe })
-	external := []byte(`{"hook_event_name":"PreToolUse","tool_name":"Bash","cwd":"/repo","tool_input":{"command":"rg Foo /tmp/external"}}`)
+	// The search target has to be absolute in the platform's own spelling:
+	// filepath.IsAbs("/tmp/external") is false on Windows, so a POSIX literal
+	// would be joined onto the cwd and land back inside the workspace.
+	external := mustJSON(t, map[string]any{
+		"hook_event_name": "PreToolUse",
+		"tool_name":       "Bash",
+		"cwd":             repoFixtureRoot,
+		"tool_input":      map[string]any{"command": "rg Foo " + fixtureAbs("/tmp/external")},
+	})
 	externalOut := captureStdout(t, func() { runCodex(external, 0, CodexModeDeny) })
 	externalHSO := decodeHookOutput(t, externalOut).HookSpecificOutput
 	if externalHSO == nil || externalHSO.PermissionDecision != "" || externalHSO.AdditionalContext == "" {
@@ -331,9 +339,12 @@ func TestRunCodexHardDenyRequiresIndexedWorkspaceMatch(t *testing.T) {
 }
 
 func TestRunCodexBashRewriteOnlyForSimpleIndexedCat(t *testing.T) {
-	oldIndexed := fileIndexedFn
-	fileIndexedFn = func(_, path string) (bool, int) { return path == "internal/a.go", 3 }
-	t.Cleanup(func() { fileIndexedFn = oldIndexed })
+	stubFileIndexScopeBy(t, func(_, path string) fileIndexStatus {
+		if path == "internal/a.go" {
+			return indexedStatus(3)
+		}
+		return indexedStatus(0)
+	})
 
 	data := codexBashPayload("cat internal/a.go")
 	out := captureStdout(t, func() { runCodex(data, 0, CodexModeRewrite) })

@@ -161,7 +161,7 @@ func TestApplyPreparedMetadataRefreshReleasesParseTree(t *testing.T) {
 	require.True(t, ok)
 	tree := preparedTree(t, idx, path)
 
-	prior := idx.graph.GetFileNodes(idx.graphRelKey(path))
+	prior := idx.graph.GetFileNodes(idx.relKey(path))
 	idx.applyPreparedMetadataRefresh(path, prior)
 	require.Nil(t, tree.Tree(), "the metadata refresh must release the tree it took")
 }

@@ -1703,8 +1703,20 @@ func TestCheckoutLifecycleRunsACoordinatorPerAutomaticCheckout(t *testing.T) {
 
 	// The worktree leaves. The removal clock has to expire before the identity
 	// goes, and the coordinator goes with it.
-	if err := os.RemoveAll(worktree); err != nil {
-		t.Fatalf("remove the worktree: %v", err)
+	// The coordinator is deliberately still running: its asynchronous git
+	// samples can briefly hold the directory as a subprocess's working
+	// directory, which prevents removal on Windows. Wait for that transient
+	// handle to clear without closing the coordinator ahead of the sweep.
+	removeDeadline := time.Now().Add(5 * time.Second)
+	for {
+		err := os.RemoveAll(worktree)
+		if err == nil {
+			break
+		}
+		if time.Now().After(removeDeadline) {
+			t.Fatalf("remove the worktree: %v", err)
+		}
+		time.Sleep(10 * time.Millisecond)
 	}
 	if _, err := f.lc.Sweep(ctx); err != nil {
 		t.Fatalf("sweep after the removal: %v", err)

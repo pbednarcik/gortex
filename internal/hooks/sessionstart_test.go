@@ -210,8 +210,8 @@ func TestRunSessionStart_DaemonReady_CwdExactMatch(t *testing.T) {
 			UptimeSeconds: 3600,
 			Ready:         true,
 			TrackedRepos: []daemon.TrackedRepoStatus{
-				{Name: "gortex", Path: "/tmp/gortex", Workspace: "gortex", Nodes: 6604, Edges: 27403},
-				{Name: "cloud_web", Path: "/tmp/cloud_web", Workspace: "cloud_web", Nodes: 265, Edges: 276},
+				{Name: "gortex", Path: gortexTmpFixtureRoot, Workspace: "gortex", Nodes: 6604, Edges: 27403},
+				{Name: "cloud_web", Path: cloudWebTmpFixtureRoot, Workspace: "cloud_web", Nodes: 265, Edges: 276},
 			},
 			Workspaces: []daemon.WorkspaceSummary{
 				{Slug: "gortex"}, {Slug: "cloud_web"},
@@ -219,7 +219,7 @@ func TestRunSessionStart_DaemonReady_CwdExactMatch(t *testing.T) {
 		}, nil
 	})
 
-	data := []byte(`{"hook_event_name":"SessionStart","cwd":"/tmp/gortex"}`)
+	data := mustJSON(t, map[string]any{"hook_event_name": "SessionStart", "cwd": gortexTmpFixtureRoot})
 	out := captureStdout(t, func() { runSessionStart(data, 0) })
 
 	var payload HookOutput
@@ -245,14 +245,14 @@ func TestRunSessionStart_DaemonReady_CwdContainsRepos(t *testing.T) {
 			UptimeSeconds: 60,
 			Ready:         true,
 			TrackedRepos: []daemon.TrackedRepoStatus{
-				{Name: "gortex", Path: "/tmp/gortex"},
-				{Name: "cloud_web", Path: "/tmp/cloud_web"},
-				{Name: "project1", Path: "/opt/project1"}, // unrelated: NOT under cwd /tmp
+				{Name: "gortex", Path: gortexTmpFixtureRoot},
+				{Name: "cloud_web", Path: cloudWebTmpFixtureRoot},
+				{Name: "project1", Path: fixtureAbs("/opt/project1")}, // unrelated: NOT under cwd /tmp
 			},
 		}, nil
 	})
 
-	data := []byte(`{"hook_event_name":"SessionStart","cwd":"/tmp"}`)
+	data := mustJSON(t, map[string]any{"hook_event_name": "SessionStart", "cwd": fixtureAbs("/tmp")})
 	out := captureStdout(t, func() { runSessionStart(data, 0) })
 
 	var payload HookOutput
@@ -283,12 +283,13 @@ func TestRunSessionStart_DaemonReady_CwdNotTracked(t *testing.T) {
 			Version: "0.15.0",
 			Ready:   true,
 			TrackedRepos: []daemon.TrackedRepoStatus{
-				{Name: "gortex", Path: "/tmp/gortex"},
+				{Name: "gortex", Path: gortexTmpFixtureRoot},
 			},
 		}, nil
 	})
 
-	data := []byte(`{"hook_event_name":"SessionStart","cwd":"/tmp/playground"}`)
+	playground := fixtureAbs("/tmp/playground")
+	data := mustJSON(t, map[string]any{"hook_event_name": "SessionStart", "cwd": playground})
 	out := captureStdout(t, func() { runSessionStart(data, 0) })
 
 	var payload HookOutput
@@ -299,7 +300,7 @@ func TestRunSessionStart_DaemonReady_CwdNotTracked(t *testing.T) {
 	if !strings.Contains(ac, "is not covered by any tracked repo") {
 		t.Errorf("expected untracked notice, got:\n%s", ac)
 	}
-	if !strings.Contains(ac, "gortex track /tmp/playground") {
+	if !strings.Contains(ac, "gortex track "+playground) {
 		t.Errorf("expected actionable track command, got:\n%s", ac)
 	}
 }
@@ -403,7 +404,7 @@ func TestDispatch_RoutesSessionStart(t *testing.T) {
 		}, nil
 	})
 
-	data := []byte(`{"hook_event_name":"SessionStart","cwd":"/tmp"}`)
+	data := mustJSON(t, map[string]any{"hook_event_name": "SessionStart", "cwd": fixtureAbs("/tmp")})
 	withStdin(t, data, func() {
 		out := captureStdout(t, func() { Run(0, ModeDeny) })
 		if !strings.Contains(out, "Gortex Session Orientation") {

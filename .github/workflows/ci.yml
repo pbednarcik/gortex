@@ -13,8 +13,9 @@ jobs:
     # per-step budget needs headroom; this job-level cap still bounds a hang.
     timeout-minutes: 60
     strategy:
+      fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-latest]
+        os: [ubuntu-latest, macos-latest, windows-latest]
         go-version: ['1.27']
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -27,7 +28,23 @@ jobs:
         run: go build -o gortex ./cmd/gortex/
 
       - name: Test
+        if: matrix.os != 'windows-latest'
         run: go test -race -timeout=45m -coverprofile=coverage.out ./...
+
+      # The Windows shard checks the platform contract, not the race
+      # contract: the race detector multiplies runtime several times over and
+      # the windows runners are already the slowest of the three, so the two
+      # together overran the job cap before the suite finished. Linux and
+      # macOS keep -race, which is where a data race would surface anyway.
+      # -v is temporary: per-test timings are how we find which packages hang
+      # here, and it comes out once the shard is reliably green.
+      # It writes no coverage profile either: nothing uploads one from this
+      # shard, and the runner's default PowerShell tokenises
+      # -coverprofile=coverage.out into an extra ".out" package argument, so
+      # the job failed on an unresolvable package before any test ran.
+      - name: Test (windows, no race detector)
+        if: matrix.os == 'windows-latest'
+        run: go test -v -timeout=45m ./...
 
       - name: Upload coverage
         if: matrix.os == 'ubuntu-latest' && matrix.go-version == '1.27'
@@ -35,146 +52,6 @@ jobs:
         with:
           files: coverage.out
         continue-on-error: true
-
-  build-windows:
-    # CGO build smoke-test on native Windows. tree-sitter needs a C/C++
-    # compiler — the GitHub windows runner ships mingw-w64 on PATH, so no
-    # extra toolchain setup is required. `go build ./...` compiles every
-    # production package; the focused test steps below exercise the paths
-    # whose behaviour actually differs here — separators, volumes, open-file
-    # semantics, %USERPROFILE%, and the git layouts the checkout catalog is
-    # built from — without opting into the unsupported full test suite.
-    runs-on: windows-latest
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-
-      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
-        with:
-          go-version-file: go.mod
-
-      - name: Build CLI
-        run: go build -o gortex.exe ./cmd/gortex/
-
-      - name: Build all packages
-        run: go build ./...
-
-      # ./internal/agents is one package and does not recurse, so the
-      # opencode adapter is named explicitly. Its plugin asset is embedded
-      # verbatim with go:embed and TestPluginFailsOpen parses it by
-      # splitting on "\n}\n", which is the closest thing the suite has to a
-      # detector for a CRLF checkout of an embedded file — and it can only
-      # fire on a runner that converts line endings.
-      - name: Test Windows agent integrations
-        run: >
-          go test -timeout=5m -count=1
-          ./internal/agents ./internal/agents/opencode
-
-      # Symlink confinement keeps out-of-repo files out of the index, and it
-      # reads differently on Windows: a symlink reparse point maps to
-      # ModeSymlink but a directory junction maps to ModeIrregular, and
-      # evalSymlinks normalises path case where Unix does not. Verifying it
-      # only on the linux/macos matrix would leave the platform whose
-      # semantics differ most as the untested one.
-      - name: Test symlink confinement
-        run: go test -timeout=5m -count=1 ./internal/pathguard
-
-      # Windows refuses to unlink an open file, so a leaked sidecar handle
-      # pins its directory and fails the enclosing t.TempDir() cleanup. That
-      # asymmetry is invisible on the linux/macos matrix, which is why this
-      # one test runs here rather than only there.
-      - name: Test sidecar handle release
-        run: go test -timeout=5m -count=1 -run TestCloseSidecar ./internal/persistence
-
-      # Same asymmetry, different holder: the plan-lock fixture opens an
-      # on-disk Store, so a missing Close pins plan_lock.sqlite and fails
-      # its t.TempDir() cleanup here while passing everywhere else. Every
-      # assertion in these tests is platform-neutral — only the cleanup
-      # distinguishes the runners — so nothing but this step can protect
-      # the fixture's Close from being dropped again.
-      - name: Test plan-lock fixture handle release
-        run: >
-          go test -timeout=10m -count=1
-          -run 'PlanLock|PlansLocked|PlansNeverScan'
-          ./internal/graph/store_sqlite
-
-      # os.UserHomeDir reads %USERPROFILE% here and $HOME everywhere else, so
-      # a test that isolates itself with HOME alone keeps resolving the real
-      # profile on Windows — and writes to it. That is invisible to the
-      # linux/macos matrix by construction, so the isolation helper and the
-      # path resolver it protects have to be verified on this runner or not
-      # at all.
-      - name: Test user-state isolation
-        run: go test -timeout=5m -count=1 ./internal/testenv ./internal/platform
-
-      # Indexed paths are repoPrefix + '/' + the rest in native separators, so
-      # on Windows a stored path reads `repo/dir\file.cs`. Every test for that
-      # shape is a no-op on the linux/macos matrix — POSIX treats '\' as an
-      # ordinary filename byte, so filepath.Clean and filepath.ToSlash both
-      # leave the fixture untouched and the assertions pass with or without
-      # the production fix. This runner is the only one where they can fail.
-      - name: Test store path separator handling
-        run: go test -timeout=5m -count=1 ./internal/graphpath
-
-      # The same asymmetry reaches the other direction too: a test that spells
-      # an expected path with '/' passes on POSIX whatever the code does, and
-      # only this runner can tell whether the value under test is a native
-      # filesystem path (filepath.Join / filepath.Clean) or a '/'-keyed store
-      # path. ParseDiffGitPaths, ParseDiffLinesNewSide and FeedbackDir all
-      # assert on native paths, so they belong here rather than nowhere.
-      # The path-domain contracts belong here for the same reason. A graph
-      # key is "<prefix>/" plus a native-separator remainder, so GraphKey,
-      # JoinFileNodes, the prefix-shadow end-to-end pair and RankFileRisk's
-      # per-domain normalization only diverge once '/' and the native
-      # separator differ — every one of them passes on the linux/macos
-      # matrix whatever the code does. internal/review joins the list
-      # because the file-risk normalizer lives there. FidelityGlob is the
-      # same asymmetry once more: filepath.Match's separator is the
-      # platform's, so on Windows '*' crosses a '/' that POSIX already
-      # protects, and `internal/*.go` matching `internal/sub/x.go` is a
-      # Windows-only verdict. Linux and macOS return the same answer from
-      # filepath.Match and path.Match, so this runner is the only one that
-      # can tell the two apart. FindFiles_Glob is the handler-level half of
-      # the same contract: `internal/**/*_test.go` is the schema's own
-      # example, and the two matchers disagree about how deep it reaches
-      # only where '/' is not the separator.
-      - name: Test native-separator store path comparisons
-        run: >
-          go test -timeout=10m -count=1
-          -run 'NativeSeparator|MixedSeparator|ImportAdjacency|ParseDiffGitPaths|ParseDiffLinesNewSide|FeedbackDir|ReviewRulepack|PrefixedGraphReportsRulepack|GraphKey|JoinFileNodes|ChangedSymbolsForFiles|PrefixShadow|IdsOnPrefixedGraph|RankFileRisk|PrefixedDeleteAndRename|FidelityGlob|FindFiles_Glob'
-          ./internal/analysis ./internal/graph/store_sqlite
-          ./internal/mcp ./internal/resolver ./internal/persistence
-          ./internal/review
-
-      # gitstate reads git's own answers and measures them against host paths.
-      # git spells a worktree root with '/' on every platform while a fixture
-      # builds one with the host separator, an absolute path needs a volume
-      # here and not on POSIX, and a repository's admin directory is reached
-      # by joining. None of those distinctions exists on the linux/macos
-      # matrix, so the whole package runs here rather than the one test that
-      # looks path-shaped. The timeout is generous because every fixture
-      # shells out to git and process spawn is the slow axis on this runner.
-      - name: Test git state inspection
-        run: go test -timeout=15m -count=1 ./internal/gitstate
-
-      # The reconcile pass turns that inventory into catalog rows: it joins
-      # admin directories, and it decides which checkout owns a path by
-      # measuring roots against each other. Both are separator-shaped, so a
-      # '/'-spelled expectation passes on POSIX whatever the code does.
-      - name: Test checkout reconciliation
-        run: go test -timeout=10m -count=1 ./internal/reconcile
-
-      # The CLI half of the same code: the checkout verbs, the view router
-      # that answers a probe from the checkout containing the probed path,
-      # and the classifier that tells a linked worktree from a main checkout
-      # by reading its `.git` file. Every one of them decides by comparing
-      # path spellings, and the git layouts they classify are built by git
-      # itself. The selector names those tests only — the rest of the package
-      # is either unrelated or needs a daemon behind an AF_UNIX socket.
-      - name: Test checkout and view path routing
-        run: >
-          go test -timeout=10m -count=1
-          -run '^(TestRepos(Families|SetPrimary|Forget|Reconcile|ExplainView)|TestUntrack(Previews|Reports)|TestController(TrackUntrack|Reload)DrivesTheCheckoutLifecycle|TestControllerAnswersTheFileCoverageVerb|TestProbeOf|TestProbeMatchesAPathSpelledThroughASymlink|TestRoutedProbe|TestUnroutedProbe|TestSearchSymbolsWithoutAPath|TestViewsStatus|TestReload_(Keeps|Untracks)|TestDispatcher_(RegisteredCheckout|UnregisteredWorktree)|TestLinkedWorktreeAt_)'
-          ./cmd/gortex
 
   build-linux-static:
     # The linux release ships a statically linked binary so it runs on any

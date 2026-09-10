@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"path"
 	"path/filepath"
 	"sort"
 	"strings"
@@ -274,7 +275,7 @@ func (s *Server) handleSiblingDiffContext(ctx context.Context, req mcp.CallToolR
 	seen := map[string]bool{}
 	var siblings []siblingDiffRow
 	for _, f := range diff.ChangedFiles {
-		f = filepath.Clean(f)
+		f = cleanRepoRelPath(f)
 		if f == "" || f == "." || focus[f] || seen[f] {
 			continue
 		}
@@ -324,13 +325,30 @@ func siblingDiffScope(req mcp.CallToolRequest) (scope, baseRef string) {
 	return scope, baseRef
 }
 
+// cleanRepoRelPath is the one cleaner every repo-relative path in this file
+// goes through: the changed-file list, the focus set, and the node lookups
+// that join them. filepath.Clean would be wrong here — it re-spells the path
+// in the running platform's separators, and on Windows that leaves
+// `internal\alpha\a.go`, which is neither what MapGitDiff hands back (git
+// speaks '/' everywhere) nor what the graph keys its file nodes under (the
+// indexer folds every key through filepath.ToSlash). The sibling relation
+// silently degraded to "none" for every file below the repo root, because
+// GetFileNodes was handed a spelling no node carries.
+func cleanRepoRelPath(p string) string {
+	p = strings.TrimSpace(p)
+	if p == "" {
+		return ""
+	}
+	return path.Clean(filepath.ToSlash(p))
+}
+
 // resolveFocusFiles collects the focus file set from focus_files / focus_file
 // (paths) and focus_symbol_id (the symbol's file). Paths are cleaned so they
 // join the MapGitDiff ChangedFiles keys.
 func (s *Server) resolveFocusFiles(ctx context.Context, req mcp.CallToolRequest) map[string]bool {
 	focus := map[string]bool{}
 	add := func(p string) {
-		p = filepath.Clean(strings.TrimSpace(p))
+		p = cleanRepoRelPath(p)
 		if p != "" && p != "." {
 			focus[p] = true
 		}

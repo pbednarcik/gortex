@@ -212,8 +212,7 @@ func TestWatcherInitialReplayMarkerPermissionFailureIsFailClosed(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "main.go")
 	writeTestFile(t, path, "package sample\n\nfunc Original() {}\n")
-	require.NoError(t, os.Chmod(dir, 0o555))
-	t.Cleanup(func() { _ = os.Chmod(dir, 0o755) })
+	blockMarker := blockStartupMarkerCreation(t, dir)
 
 	idx := New(graph.New(), parser.NewRegistry(), config.Default().Index, zap.NewNop())
 	idx.SetRootPath(dir)
@@ -221,12 +220,13 @@ func TestWatcherInitialReplayMarkerPermissionFailureIsFailClosed(t *testing.T) {
 	require.NoError(t, err)
 	w.fsw = newStartupBarrierFakeWatcher()
 	writeSucceeded := false
-	w.initialReplayMarkerCreating = func(string) {
-		// Directory mode forbids creating the marker, but the existing 0644
-		// source remains writable. Silently skipping the barrier would lose this
-		// exact concurrent edit.
+	w.initialReplayMarkerCreating = func(marker string) {
+		// The marker cannot be created, but the existing 0644 source remains
+		// writable. Silently skipping the barrier would lose this exact
+		// concurrent edit.
 		require.NoError(t, os.WriteFile(path, []byte("package sample\n\nfunc ChangedDuringMarker() {}\n"), 0o644))
 		writeSucceeded = true
+		blockMarker(marker)
 	}
 
 	err = w.reconcileInitialReplayThroughMarkers([]string{dir}, time.Second)

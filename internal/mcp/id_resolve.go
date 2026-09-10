@@ -99,10 +99,9 @@ func (s *Server) resolveSymbolID(ctx context.Context, id string) string {
 	// prefix; the graphRelID rung below does not. Returning early on a nil
 	// multiIndexer skipped both, which cost a server built without
 	// MultiRepoOptions (cmd/gortex eval_recall.go, eval_server.go) the
-	// separator normalization graphPathSpelling exists to provide: on Windows
-	// the stored id is `pkga\a.go::Foo` while every agent writes
-	// `pkga/a.go::Foo`, and the tool answered "symbol not found" for an
-	// indexed symbol.
+	// path anchoring graphRelID exists to provide: an absolute-path id
+	// never matches a stored (repo-relative) one, and the tool answered
+	// "symbol not found" for an indexed symbol.
 	if s.multiIndexer != nil {
 		cwd := SessionCWDFromContext(ctx)
 		if cwd != "" {

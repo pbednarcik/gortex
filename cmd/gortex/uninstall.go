@@ -276,12 +276,19 @@ func runUninstall(cmd *cobra.Command, _ []string) error {
 // silent about a Gortex one it is about to delete.
 func filterPresentUninstallTargets() ([]string, []string) {
 	var pf, pd []string
+	// The literal targets are written with '/' for readability, while the
+	// owned-entry targets come out of filepath.Join. Normalising the
+	// literals to the native separator keeps one spelling in the confirm
+	// wizard: on Windows a list that mixes `.opencode/plugin/gortex.js`
+	// with `.agents\skills\gortex-stub` reads as two different things.
 	for _, f := range uninstallFiles {
+		f = filepath.FromSlash(f)
 		if _, err := os.Stat(f); err == nil {
 			pf = append(pf, f)
 		}
 	}
 	for _, d := range uninstallDirs {
+		d = filepath.FromSlash(d)
 		if _, err := os.Stat(d); err == nil {
 			pd = append(pd, d)
 		}

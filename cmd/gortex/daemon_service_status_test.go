@@ -5,6 +5,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 )
@@ -427,6 +428,12 @@ func TestServiceStatusNotesRunningDaemonForALoadedStoppedUnit(t *testing.T) {
 // gate to the same discipline as the launchd query: a stat that failed for any
 // other reason establishes neither answer.
 func TestServiceStatusReportsAnUnreadablePlist(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		// Windows has no directory search bit: os.Chmod only toggles the
+		// read-only attribute, so the plist keeps stat'ing cleanly and the
+		// gate has no inconclusive case to report.
+		t.Skip("no POSIX directory permissions to make Stat fail with EACCES")
+	}
 	dir := t.TempDir()
 	blocked := filepath.Join(dir, "blocked")
 	if err := os.Mkdir(blocked, 0o755); err != nil {

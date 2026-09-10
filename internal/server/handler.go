@@ -329,6 +329,15 @@ func (h *Handler) SetReadOnly(ro bool) { h.readOnly = ro }
 // SetCapabilities overrides the advertised federation capability set.
 func (h *Handler) SetCapabilities(caps []string) { h.capabilities = caps }
 
+// SetStartTimeForTest overrides the instant /v1/health reports uptime
+// from. It exists so a test in a package that embeds this handler (see
+// internal/eval) can backdate the start rather than race the clock for a
+// positive reading: Windows advances the runtime's monotonic clock in
+// ~0.5-15.6 ms ticks, so a handler built microseconds before the request
+// still lands inside the tick it started in and time.Since returns
+// exactly 0 there. Production code has no reason to move the start.
+func (h *Handler) SetStartTimeForTest(start time.Time) { h.startTime = start }
+
 // --- /tools ---
 
 type toolInfo struct {

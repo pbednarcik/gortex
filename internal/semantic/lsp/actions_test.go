@@ -84,9 +84,13 @@ func TestWriteWorkspaceEdit_DocumentChanges(t *testing.T) {
 	p := filepath.Join(dir, "x.txt")
 	require.NoError(t, os.WriteFile(p, []byte("old\n"), 0o644))
 
+	// pathToURI, not `"file://" + p`: the naive concatenation puts a Windows
+	// drive letter in the URI authority ("file://C:\dir\x.txt"), which
+	// uriToAbsPath rejects — WriteWorkspaceEdit would then write nothing and
+	// report no files.
 	edit := WorkspaceEdit{
 		DocumentChanges: []TextDocumentEdit{{
-			TextDocument: VersionedTextDocumentIdentifier{URI: "file://" + p, Version: 1},
+			TextDocument: VersionedTextDocumentIdentifier{URI: pathToURI(p), Version: 1},
 			Edits: []TextEdit{{
 				Range:   Range{Start: Position{Line: 0, Character: 0}, End: Position{Line: 0, Character: 3}},
 				NewText: "new",
@@ -108,9 +112,11 @@ func TestWriteWorkspaceEdit_LegacyChanges(t *testing.T) {
 	p := filepath.Join(dir, "y.txt")
 	require.NoError(t, os.WriteFile(p, []byte("a b c\n"), 0o644))
 
+	// Same reason as the documentChanges case: the URI has to be built by
+	// pathToURI so a Windows drive letter lands inside the path.
 	edit := WorkspaceEdit{
 		Changes: map[string][]TextEdit{
-			"file://" + p: {{
+			pathToURI(p): {{
 				Range:   Range{Start: Position{Line: 0, Character: 2}, End: Position{Line: 0, Character: 3}},
 				NewText: "X",
 			}},
@@ -164,12 +170,17 @@ func TestCodeActionOrCommand_AsCodeAction(t *testing.T) {
 }
 
 // TestUriToAbsPath rejects non-file URIs and parses well-formed ones.
+// uriToAbsPath returns an OS-NATIVE path, so the expectation is spelled
+// natively too (on Windows "file:///abs/path.go" is `\abs\path.go`). The
+// per-platform URI literals — including the drive-letter shapes — are
+// table-tested in internal/lspuri; here the wrapper's delegation plus a
+// lossless round trip through a real native absolute path is what matters.
 func TestUriToAbsPath(t *testing.T) {
 	cases := []struct {
 		uri  string
 		want string
 	}{
-		{"file:///abs/path.go", "/abs/path.go"},
+		{"file:///abs/path.go", filepath.FromSlash("/abs/path.go")},
 		{"http://example.com/x", ""},
 		{"", ""},
 	}
@@ -177,6 +188,11 @@ func TestUriToAbsPath(t *testing.T) {
 		if got := uriToAbsPath(c.uri); got != c.want {
 			t.Errorf("uriToAbsPath(%q) = %q, want %q", c.uri, got, c.want)
 		}
+	}
+
+	native := filepath.Join(t.TempDir(), "round trip.go")
+	if got := uriToAbsPath(pathToURI(native)); got != native {
+		t.Errorf("round trip of %q = %q", native, got)
 	}
 }
 

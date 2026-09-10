@@ -5,6 +5,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 
@@ -133,15 +134,32 @@ func TestHealStaleHookCommands(t *testing.T) {
 	})
 }
 
+// writeGortexStub drops a stand-in `gortex` binary in dir and returns its
+// path. The name carries .exe on Windows because exec.LookPath only
+// considers files whose extension is in PATHEXT there — an extensionless
+// stub is invisible to it, and every PATH-resolution assertion below would
+// silently degrade to the bare-name fallback.
+func writeGortexStub(t *testing.T, dir string) string {
+	t.Helper()
+	name := "gortex"
+	if runtime.GOOS == "windows" {
+		name += ".exe"
+	}
+	path := filepath.Join(dir, name)
+	require.NoError(t, os.WriteFile(path, []byte("#!/bin/sh\nexit 0\n"), 0o755))
+	return path
+}
+
 func TestResolveHookCommand(t *testing.T) {
 	t.Run("foundOnPath", func(t *testing.T) {
 		dir := t.TempDir()
-		fake := filepath.Join(dir, "gortex")
-		require.NoError(t, os.WriteFile(fake, []byte("#!/bin/sh\nexit 0\n"), 0o755))
+		fake := writeGortexStub(t, dir)
 		t.Setenv("PATH", dir)
 
 		got := ResolveHookCommand(io.Discard)
-		assert.Equal(t, fake+" hook", got, "should resolve to absolute path on PATH")
+		// shellSafeHookBinary rewrites separators for the shell that runs
+		// the hook, so the expectation is the slash spelling of the path.
+		assert.Equal(t, filepath.ToSlash(fake)+" hook", got, "should resolve to absolute path on PATH")
 	})
 
 	t.Run("notFoundFallsBackToBare", func(t *testing.T) {
@@ -152,8 +170,7 @@ func TestResolveHookCommand(t *testing.T) {
 
 	t.Run("commandNeverContainsBackslash", func(t *testing.T) {
 		dir := t.TempDir()
-		fake := filepath.Join(dir, "gortex")
-		require.NoError(t, os.WriteFile(fake, []byte("#!/bin/sh\nexit 0\n"), 0o755))
+		writeGortexStub(t, dir)
 		t.Setenv("PATH", dir)
 
 		got := ResolveHookCommand(io.Discard)
@@ -168,19 +185,20 @@ func TestResolveHookCommand(t *testing.T) {
 		// absolute path while the stanza collapses to the bare name — both
 		// resolve to the same file.
 		dir := t.TempDir()
-		fake := filepath.Join(dir, "gortex")
-		require.NoError(t, os.WriteFile(fake, []byte("#!/bin/sh\nexit 0\n"), 0o755))
+		fake := writeGortexStub(t, dir)
 		t.Setenv("PATH", dir)
 
 		hookBin := strings.TrimSuffix(ResolveHookCommand(io.Discard), " hook")
 		mcpCmd := agents.ResolveGortexCommand()
 		// Map the bare name to the PATH gortex it launches, then compare
-		// the concrete on-disk binaries.
+		// the concrete on-disk binaries. The hook command carries the
+		// slash spelling, so both sides come back to native separators
+		// before they are compared.
 		launched := func(cmd string) string {
 			if cmd == "gortex" {
 				return fake
 			}
-			return cmd
+			return filepath.Clean(filepath.FromSlash(cmd))
 		}
 		assert.Equal(t, launched(mcpCmd), launched(hookBin),
 			"hook command and MCP stanza must resolve to the same gortex binary")

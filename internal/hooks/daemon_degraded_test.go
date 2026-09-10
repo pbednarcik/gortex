@@ -2,6 +2,7 @@ package hooks
 
 import (
 	"encoding/json"
+	"path/filepath"
 	"strings"
 	"testing"
 
@@ -21,8 +22,8 @@ func preToolReadPayload(t *testing.T, sessionID string) []byte {
 	return mustJSON(t, map[string]any{
 		"hook_event_name": "PreToolUse",
 		"tool_name":       "Read",
-		"tool_input":      map[string]any{"file_path": "/repo/internal/server.go"},
-		"cwd":             "/repo",
+		"tool_input":      map[string]any{"file_path": filepath.Join(repoFixtureRoot, "internal", "server.go")},
+		"cwd":             repoFixtureRoot,
 		"session_id":      sessionID,
 	})
 }
@@ -74,9 +75,9 @@ func TestPreToolUseDaemonDownGatesForceCompressDeny(t *testing.T) {
 		"tool_name":       gortexCompactReadTool,
 		"tool_input": map[string]any{
 			"operation": "file",
-			"target":    map[string]any{"file": "/repo/internal/server.go"},
+			"target":    map[string]any{"file": filepath.Join(repoFixtureRoot, "internal", "server.go")},
 		},
-		"cwd": "/repo",
+		"cwd": repoFixtureRoot,
 	})
 
 	withDaemonReachable(t, true)
@@ -104,7 +105,7 @@ func TestPreToolUseTerminalDenyStaysLiveDuringOutage(t *testing.T) {
 	payload := mustJSON(t, map[string]any{
 		"hook_event_name": "PreToolUse",
 		"tool_name":       "Read",
-		"tool_input":      map[string]any{"file_path": "/repo/internal/server.go"},
+		"tool_input":      map[string]any{"file_path": filepath.Join(repoFixtureRoot, "internal", "server.go")},
 		"cwd":             cwd,
 		"session_id":      "sess-terminal-outage",
 		"agent_id":        "agent-1",
@@ -128,9 +129,9 @@ func TestPostToolUseDaemonDownSuppressesFollowUps(t *testing.T) {
 	payload := mustJSON(t, map[string]any{
 		"hook_event_name": "PostToolUse",
 		"tool_name":       "Read",
-		"tool_input":      map[string]any{"file_path": "/repo/internal/server.go"},
+		"tool_input":      map[string]any{"file_path": filepath.Join(repoFixtureRoot, "internal", "server.go")},
 		"tool_response":   "package server",
-		"cwd":             "/repo",
+		"cwd":             repoFixtureRoot,
 	})
 
 	withDaemonReachable(t, true)
@@ -184,9 +185,9 @@ func TestCodexMCPReadDaemonDownStaysSilent(t *testing.T) {
 		"tool_name":       gortexCompactReadTool,
 		"tool_input": map[string]any{
 			"operation": "file",
-			"target":    map[string]any{"file": "/repo/internal/server.go"},
+			"target":    map[string]any{"file": filepath.Join(repoFixtureRoot, "internal", "server.go")},
 		},
-		"cwd": "/repo",
+		"cwd": repoFixtureRoot,
 	})
 
 	withDaemonReachable(t, true)
@@ -204,7 +205,7 @@ func TestCodexMCPReadDaemonDownStaysSilent(t *testing.T) {
 
 func TestKimiPreToolUseDaemonDownStaysSilent(t *testing.T) {
 	stubIndexedFile(t, true, 4)
-	input := map[string]any{"file_path": "/repo/internal/server.go"}
+	input := map[string]any{"file_path": filepath.Join(repoFixtureRoot, "internal", "server.go")}
 
 	withDaemonReachable(t, true)
 	control := captureHookStdout(t, func() { runKimiPreToolUse("Read", input, "sess", 0, ModeDeny) })
@@ -240,8 +241,8 @@ func TestPiToolCallDaemonDownEmptyDecision(t *testing.T) {
 	ev := PiEvent{
 		Event:     "tool_call",
 		ToolName:  "Read",
-		ToolInput: map[string]any{"file_path": "/repo/internal/server.go"},
-		CWD:       "/repo",
+		ToolInput: map[string]any{"file_path": filepath.Join(repoFixtureRoot, "internal", "server.go")},
+		CWD:       repoFixtureRoot,
 		SessionID: "sess",
 	}
 
@@ -261,8 +262,8 @@ func TestHermesPreToolCallDaemonDownNeverBlocks(t *testing.T) {
 	payload := mustJSON(t, map[string]any{
 		"hook_event_name": hermesEventPreToolCall,
 		"tool_name":       hermesReadFileTool,
-		"tool_input":      map[string]any{"path": "/repo/internal/server.go"},
-		"cwd":             "/repo",
+		"tool_input":      map[string]any{"path": filepath.Join(repoFixtureRoot, "internal", "server.go")},
+		"cwd":             repoFixtureRoot,
 		"session_id":      "sess",
 	})
 
@@ -340,15 +341,15 @@ func TestDaemonDownNoticeScopedToTrackedRepos(t *testing.T) {
 	withDaemonReachable(t, false)
 	oldRepos := hookTrackedReposFn
 	hookTrackedReposFn = func() []daemon.TrackedRepoStatus {
-		return []daemon.TrackedRepoStatus{{Path: "/repo", Name: "repo"}}
+		return []daemon.TrackedRepoStatus{{Path: repoFixtureRoot, Name: "repo"}}
 	}
 	t.Cleanup(func() { hookTrackedReposFn = oldRepos })
 
 	untracked := mustJSON(t, map[string]any{
 		"hook_event_name": "PreToolUse",
 		"tool_name":       "Read",
-		"tool_input":      map[string]any{"file_path": "/elsewhere/scratch.go"},
-		"cwd":             "/elsewhere",
+		"tool_input":      map[string]any{"file_path": filepath.Join(elsewhereFixtureRoot, "scratch.go")},
+		"cwd":             elsewhereFixtureRoot,
 		"session_id":      "sess-scoped",
 	})
 	if out := captureHookStdout(t, func() { runPreToolUse(untracked, 0, ModeDeny) }); out != "" {
@@ -369,9 +370,9 @@ func TestPreToolUseDaemonDownSkipsNudgeUnderAutoApprove(t *testing.T) {
 		"tool_name":       gortexCompactReadTool,
 		"tool_input": map[string]any{
 			"operation": "file",
-			"target":    map[string]any{"file": "/repo/internal/server.go"},
+			"target":    map[string]any{"file": filepath.Join(repoFixtureRoot, "internal", "server.go")},
 		},
-		"cwd":             "/repo",
+		"cwd":             repoFixtureRoot,
 		"permission_mode": "acceptEdits",
 	})
 
@@ -421,7 +422,7 @@ func TestPiAdaptiveNudgeStreakFrozenDuringOutage(t *testing.T) {
 	ev := PiEvent{
 		Event:        "tool_call",
 		ToolName:     "search_symbols",
-		CWD:          "/repo",
+		CWD:          repoFixtureRoot,
 		SessionID:    session,
 		IsGortexTool: true,
 	}

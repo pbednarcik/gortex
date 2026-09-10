@@ -57,7 +57,7 @@ func TestStaleRefsBroadcaster_RemovedSymbol_InWorkingSet(t *testing.T) {
 	calls := fake.snapshot()
 	require.Len(t, calls, 1)
 	assert.Equal(t, "/x.go", calls[0].params["path"])
-	assert.Equal(t, "file:///x.go", calls[0].params["uri"])
+	assert.Equal(t, wantFileURI(t, "/x.go"), calls[0].params["uri"])
 	removed := calls[0].params["removed_symbols"].([]string)
 	require.Len(t, removed, 1)
 	assert.Equal(t, "x.go::Foo", removed[0])

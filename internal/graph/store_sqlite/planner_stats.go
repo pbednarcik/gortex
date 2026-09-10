@@ -163,101 +163,175 @@ func (s *Store) refreshPlannerStatsLocked(ctx context.Context) error {
 	return refreshPlannerStatsOnConn(ctx, conn)
 }
 
-func refreshPlannerStatsOnConn(ctx context.Context, conn *sql.Conn) error {
-	if _, err := conn.ExecContext(ctx, fmt.Sprintf(`PRAGMA analysis_limit=%d`, plannerStatsAnalysisLimit)); err != nil {
-		return err
+// analyzePlannerStatsIndexLocked rebuilds ONE index's statistics under a write
+// gate the caller has just taken. It is the unit of work the cooperative
+// runtime refresh holds the gate for: the batch above is right for a cold-load
+// finalize, which already owns the store, and wrong for a live daemon, where
+// the gate sits underneath the reach-topology writer gate, the batch mutation
+// gate and a repository lane.
+func (s *Store) analyzePlannerStatsIndexLocked(ctx context.Context, name string) (removedStatRow bool, err error) {
+	conn, release, err := s.activeWriteConnLocked(ctx)
+	if err != nil {
+		return false, err
 	}
+	defer release()
+	hasStatTable, err := preparePlannerStatsConn(ctx, conn)
+	if err != nil {
+		return false, err
+	}
+	return analyzePlannerStatsIndexOnConn(ctx, conn, name, hasStatTable)
+}
 
+// reloadPlannerStatsLocked reloads sqlite_stat1 after a deletion, under a write
+// gate the caller has just taken. Best-effort in full: a reload that cannot run
+// leaves the deleted row absent for every connection opened from here on, and
+// the next successful refresh reloads it for the ones already open.
+func (s *Store) reloadPlannerStatsLocked(ctx context.Context) {
+	conn, release, err := s.activeWriteConnLocked(ctx)
+	if err != nil {
+		log.Printf("store_sqlite: planner stats reload failed error=%q", err)
+		return
+	}
+	defer release()
+	reloadPlannerStatsOnConn(ctx, conn)
+}
+
+func refreshPlannerStatsOnConn(ctx context.Context, conn *sql.Conn) error {
 	// Materialize the tiny schema result and close its cursor before issuing
 	// ANALYZE on the same physical connection. Re-entering a pinned connection
 	// with an open rows cursor can deadlock database/sql.
-	rows, err := conn.QueryContext(ctx, plannerStatsIndexQuery)
+	indexes, err := plannerStatsIndexesOnConn(ctx, conn)
 	if err != nil {
 		return err
+	}
+
+	hasStatTable, err := preparePlannerStatsConn(ctx, conn)
+	if err != nil {
+		return err
+	}
+
+	removedStatRow := false
+	for _, name := range indexes {
+		removed, err := analyzePlannerStatsIndexOnConn(ctx, conn, name, hasStatTable)
+		if err != nil {
+			return err
+		}
+		removedStatRow = removedStatRow || removed
+	}
+	if removedStatRow {
+		reloadPlannerStatsOnConn(ctx, conn)
+	}
+	return nil
+}
+
+// plannerStatsIndexesOnConn reads the critical-index list through a pinned
+// connection, fully materialized so no cursor is open when ANALYZE runs on the
+// same physical connection.
+func plannerStatsIndexesOnConn(ctx context.Context, conn *sql.Conn) ([]string, error) {
+	rows, err := conn.QueryContext(ctx, plannerStatsIndexQuery)
+	if err != nil {
+		return nil, err
 	}
 	var indexes []string
 	for rows.Next() {
 		var name string
 		if err := rows.Scan(&name); err != nil {
 			_ = rows.Close()
-			return err
+			return nil, err
 		}
 		indexes = append(indexes, name)
 	}
 	if err := rows.Err(); err != nil {
 		_ = rows.Close()
-		return err
+		return nil, err
 	}
 	if err := rows.Close(); err != nil {
-		return err
+		return nil, err
 	}
+	return indexes, nil
+}
 
-	// Probe the catalog once: sqlite_stat1 may not exist yet, and if it does
-	// not, no stale row can exist for any index either. The probe is part of
-	// the best-effort hygiene described below, so a failure is logged rather
-	// than returned: assuming the table exists costs at most a DELETE that
-	// matches nothing, while failing here would abort a cold load.
-	hasStatTable := true
+// preparePlannerStatsConn binds the sampling budget and answers whether
+// sqlite_stat1 exists at all.
+//
+// analysis_limit is a CONNECTION setting, so it has to be bound on whichever
+// connection is about to ANALYZE. The cooperative runtime refresh acquires a
+// connection per index, which is exactly why this is a separate step rather
+// than a preamble inside the loop above.
+//
+// The catalog probe is part of the best-effort hygiene described in
+// analyzePlannerStatsIndexOnConn, so its failure is logged rather than
+// returned: assuming the table exists costs at most a DELETE that matches
+// nothing, while failing here would abort a cold load.
+func preparePlannerStatsConn(ctx context.Context, conn *sql.Conn) (hasStatTable bool, err error) {
+	if _, err := conn.ExecContext(ctx, fmt.Sprintf(`PRAGMA analysis_limit=%d`, plannerStatsAnalysisLimit)); err != nil {
+		return false, err
+	}
+	hasStatTable = true
 	if err := conn.QueryRowContext(ctx, plannerStatsTableExistsQuery).Scan(&hasStatTable); err != nil {
 		log.Printf("store_sqlite: planner stats catalog probe failed error=%q", err)
 		hasStatTable = true
 	}
+	return hasStatTable, nil
+}
 
-	// ANALYZE on an empty partial index writes a literal '0 0 0 0 0' stat row,
-	// and a believed-zero cardinality is worse than no statistics at all: with
-	// no row SQLite falls back to its default cost model, which plans these
-	// queries correctly, while a zero row convinces the planner the index is
-	// free to scan and it hoists that relation to the outermost loop (issue
-	// #651 turned the receiver rebind into O(types * member_of) that way).
-	// So never ANALYZE an empty partial critical index; drop any row it left
-	// behind instead.
-	//
-	// Every step of that hygiene is best-effort by design. ANALYZE itself
-	// stays a hard error as it always was, but a failed probe, a failed
-	// DELETE or a failed reload must not fail the caller:
-	// Store.EndCoordinatedBulkLoad joins this function's error into the
-	// cold-load result, and the multi-repo pipeline aborts on it. Losing a
-	// statistics refinement is a planning regression; aborting a cold load
-	// loses the index.
-	removedStatRow := false
-	for _, name := range indexes {
-		if spec, known := plannerStatsIndexProbes[name]; known && spec.partial {
-			var hasRows bool
-			if err := conn.QueryRowContext(ctx, spec.existsQuery(name)).Scan(&hasRows); err != nil {
-				// Fall through to the plain ANALYZE: without a usable probe
-				// the safest assumption is that the index is populated, which
-				// is the branch that behaves exactly as it did before this
-				// hygiene existed.
-				log.Printf("store_sqlite: planner stats probe failed index=%s error=%q", name, err)
-			} else if !hasRows {
-				if hasStatTable {
-					// Index names are unique across the whole schema, so
-					// matching on idx alone is exact today and stays exact
-					// if a partial critical index ever lands on edges.
-					res, err := conn.ExecContext(ctx, `DELETE FROM sqlite_stat1 WHERE idx = ?`, name)
-					if err != nil {
-						log.Printf("store_sqlite: planner stats clear failed index=%s error=%q", name, err)
-					} else if affected, err := res.RowsAffected(); err == nil && affected > 0 {
-						removedStatRow = true
-					}
+// analyzePlannerStatsIndexOnConn rebuilds ONE index's statistics, and reports
+// whether it removed a stat row instead (which obliges the caller to reload).
+//
+// ANALYZE on an empty partial index writes a literal '0 0 0 0 0' stat row, and
+// a believed-zero cardinality is worse than no statistics at all: with no row
+// SQLite falls back to its default cost model, which plans these queries
+// correctly, while a zero row convinces the planner the index is free to scan
+// and it hoists that relation to the outermost loop (issue #651 turned the
+// receiver rebind into O(types * member_of) that way). So never ANALYZE an
+// empty partial critical index; drop any row it left behind instead.
+//
+// Every step of that hygiene is best-effort by design. ANALYZE itself stays a
+// hard error as it always was, but a failed probe, a failed DELETE or a failed
+// reload must not fail the caller: Store.EndCoordinatedBulkLoad joins the
+// batch refresh's error into the cold-load result, and the multi-repo pipeline
+// aborts on it. Losing a statistics refinement is a planning regression;
+// aborting a cold load loses the index.
+func analyzePlannerStatsIndexOnConn(ctx context.Context, conn *sql.Conn, name string, hasStatTable bool) (removedStatRow bool, err error) {
+	if spec, known := plannerStatsIndexProbes[name]; known && spec.partial {
+		var hasRows bool
+		if err := conn.QueryRowContext(ctx, spec.existsQuery(name)).Scan(&hasRows); err != nil {
+			// Fall through to the plain ANALYZE: without a usable probe the
+			// safest assumption is that the index is populated, which is the
+			// branch that behaves exactly as it did before this hygiene
+			// existed.
+			log.Printf("store_sqlite: planner stats probe failed index=%s error=%q", name, err)
+		} else if !hasRows {
+			if hasStatTable {
+				// Index names are unique across the whole schema, so matching
+				// on idx alone is exact today and stays exact if a partial
+				// critical index ever lands on edges.
+				res, err := conn.ExecContext(ctx, `DELETE FROM sqlite_stat1 WHERE idx = ?`, name)
+				if err != nil {
+					log.Printf("store_sqlite: planner stats clear failed index=%s error=%q", name, err)
+				} else if affected, err := res.RowsAffected(); err == nil && affected > 0 {
+					removedStatRow = true
 				}
-				continue
 			}
-		}
-		if _, err := conn.ExecContext(ctx, `ANALYZE `+quoteSQLiteIdentifier(name)); err != nil {
-			return fmt.Errorf("analyze graph index %s: %w", name, err)
+			return removedStatRow, nil
 		}
 	}
-	if removedStatRow {
-		// A direct DELETE from sqlite_stat1 is invisible to the connection's
-		// cached statistics until they are reloaded. ANALYZE on the schema
-		// table reloads sqlite_stat1 without recomputing anything, so this
-		// connection stops planning against the row that was just removed.
-		if _, err := conn.ExecContext(ctx, `ANALYZE sqlite_schema`); err != nil {
-			log.Printf("store_sqlite: planner stats reload failed error=%q", err)
-		}
+	if _, err := conn.ExecContext(ctx, `ANALYZE `+quoteSQLiteIdentifier(name)); err != nil {
+		return removedStatRow, fmt.Errorf("analyze graph index %s: %w", name, err)
 	}
-	return nil
+	return removedStatRow, nil
+}
+
+// reloadPlannerStatsOnConn makes a direct DELETE from sqlite_stat1 visible.
+//
+// The deletion is invisible to the connection's cached statistics until they
+// are reloaded. ANALYZE on the schema table reloads sqlite_stat1 without
+// recomputing anything, so this connection stops planning against the row that
+// was just removed. Best-effort, as above.
+func reloadPlannerStatsOnConn(ctx context.Context, conn *sql.Conn) {
+	if _, err := conn.ExecContext(ctx, `ANALYZE sqlite_schema`); err != nil {
+		log.Printf("store_sqlite: planner stats reload failed error=%q", err)
+	}
 }
 
 func quoteSQLiteIdentifier(name string) string {
@@ -434,29 +508,30 @@ func plannerStatsBelievedRows(ctx context.Context, db *sql.DB, index string) int
 // rest of its life. Never fatal: a store without stats still answers every
 // query, just through the default cost model.
 //
-// It reports whether sqlite_stat1 was actually rewritten, because the rewrite
-// is only visible to the connection that performed it: the caller has to
-// recycle the read pool for the repair to reach readers at all.
-func healPlannerStats(db *sql.DB) (repaired bool) {
+// It reports whether sqlite_stat1 was actually rewritten, and why, because the
+// rewrite is only visible to the connection that performed it: the caller has
+// to recycle the read pool for the repair to reach readers at all, and stamp
+// the freshness ledger so the runtime checker knows an ANALYZE already ran.
+func healPlannerStats(db *sql.DB) (repaired bool, reason string) {
 	ctx := context.Background()
 	reason, needsRepair := plannerStatsRepairReason(ctx, db)
 	if !needsRepair {
-		return false
+		return false, ""
 	}
 	var hasNodes bool
 	if err := db.QueryRowContext(ctx, `SELECT EXISTS(SELECT 1 FROM nodes)`).Scan(&hasNodes); err != nil || !hasNodes {
-		return false
+		return false, ""
 	}
 	started := time.Now()
 	conn, err := db.Conn(ctx)
 	if err != nil {
-		return false
+		return false, ""
 	}
 	defer conn.Close()
 	if err := refreshPlannerStatsOnConn(ctx, conn); err != nil {
 		log.Printf("store_sqlite: planner stats heal failed error=%q", err)
-		return false
+		return false, ""
 	}
 	log.Printf("store_sqlite: planner stats repair reason=%s elapsed=%s", reason, time.Since(started))
-	return true
+	return true, reason
 }

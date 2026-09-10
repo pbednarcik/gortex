@@ -47,8 +47,12 @@ func TestFoldPath_UppercasesDriveLetter(t *testing.T) {
 }
 
 func TestFoldPath_CleansRedundantSegments(t *testing.T) {
-	got := foldPath("/Users/me/./project/../project", false)
-	want := "/Users/me/project"
+	// foldPath canonicalizes with filepath.Clean, which also rewrites
+	// separators to the host's native ones — so both the input and the
+	// expectation are spelled natively (on Windows "/Users/me/project"
+	// folds to `\Users\me\project`).
+	got := foldPath(filepath.FromSlash("/Users/me/./project/../project"), false)
+	want := filepath.FromSlash("/Users/me/project")
 	if got != want {
 		t.Fatalf("foldPath did not clean: got %q want %q", got, want)
 	}

@@ -137,10 +137,70 @@ WHERE view_gen = ?
 	return statements, nil
 }
 
-// ReplaceRefFactsForFiles atomically delete-then-refills the exact changed-file
-// frontier. The delete is deliberately scoped by repo even though graph paths
-// are normally prefixed: stale facts for a now-empty/removed file still need
-// deletion, and a same-named file in another repository must survive.
+// refFactFileProjection starts with the requested files, not the whole repo.
+// Fact identity omits edge.file_path: collapse collisions before comparing
+// payloads, with highest edge rowid as a deterministic winner matching the
+// existing adjacency traversal. Otherwise colliding facts can oscillate even
+// when the graph is unchanged. Each statement materializes its own desired
+// set within the same transaction, avoiding a projection per old fact.
+const refFactFileProjection = `WITH selected AS (
+    SELECT n.repo_prefix, e.from_id, e.to_id, e.kind,
+           COALESCE(t.name, '') AS ref_name, e.line,
+           ` + refFactOriginExpr + ` AS effective_origin,
+           n.file_path, n.language, e.id AS edge_id
+    FROM json_each(?) AS requested
+    CROSS JOIN nodes AS n
+      ON n.repo_prefix = ? AND n.file_path = CAST(requested.value AS TEXT)
+    JOIN edges AS e INDEXED BY edges_by_from
+      ON e.from_id = n.id AND e.view_gen = n.view_gen
+    LEFT JOIN nodes AS t ON t.id = e.to_id AND t.view_gen = e.view_gen
+    WHERE ` + refFactEligiblePredicate + ` AND n.view_gen = ?
+), ranked AS (
+    SELECT ? AS view_gen, repo_prefix, from_id, to_id, kind, ref_name, line,
+           effective_origin AS origin,
+           CASE effective_origin
+               WHEN 'lsp_resolved' THEN 'lsp'
+               WHEN 'lsp_dispatch' THEN 'lsp'
+               WHEN 'ast_resolved' THEN 'ast'
+               ELSE 'heuristic'
+           END AS tier,
+           '' AS candidates, file_path, language AS lang,
+           ROW_NUMBER() OVER (
+               PARTITION BY repo_prefix, from_id, to_id, kind, line
+               ORDER BY edge_id DESC
+           ) AS fact_rank
+    FROM selected
+), desired AS MATERIALIZED (
+    SELECT ` + refFactColumns + ` FROM ranked WHERE fact_rank = 1
+)
+`
+
+const refFactDeleteObsolete = refFactFileProjection + `DELETE FROM ref_facts
+WHERE view_gen = ? AND repo_prefix = ?
+  AND file_path IN (SELECT CAST(value AS TEXT) FROM json_each(?))
+  AND NOT EXISTS (
+      SELECT 1 FROM desired AS d
+      WHERE d.view_gen = ref_facts.view_gen AND d.repo_prefix = ref_facts.repo_prefix
+        AND d.from_id = ref_facts.from_id AND d.to_id = ref_facts.to_id
+        AND d.kind = ref_facts.kind AND d.line = ref_facts.line
+  )`
+
+const refFactUpsertChanged = refFactFileProjection + `INSERT INTO ref_facts (` + refFactColumns + `)
+SELECT ` + refFactColumns + ` FROM desired WHERE true
+ON CONFLICT (view_gen, repo_prefix, from_id, to_id, kind, line) DO UPDATE SET
+    ref_name = excluded.ref_name, origin = excluded.origin, tier = excluded.tier,
+    candidates = excluded.candidates, file_path = excluded.file_path, lang = excluded.lang
+WHERE ref_facts.ref_name IS NOT excluded.ref_name
+   OR ref_facts.origin IS NOT excluded.origin
+   OR ref_facts.tier IS NOT excluded.tier
+   OR ref_facts.candidates IS NOT excluded.candidates
+   OR ref_facts.file_path IS NOT excluded.file_path
+   OR ref_facts.lang IS NOT excluded.lang`
+
+// ReplaceRefFactsForFiles atomically applies only changed reference facts in
+// the exact file frontier. Unchanged payloads perform no persistent writes.
+// Deletion remains repo-scoped so removed/empty files lose stale facts without
+// disturbing a same-named file in another repository or generation.
 func (s *Store) ReplaceRefFactsForFiles(repoPrefix string, files []string) error {
 	_, err := s.replaceRefFactsForFiles(repoPrefix, files)
 	return err
@@ -164,18 +224,13 @@ func (s *Store) replaceRefFactsForFiles(repoPrefix string, files []string) (stat
 	}
 	defer tx.Rollback() //nolint:errcheck // no-op after Commit
 
-	if _, err := tx.Exec(`DELETE FROM ref_facts
-WHERE view_gen = ?
-  AND repo_prefix = ?
-  AND file_path IN (SELECT CAST(value AS TEXT) FROM json_each(?))`, s.viewGen, repoPrefix, string(filesJSON)); err != nil {
+	if _, err := tx.Exec(refFactDeleteObsolete,
+		string(filesJSON), repoPrefix, s.viewGen, s.viewGen,
+		s.viewGen, repoPrefix, string(filesJSON)); err != nil {
 		return statements, err
 	}
 	statements++
-	insert := refFactInsertPrefix + `    FROM json_each(?) AS requested
-    JOIN nodes AS n
-      ON n.repo_prefix = ? AND n.file_path = CAST(requested.value AS TEXT)
-    JOIN edges AS e INDEXED BY edges_by_from ON e.from_id = n.id AND e.view_gen = n.view_gen` + refFactInsertSuffix
-	if _, err := tx.Exec(insert, string(filesJSON), repoPrefix, s.viewGen, s.viewGen); err != nil {
+	if _, err := tx.Exec(refFactUpsertChanged, string(filesJSON), repoPrefix, s.viewGen, s.viewGen); err != nil {
 		return statements, fmt.Errorf("ref-facts refill: %w", err)
 	}
 	statements++

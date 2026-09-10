@@ -909,7 +909,14 @@ func createGraphCoreIndexes(db schemaColumnDB) error {
 			return fmt.Errorf("%s: %w", idx.name, err)
 		}
 	}
-	for _, ddl := range []string{nodesByQualIndexSQL, edgesExternalIndexSQL} {
+	for _, ddl := range []string{
+		nodesByQualIndexSQL,
+		edgesExternalIndexSQL,
+		// Keep this sparse frontier live during bulk loading. It must also be
+		// buildable before the view-generation migration adds view_gen.
+		`CREATE INDEX IF NOT EXISTS nodes_missing_workspace_slugs ON nodes(repo_prefix)
+			WHERE workspace_id = '' OR project_id = ''`,
+	} {
 		if _, err := db.Exec(ddl); err != nil {
 			return err
 		}
@@ -1233,6 +1240,11 @@ const contentFTSRowidTableBody = ` (
 // virtual table has no rewritable primary key, and their per-generation
 // scoping runs through the docid maps below them.
 var viewGenSidecars = []viewGenSidecar{
+	{
+		table:   "file_index_failures",
+		body:    fileIndexFailuresTableBody,
+		columns: `repo_prefix, file_path, error, permission_denied, workspace_id, project_id`,
+	},
 	{
 		table:   "file_mtimes",
 		body:    fileMtimesTableBody,

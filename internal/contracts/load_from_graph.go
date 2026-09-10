@@ -1,82 +1,315 @@
 package contracts
 
 import (
+	"encoding/json"
+	"reflect"
+	"sort"
+
 	"github.com/zzet/gortex/internal/graph"
 )
 
-// LoadRegistryFromGraph rebuilds a Registry by scanning every
-// KindContract node under repoPrefix and reconstructing the Contract
-// struct from Node.Meta. The reverse of the AddNode stamping the
-// indexer's commitContracts (and contracts/wrapper.go's
-// commitInlinedContractToGraph) do — both write the full record onto
-// Meta so a daemon restart can rehydrate without replaying the gob
-// snapshot.
-//
-// Empty repoPrefix loads every contract — useful for ad-hoc probes,
-// not a path the daemon normally takes (the warmup rehydrates the
-// per-repo registries one prefix at a time so a stale repo's
-// contracts don't bleed into a fresh sibling). Returns nil when no
-// contracts are recorded for the prefix.
+type persistedContractRecordKey struct {
+	id, file, symbol, repo, workspace, project string
+	role                                       Role
+}
+
+func persistedContractKey(c Contract) persistedContractRecordKey {
+	return persistedContractRecordKey{c.ID, c.FilePath, c.SymbolID, c.RepoPrefix, c.WorkspaceID, c.ProjectID, c.Role}
+}
+
+// LoadRegistryFromGraph reconstructs records from repo-owned provides/consumes
+// rows plus recoverable legacy scalar nodes. Canonical IDs are shared semantic
+// identities: a canonical node's last-writer scope does not own every record.
+// Empty prefix remains the exact single-repository namespace, not global.
 func LoadRegistryFromGraph(g graph.Store, repoPrefix string) *Registry {
+	return loadRegistryFromGraph(g, repoPrefix, "", "", false)
+}
+
+// LoadRegistryFromGraphWithScope restores an indexer's legacy scope while
+// preserving explicitly persisted owner scope, including empty strings. The
+// ordinary loader continues to derive its fallback from the canonical node.
+func LoadRegistryFromGraphWithScope(g graph.Store, repoPrefix, workspaceID, projectID string) *Registry {
+	return loadRegistryFromGraph(g, repoPrefix, workspaceID, projectID, true)
+}
+
+func loadRegistryFromGraph(g graph.Store, repoPrefix, workspaceID, projectID string, useScope bool) *Registry {
 	if g == nil {
 		return nil
 	}
-	all := g.GetRepoNodes(repoPrefix)
-	if len(all) == 0 {
-		return nil
+	owners := graph.ReadRepoEdgesByKinds(g, []string{repoPrefix}, []graph.EdgeKind{graph.EdgeProvides, graph.EdgeConsumes})
+	nodes := make(map[string]*graph.Node)
+	rememberNode := func(node *graph.Node) {
+		if node != nil && node.ID != "" && node.Kind == graph.KindContract {
+			nodes[node.ID] = node
+		}
 	}
-	reg := NewRegistry()
-	for _, n := range all {
-		if n == nil || n.Kind != graph.KindContract {
+	if repoPrefix == "" {
+		// Retain the original branch's backend-defined exact empty scope.
+		for _, node := range g.GetRepoNodes("") {
+			rememberNode(node)
+		}
+	} else {
+		for node := range graph.NodesInScopeSeq(g, []string{repoPrefix}, nil, graph.KindContract) {
+			rememberNode(node)
+		}
+	}
+	missing := make(map[string]struct{})
+	for _, row := range owners {
+		if row.Edge != nil && row.Edge.To != "" && nodes[row.Edge.To] == nil {
+			missing[row.Edge.To] = struct{}{}
+		}
+	}
+	ids := make([]string, 0, len(missing))
+	for id := range missing {
+		ids = append(ids, id)
+	}
+	sort.Strings(ids)
+	for start := 0; start < len(ids); start += 128 {
+		for _, node := range g.GetNodesByIDs(ids[start:min(start+128, len(ids))]) {
+			rememberNode(node)
+		}
+	}
+	registry := NewRegistry()
+	seenRecords := make(map[string][]Contract)
+	ownerIdentities := make(map[persistedContractRecordKey]struct{})
+	add := func(c Contract) {
+		if c.ID == "" || c.RepoPrefix != repoPrefix {
+			return
+		}
+		// Deduplicate exact recovered records only. Line and metadata can
+		// distinguish records even when their semantic contract ID is shared.
+		// If an in-memory adapter exposes a non-serializable metadata value,
+		// preserve its record rather than silently discarding it.
+		if encoded, err := json.Marshal(c); err == nil {
+			key := string(encoded)
+			// JSON is only a bucket key: concrete metadata types such as
+			// int and float64 can encode identically but remain distinct.
+			for _, existing := range seenRecords[key] {
+				if reflect.DeepEqual(existing, c) {
+					return
+				}
+			}
+			seenRecords[key] = append(seenRecords[key], c)
+		}
+		registry.Add(c)
+	}
+	// A scalar payload for an existing owner identity is stale fallback, not
+	// another owner merely because its confidence/type/metadata differs.
+	// Recovered owner rows remain complete even where Registry.All deliberately
+	// coalesces line/payload variants; ByID and other scoped indices retain them.
+	for _, row := range owners {
+		edge := row.Edge
+		if edge == nil {
 			continue
 		}
-		c := contractFromNode(n)
-		if c.ID == "" {
+		var c Contract
+		if useScope {
+			c, _ = ContractFromOwnerEdge(nodes[edge.To], edge, repoPrefix, workspaceID, projectID)
+		} else {
+			c = contractFromOwnerNode(nodes[edge.To], edge, repoPrefix)
+		}
+		if c.ID != "" && c.RepoPrefix == repoPrefix {
+			ownerIdentities[persistedContractKey(c)] = struct{}{}
+		}
+		add(c)
+	}
+	scalarLiveness := false
+	if guarantee, ok := g.(graph.ContractOwnerScalarLiveness); ok {
+		scalarLiveness = guarantee.ContractOwnerScalarLivenessGuaranteed()
+	}
+	conservativeOwners := make(map[string]bool)
+	if !scalarLiveness {
+		// Opaque adapters keep the old non-atomic replacement behavior. They
+		// cannot safely invalidate a legacy scalar through read -> AddNode.
+		// A surviving owner anywhere in this selected store/view makes scalar
+		// fallback ambiguous, so omit it conservatively instead of reviving a
+		// deleted record. Scalar-only legacy contracts still remain readable.
+		candidates := make([]string, 0, len(nodes))
+		for id, node := range nodes {
+			ownerBacked, _ := node.Meta["contract_owner_record"].(bool)
+			removed, _ := node.Meta["contract_owner_removed"].(bool)
+			if node.RepoPrefix == repoPrefix && !ownerBacked && !removed {
+				candidates = append(candidates, id)
+			}
+		}
+		sort.Strings(candidates)
+		for start := 0; start < len(candidates); start += 128 {
+			for id, incoming := range g.GetInEdgesByNodeIDs(candidates[start:min(start+128, len(candidates))]) {
+				for _, edge := range incoming {
+					if edge != nil && (edge.Kind == graph.EdgeProvides || edge.Kind == graph.EdgeConsumes || edge.Kind == graph.EdgeHandlesRoute) {
+						conservativeOwners[id] = true
+						break
+					}
+				}
+			}
+		}
+	}
+	var sparseOwnerIdentities map[persistedContractRecordKey]struct{}
+	ids = ids[:0]
+	for id := range nodes {
+		ids = append(ids, id)
+	}
+	sort.Strings(ids)
+	for _, id := range ids {
+		node := nodes[id]
+		if node.RepoPrefix != repoPrefix {
 			continue
 		}
-		reg.Add(c)
+		ownerBacked, _ := node.Meta["contract_owner_record"].(bool)
+		removed, _ := node.Meta["contract_owner_removed"].(bool)
+		if ownerBacked || removed || conservativeOwners[id] {
+			continue
+		}
+		c := contractFromNode(node)
+		if useScope {
+			// Legacy scalar reconstruction historically uses the owning
+			// indexer's scope even when stale scalar scope is populated.
+			c.RepoPrefix, c.WorkspaceID, c.ProjectID = repoPrefix, workspaceID, projectID
+		}
+		key := persistedContractKey(c)
+		_, ownerExists := ownerIdentities[key]
+		if _, symbolPresent := node.Meta["symbol_id"]; !symbolPresent && !ownerExists && len(ownerIdentities) > 0 {
+			// Missing symbol identity is sparse legacy data, unlike an
+			// explicitly empty string. Modern owner-backed loads never
+			// allocate this fallback index; build it only once if needed.
+			if sparseOwnerIdentities == nil {
+				sparseOwnerIdentities = make(map[persistedContractRecordKey]struct{}, len(ownerIdentities))
+				for ownerKey := range ownerIdentities {
+					ownerKey.symbol = ""
+					sparseOwnerIdentities[ownerKey] = struct{}{}
+				}
+			}
+			key.symbol = ""
+			_, ownerExists = sparseOwnerIdentities[key]
+		}
+		if !ownerExists {
+			add(c)
+		}
 	}
-	if len(reg.All()) == 0 {
+	if len(registry.All()) == 0 {
 		return nil
 	}
-	return reg
+	return registry
 }
 
-// contractFromNode decodes a Contract from a KindContract graph node's
-// Meta payload. Inverse of the AddNode stamping the indexer does.
-// Missing fields are left at their zero value — preserves forward
-// compatibility if the indexer adds new Meta keys before this loader
-// learns about them.
-func contractFromNode(n *graph.Node) Contract {
-	c := Contract{
-		ID:         n.ID,
-		FilePath:   n.FilePath,
-		RepoPrefix: n.RepoPrefix,
+func contractFromNode(node *graph.Node) Contract {
+	if node == nil || node.Kind != graph.KindContract || node.ID == "" {
+		return Contract{}
 	}
-	if n.Meta == nil {
+	c := Contract{ID: node.ID, FilePath: node.FilePath, RepoPrefix: node.RepoPrefix, WorkspaceID: node.WorkspaceID, ProjectID: node.ProjectID}
+	if node.Meta == nil {
 		return c
 	}
-	if v, ok := n.Meta["type"].(string); ok {
-		c.Type = ContractType(v)
+	if value, ok := node.Meta["type"].(string); ok {
+		c.Type = ContractType(value)
 	}
-	if v, ok := n.Meta["role"].(string); ok {
-		c.Role = Role(v)
+	if value, ok := node.Meta["role"].(string); ok {
+		c.Role = Role(value)
 	}
-	if v, ok := n.Meta["symbol_id"].(string); ok {
-		c.SymbolID = v
+	if value, ok := node.Meta["symbol_id"].(string); ok {
+		c.SymbolID = value
 	}
-	if v, ok := n.Meta["line"].(int); ok {
-		c.Line = v
-	} else if v, ok := n.Meta["line"].(int64); ok {
-		c.Line = int(v)
-	}
-	if v, ok := n.Meta["confidence"].(float64); ok {
-		c.Confidence = v
-	}
-	c.WorkspaceID = n.WorkspaceID
-	c.ProjectID = n.ProjectID
-	if v, ok := n.Meta["contract_meta"].(map[string]any); ok && len(v) > 0 {
-		c.Meta = v
+	c.Line = persistedContractLine(node.Meta["line"])
+	c.Confidence = persistedContractConfidence(node.Meta["confidence"])
+	if value, ok := node.Meta["contract_meta"].(map[string]any); ok {
+		c.Meta = value
 	}
 	return c
+}
+
+// ContractFromGraphNode decodes the scalar payload, not its ownership liveness.
+// LoadRegistryFromGraph applies persisted-owner/removal fallback policy.
+func ContractFromGraphNode(node *graph.Node) (Contract, bool) {
+	c := contractFromNode(node)
+	return c, c.ID != ""
+}
+
+func contractFromOwnerNode(node *graph.Node, edge *graph.Edge, repo string) Contract {
+	workspace, project := "", ""
+	if node != nil && node.RepoPrefix == repo {
+		workspace, project = node.WorkspaceID, node.ProjectID
+	}
+	c, _ := ContractFromOwnerEdge(node, edge, repo, workspace, project)
+	return c
+}
+
+// ContractFromOwnerEdge is shared with incremental reconstruction. Scope
+// arguments are fallbacks only; explicit durable owner payload is authoritative.
+func ContractFromOwnerEdge(node *graph.Node, edge *graph.Edge, repo, workspace, project string) (Contract, bool) {
+	c := contractFromNode(node)
+	if c.ID == "" || edge == nil || edge.From == "" || (edge.Kind != graph.EdgeProvides && edge.Kind != graph.EdgeConsumes) {
+		return Contract{}, false
+	}
+	c.WorkspaceID, c.ProjectID = workspace, project
+	c.RepoPrefix, c.FilePath, c.SymbolID, c.Line = repo, edge.FilePath, edge.From, edge.Line
+	if symbol, explicit := edge.Meta["contract_owner_symbol_id"].(string); explicit {
+		c.SymbolID = symbol
+		// New complete owner payloads must not inherit another record's
+		// canonical metadata when this owner's metadata is genuinely nil.
+		c.Meta = nil
+	}
+	c.Role = RoleProvider
+	if edge.Kind == graph.EdgeConsumes {
+		c.Role = RoleConsumer
+	}
+	if value, ok := edge.Meta["contract_owner_repo_prefix"].(string); ok {
+		c.RepoPrefix = value
+	}
+	if value, ok := edge.Meta["contract_owner_workspace"].(string); ok {
+		c.WorkspaceID = value
+	}
+	if value, ok := edge.Meta["contract_owner_project"].(string); ok {
+		c.ProjectID = value
+	}
+	if value, ok := edge.Meta["contract_owner_type"].(string); ok {
+		c.Type = ContractType(value)
+	}
+	if value, exists := edge.Meta["contract_owner_confidence"]; exists {
+		c.Confidence = persistedContractConfidence(value)
+	}
+	if value, exists := edge.Meta["contract_owner_meta"]; exists {
+		if value == nil {
+			c.Meta = nil
+		} else if meta, ok := value.(map[string]any); ok {
+			c.Meta = meta
+		}
+	}
+	if value, ok := edge.Meta["contract_owner_symbol_id"].(string); ok {
+		c.SymbolID = value
+	}
+	return c, true
+}
+
+func persistedContractLine(value any) int {
+	switch value := value.(type) {
+	case int:
+		return value
+	case int64:
+		return int(value)
+	case float64:
+		return int(value)
+	case json.Number:
+		parsed, _ := value.Int64()
+		return int(parsed)
+	default:
+		return 0
+	}
+}
+
+func persistedContractConfidence(value any) float64 {
+	switch value := value.(type) {
+	case float64:
+		return value
+	case float32:
+		return float64(value)
+	case int:
+		return float64(value)
+	case int64:
+		return float64(value)
+	case json.Number:
+		parsed, _ := value.Float64()
+		return parsed
+	default:
+		return 0
+	}
 }

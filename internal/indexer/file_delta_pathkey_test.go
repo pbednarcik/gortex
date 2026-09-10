@@ -21,13 +21,11 @@ const pathKeyFixtureV2 = "package sub\n\nfunc Helper() int { return 2 }\n"
 // TestFileDeltaReusesColdWalkPathKey pins the fix for #437.
 //
 // The cold walk and the single-file delta path both stamp their relPath onto
-// node IDs. graphRelKey deliberately keeps OS-native separators so an
-// incremental lookup matches what the cold walk wrote; relKey slash-normalises
-// for the mtime map. file_delta.go handed the extractor relKey's form, so on
-// Windows the cold walk stored "sub\file.go::Helper" and the first edit moved
-// the symbol to "sub/file.go::Helper" — a different node identity for a file
-// that never moved. On a persistent store the abandoned ID stays behind with
-// whatever line numbers it last held.
+// node IDs, and both must use relKey's slash-separated spelling. When the two
+// disagreed, the cold walk stored "sub\file.go::Helper" on Windows and the
+// first edit moved the symbol to "sub/file.go::Helper" — a different node
+// identity for a file that never moved. On a persistent store the abandoned ID
+// stays behind with whatever line numbers it last held.
 //
 // On POSIX filepath.Rel already yields "/" and the two forms coincide, so this
 // is a no-op guard there and a real regression test on Windows.
@@ -61,21 +59,19 @@ func TestFileDeltaReusesColdWalkPathKey(t *testing.T) {
 			"which on a persistent store leaves the old node behind as a stale twin")
 }
 
-// TestGraphRelKeyMatchesColdWalkForm states the contract the fix relies on:
-// whatever graphRelKey returns is the form the cold walk stamps, so a delta
-// re-index keyed on it lands on the existing node.
-func TestGraphRelKeyMatchesColdWalkForm(t *testing.T) {
+// TestRelKeyMatchesColdWalkForm states the contract the fix relies on: relKey
+// returns the slash-separated form the cold walk stamps, so a delta re-index
+// keyed on it lands on the existing node. Asserting the literal is the point —
+// deriving the expectation with filepath.Rel would restate the bug on Windows.
+func TestRelKeyMatchesColdWalkForm(t *testing.T) {
 	dir := t.TempDir()
 	idx := New(graph.New(), parser.NewRegistry(), config.Default().Index, zap.NewNop())
 	idx.SetRootPath(dir)
 
 	abs := filepath.Join(dir, "sub", "file.go")
-	graphKey := idx.graphRelKey(abs)
-	coldWalkRel, err := filepath.Rel(dir, abs)
-	require.NoError(t, err)
 
-	require.Equal(t, coldWalkRel, graphKey,
-		"graphRelKey must keep the cold walk's separators, not slash-normalise them")
+	require.Equal(t, "sub/file.go", idx.relKey(abs),
+		"the graph key is slash-separated on every platform, never OS-native")
 }
 
 func helperNodeIDs(store graph.Store) []string {

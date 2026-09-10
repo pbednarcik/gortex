@@ -4,7 +4,6 @@ import (
 	"context"
 	"encoding/json"
 	"net"
-	"os"
 	"path/filepath"
 	"testing"
 	"time"
@@ -12,6 +11,7 @@ import (
 	"go.uber.org/zap"
 
 	"github.com/zzet/gortex/internal/daemon"
+	"github.com/zzet/gortex/internal/testenv"
 )
 
 // fakeController implements daemon.Controller with stubbed SearchSymbols
@@ -64,11 +64,7 @@ func (f *fakeController) EnrichCochange(_ context.Context, _ daemon.EnrichCochan
 // points GORTEX_DAEMON_SOCKET at it so daemon.Dial finds it.
 func startTestDaemon(t *testing.T, ctrl daemon.Controller) {
 	t.Helper()
-	dir, err := os.MkdirTemp("/tmp", "gx-hook-e2e")
-	if err != nil {
-		t.Fatalf("mktemp: %v", err)
-	}
-	t.Cleanup(func() { _ = os.RemoveAll(dir) })
+	dir := testenv.ShortTempDir(t)
 
 	socket := filepath.Join(dir, "s")
 	t.Setenv("GORTEX_DAEMON_SOCKET", socket)
@@ -112,15 +108,9 @@ func TestProbeViaDaemon_Hit_E2E(t *testing.T) {
 
 func TestProbeViaDaemon_NoDaemon_ReturnsUnreachable(t *testing.T) {
 	// Point at a path that has no listener.
-	dir, err := os.MkdirTemp("/tmp", "gx-hook-empty")
-	if err != nil {
-		t.Fatalf("mktemp: %v", err)
-	}
-	t.Cleanup(func() { _ = os.RemoveAll(dir) })
-	t.Setenv("GORTEX_DAEMON_SOCKET", filepath.Join(dir, "missing"))
+	t.Setenv("GORTEX_DAEMON_SOCKET", filepath.Join(testenv.ShortTempDir(t), "missing"))
 
-	_, err = probeViaDaemon("handleFoo", "", 500*time.Millisecond)
-	if err != errDaemonUnreachable {
+	if _, err := probeViaDaemon("handleFoo", "", 500*time.Millisecond); err != errDaemonUnreachable {
 		t.Errorf("expected errDaemonUnreachable, got %v", err)
 	}
 }

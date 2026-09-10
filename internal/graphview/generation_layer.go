@@ -88,6 +88,10 @@ import (
 // A GenerationLayer is safe for concurrent reads from one request.
 type GenerationLayer struct {
 	handle *store_sqlite.Store
+	// Set by the materializer before publication. A healthy checkout must
+	// not inherit filesystem failures from its designated primary.
+	failureRepoPrefix string
+	failureRepoScoped bool
 
 	// covered maps a covered graph path to what the generation claims
 	// about it. Both modes hide the layer below; only delete tombstones.

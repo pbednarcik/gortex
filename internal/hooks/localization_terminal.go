@@ -17,6 +17,7 @@ import (
 	"github.com/gofrs/flock"
 
 	"github.com/zzet/gortex/internal/localizationauth"
+	"github.com/zzet/gortex/internal/platform"
 )
 
 const (
@@ -632,15 +633,13 @@ func consumeLocalizationToolSnapshot(input localizationTerminalHookInput) (local
 	if promptID := strings.TrimSpace(input.PromptID); promptID != "" && promptID != snapshot.Identity.PromptID {
 		return localizationTerminalIdentity{}, "", false
 	}
-	claimToken, ok := localizationauth.NewToken()
-	if !ok {
+	// Claiming the snapshot has to name exactly one winner. A rename does
+	// that on POSIX, but two racing MoveFileEx calls on one source can both
+	// fail on Windows and hand the turn to nobody, so the claim is an
+	// exclusive marker that arbitrates identically on both.
+	if !platform.ClaimFile(path) {
 		return localizationTerminalIdentity{}, "", false
 	}
-	claimPath := path + ".consume-" + claimToken
-	if err := os.Rename(path, claimPath); err != nil {
-		return localizationTerminalIdentity{}, "", false
-	}
-	defer os.Remove(claimPath) //nolint:errcheck // one-shot cleanup is best effort
 	return snapshot.Identity, snapshot.AuthToken, true
 }
 
@@ -851,7 +850,11 @@ func writeLocalizationState(path string, value any) bool {
 	if err := tmp.Close(); err != nil {
 		return false
 	}
-	if err := os.Rename(tmpPath, path); err != nil {
+	// A concurrent reader of the very state file being replaced makes the
+	// commit fail with a sharing violation on Windows, and the hook would drop
+	// a terminal marker it believed it had written; platform.ReplaceFile
+	// retries that refusal briefly.
+	if err := platform.ReplaceFile(tmpPath, path); err != nil {
 		return false
 	}
 	committed = true

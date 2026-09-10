@@ -253,6 +253,18 @@ type CheckoutCoordinator struct {
 	cycleMu sync.Mutex
 
 	mu sync.Mutex
+	// Source mutations are admitted under mu and joined by CloseContext before
+	// lifecycle teardown can retire the checkout while its disk writer runs.
+	sourceMutationsClosing bool
+	sourceMutations        int
+	sourceMutationsDrained chan struct{}
+	// Refresh tickets observe this coordinator's existing loop; they never
+	// create a competing builder or retain request contexts.
+	refreshMu        sync.Mutex
+	refreshWaiters   map[uint64]*checkoutRefreshRequest
+	refreshHighWater uint64
+	refreshReserved  int
+	refreshClosed    bool
 	// retained is the commit-layer reuse cache, most recently routed first.
 	retained []retainedCommitLayer
 	// backlog holds generations a retire refused. The janitor retries them.
@@ -282,6 +294,32 @@ type CheckoutCoordinator struct {
 	// settledWithoutBuild and has no barrier.
 	cyclePreflight func(context.Context) (CheckoutCycle, bool)
 	cycleBarrier   func(context.Context)
+
+	// selectionDemand promotes a queued build independently of the debounce
+	// signal. mu guards initialization; the buffered channel coalesces demand.
+	selectionDemand chan struct{}
+}
+
+func (c *CheckoutCoordinator) selectionRequests() chan struct{} {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.selectionDemand == nil {
+		c.selectionDemand = make(chan struct{}, 1)
+	}
+	return c.selectionDemand
+}
+
+// PrioritizeSelection promotes queued work without cancelling an active build
+// or resetting the quiet window. A repeated request contributes at most one
+// buffered demand token; it does not schedule another reconcile cycle.
+func (c *CheckoutCoordinator) PrioritizeSelection() {
+	if c == nil {
+		return
+	}
+	select {
+	case c.selectionRequests() <- struct{}{}:
+	default:
+	}
 }
 
 // retainedCommitLayer is one commit generation kept for re-routing, keyed by
@@ -405,6 +443,9 @@ func (c *CheckoutCoordinator) CloseContext(ctx context.Context) error {
 		ctx = context.Background()
 	}
 	c.once.Do(func() {
+		c.mu.Lock()
+		c.sourceMutationsClosing = true
+		c.mu.Unlock()
 		if c.cancelLifetime != nil {
 			c.cancelLifetime()
 		}
@@ -414,7 +455,7 @@ func (c *CheckoutCoordinator) CloseContext(ctx context.Context) error {
 	})
 	select {
 	case <-c.done:
-		return nil
+		return c.waitSourceMutations(ctx)
 	case <-ctx.Done():
 		return ctx.Err()
 	}
@@ -451,6 +492,7 @@ func (c *CheckoutCoordinator) Running() bool {
 // still has to answer for stop and for signals.
 func (c *CheckoutCoordinator) run() {
 	defer close(c.done)
+	defer c.closeCheckoutRefreshTickets()
 	defer c.releaseTextSearcher()
 	lifetime := c.lifetimeContext()
 
@@ -545,6 +587,8 @@ func (c *CheckoutCoordinator) cycle(ctx context.Context) {
 	if ctx == nil {
 		ctx = context.Background()
 	}
+	through := c.checkoutRefreshHighWater()
+	defer c.guardCheckoutRefreshCycle(ctx, through)
 	c.mu.Lock()
 	reason := c.reason
 	c.mu.Unlock()
@@ -555,13 +599,15 @@ func (c *CheckoutCoordinator) cycle(ctx context.Context) {
 	}
 	if out, settled := preflight(ctx); settled {
 		recordCoordinatorCycle(out)
-		if c.cycleDone != nil {
-			c.cycleDone(out)
-		}
+		c.reportCheckoutCycle(ctx, through, out)
 		return
 	}
 
-	release, err := c.gate.Acquire(ctx, ViewBuildBackground)
+	priority := ViewBuildBackground
+	if through != 0 {
+		priority = ViewBuildInteractive
+	}
+	release, err := c.gate.AcquirePromotable(ctx, priority, c.selectionRequests())
 	if err != nil {
 		if errors.Is(err, ErrViewBuildQueueFull) {
 			c.logger.Debug("checkout coordinator: build deferred by admission capacity",
@@ -569,16 +615,12 @@ func (c *CheckoutCoordinator) cycle(ctx context.Context) {
 				zap.String("reason", reason),
 				zap.Error(err))
 			viewmetrics.Count(viewmetrics.CoordinatorCycleTotal, viewmetrics.OutcomeDeferred)
-			if c.cycleDone != nil {
-				c.cycleDone(CheckoutCycle{Deferred: true})
-			}
+			c.reportCheckoutCycle(ctx, through, CheckoutCycle{Deferred: true})
 			return
 		}
 		out := CheckoutCycle{Err: fmt.Errorf("indexer: wait for checkout build admission: %w", err)}
 		recordCoordinatorCycle(out)
-		if c.cycleDone != nil {
-			c.cycleDone(out)
-		}
+		c.reportCheckoutCycle(ctx, through, out)
 		return
 	}
 	defer release()
@@ -591,9 +633,7 @@ func (c *CheckoutCoordinator) cycle(ctx context.Context) {
 	if err := ctx.Err(); err != nil {
 		out := CheckoutCycle{Err: err}
 		recordCoordinatorCycle(out)
-		if c.cycleDone != nil {
-			c.cycleDone(out)
-		}
+		c.reportCheckoutCycle(ctx, through, out)
 		return
 	}
 	out := c.reconcile(ctx)
@@ -610,9 +650,7 @@ func (c *CheckoutCoordinator) cycle(ctx context.Context) {
 			zap.Int64("dirty_generation", out.DirtyGenerationID),
 			zap.Bool("commit_reused", out.CommitReused))
 	}
-	if c.cycleDone != nil {
-		c.cycleDone(out)
-	}
+	c.reportCheckoutCycle(ctx, through, out)
 }
 
 // settledWithoutBuild recognizes the overwhelmingly common poll result before

@@ -39,7 +39,7 @@ func TestWatcherPointPipelineForcesReceiptCheckedEqualMtime(t *testing.T) {
 func TestWatcherPointPipelineDeletesOwnedFileWithoutMtime(t *testing.T) {
 	dir, idx, watcher := inertTestWatcher(t, "main.go", "package main\n\nfunc Value() int { return 0 }\n")
 	path := filepath.Join(dir, "main.go")
-	graphPath := idx.prefixPath(idx.graphRelKey(path))
+	graphPath := idx.prefixPath(idx.relKey(path))
 	require.NotEmpty(t, idx.graph.GetFileNodes(graphPath))
 
 	idx.mtimeMu.Lock()

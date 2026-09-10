@@ -7,17 +7,15 @@ import (
 	"testing"
 
 	"github.com/spf13/cobra"
+
+	"github.com/zzet/gortex/internal/testenv"
 )
 
 // noDaemonSocket points GORTEX_DAEMON_SOCKET at a path with no listener
 // so daemon.IsRunning() reports false for the duration of the test.
 func noDaemonSocket(t *testing.T) {
 	t.Helper()
-	dir, err := os.MkdirTemp("/tmp", "gx-enrich")
-	if err != nil {
-		t.Fatalf("mktemp: %v", err)
-	}
-	t.Cleanup(func() { _ = os.RemoveAll(dir) })
+	dir := testenv.ShortTempDir(t)
 	t.Setenv("GORTEX_DAEMON_SOCKET", filepath.Join(dir, "no-such-socket"))
 }
 

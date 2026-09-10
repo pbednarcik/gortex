@@ -7,6 +7,8 @@ import (
 	"sort"
 	"sync"
 	"time"
+
+	"github.com/zzet/gortex/internal/platform"
 )
 
 // QuarantineEntry records one file that crashed, hung, or panicked the
@@ -31,7 +33,12 @@ type QuarantineEntry struct {
 // *Quarantine is safe for every method (no-op / not-quarantined), so
 // callers can keep crash isolation optional without nil checks.
 type Quarantine struct {
-	mu      sync.Mutex
+	mu sync.Mutex
+	// saveMu serialises the temp-file-plus-replace commit. It is separate
+	// from mu — Save snapshots the entries under mu and must not hold it
+	// across the write — and it is what keeps two Saves from replacing the
+	// backing file at the same instant, which Windows refuses.
+	saveMu  sync.Mutex
 	path    string
 	entries map[string]*QuarantineEntry
 }
@@ -150,9 +157,14 @@ func (q *Quarantine) Save() error {
 	if err := os.MkdirAll(filepath.Dir(q.path), 0o755); err != nil {
 		return err
 	}
-	// Unique temp name so concurrent Saves — the indexer re-indexes
-	// files in parallel through one shared quarantine — never clobber
-	// each other's in-flight write before the rename.
+	// The indexer re-indexes files in parallel through one shared
+	// quarantine, so Saves overlap. Two of them commit here: the
+	// unique temp name keeps their in-flight writes apart, saveMu
+	// keeps their commits apart (Windows refuses to replace a file a
+	// second replace is already moving onto), and platform.ReplaceFile
+	// absorbs the same refusal from another process.
+	q.saveMu.Lock()
+	defer q.saveMu.Unlock()
 	f, err := os.CreateTemp(filepath.Dir(q.path), ".quarantine-*.tmp")
 	if err != nil {
 		return err
@@ -167,5 +179,5 @@ func (q *Quarantine) Save() error {
 		_ = os.Remove(tmp)
 		return err
 	}
-	return os.Rename(tmp, q.path)
+	return platform.ReplaceFile(tmp, q.path)
 }

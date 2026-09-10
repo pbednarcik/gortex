@@ -48,8 +48,10 @@ func vitestCoveredRepo(t *testing.T) string {
 	run("config", "diff.mnemonicPrefix", "false")
 	run("config", "diff.noprefix", "false")
 
-	prod := filepath.Join("src", "production.ts")
-	test := filepath.Join("tests", "production.ts")
+	// Repo-relative and therefore '/'-spelled on every platform — the graph
+	// keys its file nodes that way and so does the diff these paths join.
+	const prod = "src/production.ts"
+	const test = "tests/production.ts"
 	write(prod, `export function resolveEntityOrderBy(sort: string): string[] {
   return [sort];
 }

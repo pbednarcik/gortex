@@ -399,7 +399,9 @@ func TestOverlayBranch_BackwardCompat(t *testing.T) {
 	// 2. overlay_list shows the file.
 	_, listText := invokeTool(t, srv, ctx, "overlay_list", map[string]any{})
 	require.Contains(t, listText, `"count":1`)
-	require.Contains(t, listText, targetFile)
+	// The listing is a JSON body: a Windows path reaches it with its
+	// backslashes escaped, so match the JSON spelling of the path.
+	require.Contains(t, listText, jsonEscape(targetFile))
 
 	// 3. A query reflects the overlay (Compat is visible).
 	_, summary := invokeTool(t, srv, ctx, "get_file_summary", map[string]any{

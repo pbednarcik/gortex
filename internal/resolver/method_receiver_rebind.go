@@ -1,7 +1,6 @@
 package resolver
 
 import (
-	"path/filepath"
 	"strings"
 
 	"go.uber.org/zap"
@@ -29,7 +28,7 @@ import (
 //     method types (which is most of any non-trivial Go codebase).
 //
 // Algorithm: index every Go KindType / KindInterface node by
-// (filepath.Dir(file), name); walk EdgeMemberOf; for each Go method
+// (filePathDir(file), name); walk EdgeMemberOf; for each Go method
 // whose To doesn't resolve, look up (its file's dir, type name); if
 // exactly one match, rewrite edge.To to the canonical type ID via
 // ReindexEdges (one batched commit instead of per-edge round-trips).
@@ -104,7 +103,7 @@ func (r *Resolver) rebindGoMethodReceiversForFile(filePath string) {
 			break
 		}
 	}
-	dir := filepath.Dir(filePath)
+	dir := filePathDir(filePath)
 	cacheKey := repoPrefix + "\x00" + dir
 	typesIdx, ok := r.receiverTypeIdxByDir[cacheKey]
 	if !ok {
@@ -130,7 +129,7 @@ func (r *Resolver) rebindGoMethodReceiversForFile(filePath string) {
 			// two-pass fallback; there is still no per-file query loop.
 			for _, kind := range []graph.NodeKind{graph.KindType, graph.KindInterface} {
 				for n := range r.nodesByKindLang(kind, "go") {
-					if n != nil && n.RepoPrefix == repoPrefix && filepath.Dir(n.FilePath) == dir {
+					if n != nil && n.RepoPrefix == repoPrefix && filePathDir(n.FilePath) == dir {
 						addGoTypeToIndex(typesIdx, n)
 					}
 				}
@@ -171,7 +170,7 @@ func addGoTypeToIndex(idx map[pkgKey]string, n *graph.Node) {
 	if n == nil || n.Name == "" || n.FilePath == "" {
 		return
 	}
-	k := pkgKey{n.RepoPrefix, filepath.Dir(n.FilePath), n.Name}
+	k := pkgKey{n.RepoPrefix, filePathDir(n.FilePath), n.Name}
 	if existing, ok := idx[k]; ok && existing != n.ID {
 		idx[k] = ""
 		return
@@ -225,7 +224,7 @@ func (r *Resolver) rebindMemberOf(typesIdx map[pkgKey]string, memberOf []*graph.
 		if file == "" || typeName == "" {
 			continue
 		}
-		canonicalID, ok := typesIdx[pkgKey{method.RepoPrefix, filepath.Dir(file), typeName}]
+		canonicalID, ok := typesIdx[pkgKey{method.RepoPrefix, filePathDir(file), typeName}]
 		if !ok || canonicalID == "" || canonicalID == e.To {
 			continue
 		}

@@ -3,6 +3,7 @@ package daemon
 import (
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 )
@@ -20,13 +21,17 @@ func TestServersConfig_SaveLoadRoundTrip(t *testing.T) {
 		t.Fatalf("Save: %v", err)
 	}
 
-	// File created with restrictive perms.
+	// File created with restrictive perms. NTFS carries no POSIX mode
+	// bits — Go reports 0666 for every writable file there and the real
+	// protection is the ACL — so the check is Unix-only.
 	fi, err := os.Stat(path)
 	if err != nil {
 		t.Fatalf("stat: %v", err)
 	}
-	if perm := fi.Mode().Perm(); perm != 0o600 {
-		t.Fatalf("file perm = %o, want 0600", perm)
+	if runtime.GOOS != "windows" {
+		if perm := fi.Mode().Perm(); perm != 0o600 {
+			t.Fatalf("file perm = %o, want 0600", perm)
+		}
 	}
 
 	got, err := LoadServersConfig(path)

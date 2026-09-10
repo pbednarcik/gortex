@@ -1,10 +1,18 @@
-// Package graphpath interprets store/graph file paths. Indexed paths are
-// repoPrefix + '/' + the repo-relative path in the indexing machine's native
-// separators — on Windows that is one forward slash followed by backslashes
-// (`repo/dir\file`). Slash-only string logic applied to that shape sees the
-// whole repo as a single directory; these helpers normalize before any
-// dir/prefix reasoning. Norm is filepath.ToSlash on purpose: on POSIX a
-// backslash is an ordinary filename byte, not a separator, and must survive.
+// Package graphpath interprets store/graph file paths. A freshly indexed path
+// is repoPrefix + '/' + the repo-relative path spelled with forward slashes on
+// every platform — the indexer keys graph paths through
+// pathkey.Normalize(filepath.ToSlash(rel)), so Windows and POSIX stores agree.
+//
+// Graphs written by older versions keyed the repo-relative half in the
+// indexing machine's native separators, so a Windows-indexed store of that
+// vintage holds one forward slash followed by backslashes (`repo/dir\file`).
+// Slash-only string logic applied to that shape sees the whole repo as a
+// single directory, so these helpers keep normalizing before any dir/prefix
+// reasoning and PrefixForms keeps emitting the native spelling as a second
+// form. Both are pure back-compat folding for those legacy stores; they are
+// no-ops against anything indexed since. Norm is filepath.ToSlash on purpose:
+// on POSIX a backslash is an ordinary filename byte, not a separator, and must
+// survive.
 package graphpath
 
 import (
@@ -43,11 +51,12 @@ func Dir(p string) string {
 }
 
 // PrefixForms returns the spellings a stored path may use for a caller's
-// path prefix: the '/'-joined form plus the repo-prefixed native form
-// (`repo/` + FromSlash(rest)). Deduped — a single entry on POSIX, where the
-// two spellings coincide. Callers that filter storage directly (e.g. SQL
-// LIKE, where the column cannot be normalized cheaply) match against every
-// form.
+// path prefix: the '/'-joined form that every current store uses, plus the
+// repo-prefixed native form (`repo/` + FromSlash(rest)) that a legacy
+// Windows-indexed store may still hold. Deduped — a single entry on POSIX,
+// where the two spellings coincide, and the second form only ever widens the
+// match. Callers that filter storage directly (e.g. SQL LIKE, where the column
+// cannot be normalized cheaply) match against every form.
 func PrefixForms(prefix string) []string {
 	n := Norm(prefix)
 	forms := []string{n}

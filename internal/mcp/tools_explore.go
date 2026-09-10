@@ -877,8 +877,12 @@ func exploreStructuralSignals(parent, child *graph.Node) (shared int, local bool
 			shared++
 		}
 	}
-	parentPath := nodeDisplayPath(parent)
-	childPath := nodeDisplayPath(child)
+	// An indexed path carries the indexing machine's separators, so the
+	// "same directory" test folds to '/' first — on Windows every
+	// LastIndex below would otherwise be -1 and no two files would ever
+	// read as local siblings.
+	parentPath := strings.ReplaceAll(nodeDisplayPath(parent), "\\", "/")
+	childPath := strings.ReplaceAll(nodeDisplayPath(child), "\\", "/")
 	parentSlash := strings.LastIndex(parentPath, "/")
 	childSlash := strings.LastIndex(childPath, "/")
 	if parentSlash >= 0 && childSlash >= 0 && parentPath != childPath {
@@ -1238,7 +1242,11 @@ func exploreDraftExactAnchor(query string, n *graph.Node) bool {
 			return true
 		}
 	}
-	path := nodeDisplayPath(n)
+	// Fold the indexed path's separators before taking the basename: on
+	// Windows a raw graph path has none of the '/' this LastIndex looks
+	// for, so the whole path would be matched against the query instead
+	// of the file's name and the anchor could never fire.
+	path := strings.ReplaceAll(nodeDisplayPath(n), "\\", "/")
 	if slash := strings.LastIndex(path, "/"); slash >= 0 {
 		path = path[slash+1:]
 	}
@@ -1585,6 +1593,9 @@ func exploreLocalizationExplicitAnchor(query string, n *graph.Node) bool {
 		// that would make same-name files in different packages terminal.
 		return false
 	}
+	// Same separator fold as above — the basename fallback must see a
+	// file name, not a whole backslash-joined Windows path.
+	path = strings.ReplaceAll(path, "\\", "/")
 	if slash := strings.LastIndex(path, "/"); slash >= 0 {
 		path = path[slash+1:]
 	}
@@ -5017,6 +5028,20 @@ func localizationMemberTier(n *graph.Node) int {
 	}
 }
 
+// sortLocalizationMemberTier puts one file's tier rows in declaration order,
+// falling back to the node id when two rows share a start line (a fixture
+// without line numbers, or two declarations the extractor put on one line).
+// Both keys are the graph's own, so the result is identical on every platform.
+func sortLocalizationMemberTier(tier []*rerank.Candidate) {
+	sort.SliceStable(tier, func(i, j int) bool {
+		a, b := tier[i].Node, tier[j].Node
+		if a.StartLine != b.StartLine {
+			return a.StartLine < b.StartLine
+		}
+		return a.ID < b.ID
+	})
+}
+
 // demoteLocalizationFileMembers reorders localization candidates inside the
 // index positions each file already occupies. Nothing is dropped, added, or
 // moved across files: a file's tiered candidates are written back into that
@@ -5025,13 +5050,31 @@ func localizationMemberTier(n *graph.Node) int {
 // projection's field — survives. Relative order inside a tier is preserved, so
 // the reorder is stable and idempotent. Candidates without a node or a file
 // path cannot be attributed to a file and keep their position.
+//
+// Inside a tier the rows are ordered by their own declaration site — the
+// file's reading order — rather than by the order they happened to arrive
+// in. The arrival order carries no ranking signal at this point:
+// liftLocalizationSiblingCallables writes each traded-in sibling into the
+// slot of whichever demoted member it replaced, so a file's rows are already
+// permuted by something other than their rank. Leaving that permutation
+// visible made the page depend on an upstream tie whose resolution is not
+// stable across platforms — the same Swift fixture paged
+// `[type, detect, reload]` on POSIX and `[type, reload, detect]` on Windows.
+// Declaration order is a total order on a key every platform agrees on.
+//
+// The declaration order applies to every file that holds more than one slot,
+// not only to one that happens to carry a demotable member. A tight window
+// can select a file's type and two of its ordinary methods and nothing else:
+// every row is then in the leading tier, there is no demotion to perform, and
+// gating the ordering on one made exactly that page — the one with the fewest
+// slots to disagree about — inherit the arrival permutation again.
 func demoteLocalizationFileMembers(cands []*rerank.Candidate) []*rerank.Candidate {
 	if len(cands) < 2 {
 		return cands
 	}
 	slots := make(map[string][]int, len(cands))
 	files := make([]string, 0, len(cands))
-	demotable := false
+	reorderable := false
 	for i, cand := range cands {
 		if cand == nil || cand.Node == nil || cand.Node.FilePath == "" {
 			continue
@@ -5041,11 +5084,11 @@ func demoteLocalizationFileMembers(cands []*rerank.Candidate) []*rerank.Candidat
 			files = append(files, key)
 		}
 		slots[key] = append(slots[key], i)
-		if localizationMemberTier(cand.Node) != localizationMemberTierBehavioral {
-			demotable = true
+		if len(slots[key]) > 1 {
+			reorderable = true
 		}
 	}
-	if !demotable {
+	if !reorderable {
 		return cands
 	}
 	out := append([]*rerank.Candidate(nil), cands...)
@@ -5059,6 +5102,9 @@ func demoteLocalizationFileMembers(cands []*rerank.Candidate) []*rerank.Candidat
 			cand := cands[position]
 			tier := localizationMemberTier(cand.Node)
 			tiers[tier] = append(tiers[tier], cand)
+		}
+		for i := range tiers {
+			sortLocalizationMemberTier(tiers[i])
 		}
 		written := 0
 		for _, tier := range tiers {

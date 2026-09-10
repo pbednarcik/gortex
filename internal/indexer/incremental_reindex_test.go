@@ -184,12 +184,12 @@ func TestIncrementalReindex_FailedFileSurfacedAndRetried(t *testing.T) {
 	require.NoError(t, err)
 	require.NotEmpty(t, g.FindNodesByName("Bad"))
 
-	// Make bad.go unreadable and stale: the incremental pass discovers
-	// it (stat works) but fails to read its content.
-	require.NoError(t, os.Chmod(bad, 0o000))
-	t.Cleanup(func() { _ = os.Chmod(bad, 0o644) })
+	// Make bad.go stale and unreadable: the incremental pass discovers it
+	// (stat works) but fails to read its content. Stale first — denyFileRead
+	// may hold the file open exclusively, and Chtimes needs a write handle.
 	future := time.Now().Add(2 * time.Second)
 	require.NoError(t, os.Chtimes(bad, future, future))
+	allowBadRead := denyFileRead(t, bad)
 
 	res, err := idx.IncrementalReindexPaths(dir, nil)
 	require.NoError(t, err)
@@ -198,7 +198,7 @@ func TestIncrementalReindex_FailedFileSurfacedAndRetried(t *testing.T) {
 
 	// Readable again: the file is still stale (its failed pass never
 	// recorded an mtime), so the next incremental pass recovers it.
-	require.NoError(t, os.Chmod(bad, 0o644))
+	allowBadRead()
 	res2, err := idx.IncrementalReindexPaths(dir, nil)
 	require.NoError(t, err)
 	assert.Empty(t, res2.FailedFiles, "the file indexes cleanly once readable")

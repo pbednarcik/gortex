@@ -3,7 +3,6 @@ package mcp
 import (
 	"context"
 	"encoding/json"
-	"path/filepath"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -22,23 +21,18 @@ import (
 // that: reverting a site to s.graph serves the indexed payload and keeps
 // reporting a symbol the buffer deleted.
 
-// The fixture keeps the two path vocabularies apart, because the review
-// handlers are the seam between them: rf*File is the repo-relative,
-// '/'-spelled path a forge or `git diff` hands the caller, and rf*Key is the
-// key the store actually holds — the remainder in the indexing machine's
-// native separators (see internal/graphpath), with no repo prefix here. They
-// coincide on POSIX and diverge on Windows, where analysis.JoinFileNodes
-// converts the caller's path before the lookup. Keying the graph with the
-// '/'-joined form describes a file a Windows daemon never indexes, and the
-// converted query then misses it.
+// The fixture still names the two path vocabularies the review handlers sit
+// between — rf*File is the repo-relative path a forge or `git diff` hands the
+// caller, rf*Key the key the store holds — but the two spellings are one
+// string on every platform: the indexer folds every graph key through
+// filepath.ToSlash, so there is no separator for analysis.JoinFileNodes to
+// convert.
 const (
 	rfKeptFile = "repo/edit.go"
 	rfGoneFile = "repo/gone.go"
-)
 
-var (
-	rfKeptKey = filepath.FromSlash(rfKeptFile)
-	rfGoneKey = filepath.FromSlash(rfGoneFile)
+	rfKeptKey = rfKeptFile
+	rfGoneKey = rfGoneFile
 	rfKeptID  = rfKeptKey + "::Kept"
 	rfGoneID  = rfGoneKey + "::Gone"
 )

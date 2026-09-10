@@ -1,8 +1,6 @@
 package resolver
 
 import (
-	"path/filepath"
-
 	"go.uber.org/zap"
 
 	"github.com/zzet/gortex/internal/graph"
@@ -22,7 +20,7 @@ func (r *Resolver) prepareIncrementalAttributionCache(frontier incrementalFileFr
 
 	missingSet := make(map[string]struct{})
 	for _, path := range frontier.paths {
-		for _, fileNode := range r.dirIndex[filepath.Dir(path)] {
+		for _, fileNode := range r.dirIndex[filePathDir(path)] {
 			if fileNode.FilePath == "" {
 				continue
 			}

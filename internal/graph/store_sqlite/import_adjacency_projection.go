@@ -2,7 +2,7 @@ package store_sqlite
 
 import (
 	"encoding/json"
-	"path/filepath"
+	gopath "path"
 
 	"github.com/zzet/gortex/internal/graph"
 	"github.com/zzet/gortex/internal/graphpath"
@@ -54,15 +54,15 @@ func (s *Store) ProjectImportAdjacency(filePaths []string) (map[string][]string,
 		if path == "" || path == "." {
 			return nil, false
 		}
-		// Indexed paths keep '/' after the repo prefix with the rest
-		// OS-native, so on Windows filepath.Clean rewrites separators on
-		// every stored path. A separator-only difference is not a
-		// canonicality violation — only a structural one (traversal,
-		// duplicate separators, a trailing "/." segment) rejects the
-		// request. Comparing the normalized forms is the whole test: Clean
-		// never inserts characters, so equal normalized forms mean the two
-		// spellings differ only in separators.
-		if cleaned := filepath.Clean(path); graphpath.Norm(cleaned) != graphpath.Norm(path) {
+		// Canonicality is judged in slash space, not OS space: a graph
+		// path is a stored identity, not a filesystem path, so only a
+		// structural violation (traversal, duplicate separators, a
+		// trailing "/." segment) may reject the request. filepath.Clean
+		// cannot make that call on Windows — it rewrites separators on
+		// every stored path, and prepends ".\" to any relative path whose
+		// first segment carries a colon, so a perfectly canonical
+		// "repo::pkg/a.go" would be refused there and nowhere else.
+		if norm := graphpath.Norm(path); gopath.Clean(norm) != norm {
 			return nil, false
 		}
 		if _, duplicate := seen[path]; duplicate {

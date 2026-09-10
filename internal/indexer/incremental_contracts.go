@@ -129,10 +129,14 @@ func (idx *Indexer) refreshIncrementalContractManifests(files []string) (Derived
 	receipts := make([]fileReadReceipt, 0, len(files))
 	failed := make([]string, 0)
 	for _, absPath := range files {
-		relPath := idx.graphRelKey(absPath)
+		relPath := idx.relKey(absPath)
 		graphPath := idx.prefixPath(relPath)
 		src, readVersion, err := idx.readFileWithVersion(absPath)
 		if err != nil || !readVersion.valid {
+			if err == nil {
+				err = errFileVersionChanged
+			}
+			idx.noteFileIndexFailure(absPath, err)
 			failed = append(failed, absPath)
 			continue
 		}
@@ -164,202 +168,161 @@ func (idx *Indexer) ensureIncrementalContractRegistry() *contracts.Registry {
 	if idx.contractRegistry != nil {
 		return idx.contractRegistry
 	}
-
 	reg := contracts.NewRegistry()
-	ownerRows := graph.ReadRepoEdgesByKinds(
-		idx.graph,
-		[]string{idx.repoPrefix},
-		[]graph.EdgeKind{graph.EdgeProvides, graph.EdgeConsumes},
-	)
-	ownersByContract := make(map[string][]*graph.Edge)
-	contractIDs := make(map[string]struct{})
-	for _, row := range ownerRows {
-		if row.Edge == nil || row.Edge.To == "" {
-			continue
-		}
-		ownersByContract[row.Edge.To] = append(ownersByContract[row.Edge.To], row.Edge)
-		contractIDs[row.Edge.To] = struct{}{}
-	}
-	// Symbol-less contracts have no ownership edge. Preserve the exact repo node
-	// projection for those legacy rows. Ordinary contracts are recovered from
-	// repo-owned edges, so a shared canonical node last written by another repo
-	// cannot hide this repository on a warm restart.
-	legacyNodeIDs := graph.ReadRepoNodeIDsByKinds(
-		idx.graph, []string{idx.repoPrefix}, []graph.NodeKind{graph.KindContract},
-	)
-	for _, id := range legacyNodeIDs {
-		if id != "" {
-			contractIDs[id] = struct{}{}
-		}
-	}
-	ids := make([]string, 0, len(contractIDs))
-	for id := range contractIDs {
-		ids = append(ids, id)
-	}
-	sort.Strings(ids)
-
-	for start := 0; start < len(ids); start += contractFrontierReadBatchSize {
-		end := start + contractFrontierReadBatchSize
-		if end > len(ids) {
-			end = len(ids)
-		}
-		chunk := ids[start:end]
-		nodes := idx.graph.GetNodesByIDs(chunk)
-		for _, id := range chunk {
-			node := nodes[id]
-			if node == nil || node.Kind != graph.KindContract {
-				continue
-			}
-			added := false
-			seen := make(map[string]struct{})
-			for _, edge := range ownersByContract[id] {
-				contract, ok := storedContractFromOwner(
-					node, edge, idx.repoPrefix, idx.workspaceID, idx.projectID,
-				)
-				if !ok {
-					continue
-				}
-				key := contractRegistryKey(contract)
-				if _, duplicate := seen[key]; duplicate {
-					continue
-				}
-				seen[key] = struct{}{}
-				reg.Add(contract)
-				added = true
-			}
-			if added {
-				continue
-			}
-			base, ok := storedContractFromNode(node)
-			if !ok {
-				continue
-			}
-			base.RepoPrefix = idx.repoPrefix
-			base.WorkspaceID = idx.workspaceID
-			base.ProjectID = idx.projectID
-			reg.Add(base)
+	if restored := contracts.LoadRegistryFromGraphWithScope(idx.graph, idx.repoPrefix, idx.workspaceID, idx.projectID); restored != nil {
+		for _, c := range restored.ByRepo(idx.repoPrefix) {
+			reg.Add(c)
 		}
 	}
 	idx.contractRegistry = reg
 	return reg
 }
 
-func storedContractFromNode(node *graph.Node) (contracts.Contract, bool) {
-	if node == nil || node.Kind != graph.KindContract || node.ID == "" {
-		return contracts.Contract{}, false
+func contractOwnerEdgeMeta(c contracts.Contract) map[string]any {
+	return map[string]any{
+		"contract_owner_repo_prefix": c.RepoPrefix,
+		"contract_owner_workspace":   c.EffectiveWorkspace(),
+		"contract_owner_project":     c.EffectiveProject(),
+		"contract_owner_type":        string(c.Type),
+		"contract_owner_confidence":  c.Confidence,
+		"contract_owner_meta":        c.Meta,
+		"contract_owner_symbol_id":   c.SymbolID,
 	}
-	contract := contracts.Contract{
-		ID:          node.ID,
-		FilePath:    node.FilePath,
-		RepoPrefix:  node.RepoPrefix,
-		WorkspaceID: node.WorkspaceID,
-		ProjectID:   node.ProjectID,
+}
+
+type contractFileOwnerKey struct{ repo, file string }
+
+type contractSymbolOwnerKey struct{ repo, symbol string }
+
+// contractSymbolOwners validates source existence and repository ownership in
+// bounded ID batches. Raw AddBatch accepts dangling and wrong-repo owner rows,
+// but repo-scoped reconstruction cannot discover those rows for this record.
+// Retain only the identity result, not the hydrated source metadata.
+func contractSymbolOwners(store graph.Store, all []contracts.Contract) map[contractSymbolOwnerKey]string {
+	wanted := make(map[contractSymbolOwnerKey]struct{})
+	idsSet := make(map[string]struct{})
+	for _, c := range all {
+		if c.SymbolID == "" {
+			continue
+		}
+		wanted[contractSymbolOwnerKey{c.RepoPrefix, c.SymbolID}] = struct{}{}
+		idsSet[c.SymbolID] = struct{}{}
 	}
-	if node.Meta != nil {
-		contract.Type = contracts.ContractType(contractStringMeta(node.Meta, "type"))
-		contract.Role = contracts.Role(contractStringMeta(node.Meta, "role"))
-		contract.SymbolID = contractStringMeta(node.Meta, "symbol_id")
-		contract.Line = contractIntValue(node.Meta["line"])
-		contract.Confidence = contractFloatValue(node.Meta["confidence"])
-		if meta, ok := node.Meta["contract_meta"].(map[string]any); ok {
-			contract.Meta = meta
+	ids := make([]string, 0, len(idsSet))
+	for id := range idsSet {
+		ids = append(ids, id)
+	}
+	sort.Strings(ids)
+	owners := make(map[contractSymbolOwnerKey]string, len(wanted))
+	for start := 0; start < len(ids); start += contractFrontierReadBatchSize {
+		for _, node := range store.GetNodesByIDs(ids[start:min(start+contractFrontierReadBatchSize, len(ids))]) {
+			if node == nil || node.ID == "" {
+				continue
+			}
+			key := contractSymbolOwnerKey{node.RepoPrefix, node.ID}
+			if _, keep := wanted[key]; keep {
+				owners[key] = node.ID
+			}
 		}
 	}
-	return contract, true
+	return owners
 }
 
-func storedContractFromOwner(
-	node *graph.Node,
-	edge *graph.Edge,
-	repoPrefix, workspaceID, projectID string,
-) (contracts.Contract, bool) {
-	contract, ok := storedContractFromNode(node)
-	if !ok || edge == nil {
-		return contracts.Contract{}, false
+// contractFileOwners queries only files of symbol-less records. An admitted
+// genuine KindFile node is required: do not fabricate source nodes or use a
+// contract canonical node as an ownership endpoint.
+func contractFileOwners(store graph.Store, all []contracts.Contract) map[contractFileOwnerKey]string {
+	files := make([]string, 0)
+	wanted := make(map[contractFileOwnerKey]struct{})
+	for _, c := range all {
+		if c.SymbolID != "" || c.FilePath == "" {
+			continue
+		}
+		key := contractFileOwnerKey{c.RepoPrefix, c.FilePath}
+		if _, duplicate := wanted[key]; duplicate {
+			continue
+		}
+		wanted[key] = struct{}{}
+		files = append(files, c.FilePath)
 	}
-	contract.SymbolID = edge.From
-	contract.FilePath = edge.FilePath
-	contract.Line = edge.Line
-	contract.RepoPrefix = repoPrefix
-	contract.WorkspaceID = workspaceID
-	contract.ProjectID = projectID
-	if edge.Kind == graph.EdgeConsumes {
-		contract.Role = contracts.RoleConsumer
-	} else {
-		contract.Role = contracts.RoleProvider
+	owners := make(map[contractFileOwnerKey]string, len(wanted))
+	if len(files) == 0 {
+		return owners
 	}
-	if edge.Meta == nil {
-		return contract, true
+	for node := range graph.NodesInScopeSeq(store, nil, files, graph.KindFile) {
+		if node == nil || node.Kind != graph.KindFile || node.ID == "" {
+			continue
+		}
+		key := contractFileOwnerKey{node.RepoPrefix, node.FilePath}
+		if _, keep := wanted[key]; !keep {
+			continue
+		}
+		if current := owners[key]; current == "" || node.ID < current {
+			owners[key] = node.ID
+		}
 	}
-	if value, exists := edge.Meta["contract_owner_repo_prefix"].(string); exists {
-		contract.RepoPrefix = value
-	}
-	if value, exists := edge.Meta["contract_owner_workspace"].(string); exists {
-		contract.WorkspaceID = value
-	}
-	if value, exists := edge.Meta["contract_owner_project"].(string); exists {
-		contract.ProjectID = value
-	}
-	if value, exists := edge.Meta["contract_owner_type"].(string); exists {
-		contract.Type = contracts.ContractType(value)
-	}
-	if value, exists := edge.Meta["contract_owner_confidence"]; exists {
-		contract.Confidence = contractFloatValue(value)
-	}
-	if value, exists := edge.Meta["contract_owner_meta"].(map[string]any); exists {
-		contract.Meta = value
-	}
-	return contract, true
+	return owners
 }
 
-func contractOwnerEdgeMeta(contract contracts.Contract) map[string]any {
-	return map[string]any{
-		"contract_owner_repo_prefix": contract.RepoPrefix,
-		"contract_owner_workspace":   contract.EffectiveWorkspace(),
-		"contract_owner_project":     contract.EffectiveProject(),
-		"contract_owner_type":        string(contract.Type),
-		"contract_owner_confidence":  contract.Confidence,
-		"contract_owner_meta":        contract.Meta,
+func contractOwnerEndpoint(c contracts.Contract, files map[contractFileOwnerKey]string, symbols map[contractSymbolOwnerKey]string) string {
+	if c.SymbolID != "" {
+		return symbols[contractSymbolOwnerKey{c.RepoPrefix, c.SymbolID}]
 	}
+	return files[contractFileOwnerKey{c.RepoPrefix, c.FilePath}]
 }
 
-func contractStringMeta(meta map[string]any, key string) string {
-	value, _ := meta[key].(string)
-	return value
-}
-
-func contractIntValue(value any) int {
-	switch number := value.(type) {
-	case int:
-		return number
-	case int64:
-		return int(number)
-	case float64:
-		return int(number)
-	case json.Number:
-		parsed, _ := number.Int64()
-		return int(parsed)
-	default:
-		return 0
+// contractGraphRows is the common persistence emitter. Full passes leave
+// dependency nodes to their pre-resolution single writer; incremental refresh
+// includes dependencies as before. No extraction/enrichment work moves here.
+func contractGraphRows(store graph.Store, all []contracts.Contract, includeDependencies bool) (nodes []*graph.Node, edges []*graph.Edge, missingSourceOwners int) {
+	if !includeDependencies {
+		eligible := make([]contracts.Contract, 0, len(all))
+		for _, c := range all {
+			if c.Type != contracts.ContractDependency {
+				eligible = append(eligible, c)
+			}
+		}
+		all = eligible
 	}
-}
-
-func contractFloatValue(value any) float64 {
-	switch number := value.(type) {
-	case float64:
-		return number
-	case float32:
-		return float64(number)
-	case int:
-		return float64(number)
-	case int64:
-		return float64(number)
-	case json.Number:
-		parsed, _ := number.Float64()
-		return parsed
-	default:
-		return 0
+	fileOwners := contractFileOwners(store, all)
+	symbolOwners := contractSymbolOwners(store, all)
+	nodes = make([]*graph.Node, 0, len(all))
+	edges = make([]*graph.Edge, 0, len(all)*2)
+	for _, c := range all {
+		ownerID := contractOwnerEndpoint(c, fileOwners, symbolOwners)
+		if ownerID == "" {
+			missingSourceOwners++
+		}
+		nodes = append(nodes, &graph.Node{
+			ID: c.ID, Kind: graph.KindContract, Name: c.ID, FilePath: c.FilePath, Language: "contract",
+			RepoPrefix: c.RepoPrefix, WorkspaceID: c.EffectiveWorkspace(), ProjectID: c.EffectiveProject(),
+			Meta: map[string]any{
+				"type": string(c.Type), "role": string(c.Role), "symbol_id": c.SymbolID,
+				"line": c.Line, "confidence": c.Confidence, "contract_meta": c.Meta,
+				"contract_owner_record": ownerID != "",
+			},
+		})
+		if ownerID == "" {
+			continue
+		}
+		kind := graph.EdgeProvides
+		if c.Role == contracts.RoleConsumer {
+			kind = graph.EdgeConsumes
+		}
+		edges = append(edges, &graph.Edge{
+			From: ownerID, To: c.ID, Kind: kind, FilePath: c.FilePath, Line: c.Line, Meta: contractOwnerEdgeMeta(c),
+		})
+		// File ownership does not make a symbol-less provider a route handler.
+		if c.SymbolID != "" && c.Role == contracts.RoleProvider && isRouteContractType(c.Type) {
+			meta := contractOwnerEdgeMeta(c)
+			meta["contract_type"] = string(c.Type)
+			edges = append(edges, &graph.Edge{
+				From: c.SymbolID, To: c.ID, Kind: graph.EdgeHandlesRoute,
+				FilePath: c.FilePath, Line: c.Line, Meta: meta,
+			})
+		}
 	}
+	return nodes, edges, missingSourceOwners
 }
 
 // expandIncrementalContractFrontier promotes only cross-file contract constructs
@@ -436,51 +399,12 @@ func (idx *Indexer) commitIncrementalContractFiles(
 		return contractRegistryKey(unique[i]) < contractRegistryKey(unique[j])
 	})
 
-	nodes := make([]*graph.Node, 0, len(unique))
-	edges := make([]*graph.Edge, 0, len(unique)*2)
+	nodes, edges, missingOwners := contractGraphRows(idx.graph, unique, true)
 	touchedIDs := append([]string(nil), ids...)
 	for _, contract := range unique {
-		nodes = append(nodes, &graph.Node{
-			ID:          contract.ID,
-			Kind:        graph.KindContract,
-			Name:        contract.ID,
-			FilePath:    contract.FilePath,
-			Language:    "contract",
-			RepoPrefix:  contract.RepoPrefix,
-			WorkspaceID: contract.EffectiveWorkspace(),
-			ProjectID:   contract.EffectiveProject(),
-			Meta: map[string]any{
-				"type":          string(contract.Type),
-				"role":          string(contract.Role),
-				"symbol_id":     contract.SymbolID,
-				"line":          contract.Line,
-				"confidence":    contract.Confidence,
-				"contract_meta": contract.Meta,
-			},
-		})
 		touchedIDs = append(touchedIDs, contract.ID)
-		if contract.SymbolID == "" {
-			continue
-		}
-		edgeKind := graph.EdgeProvides
-		if contract.Role == contracts.RoleConsumer {
-			edgeKind = graph.EdgeConsumes
-		}
-		edges = append(edges, &graph.Edge{
-			From: contract.SymbolID, To: contract.ID, Kind: edgeKind,
-			FilePath: contract.FilePath, Line: contract.Line,
-			Meta: contractOwnerEdgeMeta(contract),
-		})
-		if contract.Role == contracts.RoleProvider && isRouteContractType(contract.Type) {
-			routeMeta := contractOwnerEdgeMeta(contract)
-			routeMeta["contract_type"] = string(contract.Type)
-			edges = append(edges, &graph.Edge{
-				From: contract.SymbolID, To: contract.ID, Kind: graph.EdgeHandlesRoute,
-				FilePath: contract.FilePath, Line: contract.Line,
-				Meta: routeMeta,
-			})
-		}
 	}
+	idx.warnMissingContractOwners(missingOwners)
 	if _, err := graph.ReplaceContractOwners(idx.graph, graph.ContractOwnerReplacement{
 		RepoPrefix:     idx.repoPrefix,
 		FilePaths:      changedFiles,

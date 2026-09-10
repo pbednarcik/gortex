@@ -1336,6 +1336,10 @@ func renderDaemonHeader(w io.Writer, st daemon.StatusResponse) {
 	t.AppendRow(table.Row{"socket", st.SocketPath})
 	t.AppendRow(table.Row{"uptime", formatDuration(time.Duration(st.UptimeSeconds) * time.Second)})
 	switch {
+	case st.Ready && st.IndexHealthError != "":
+		t.AppendRow(table.Row{"state", "degraded — index health unavailable; queryable"})
+	case st.Ready && st.IndexDegraded:
+		t.AppendRow(table.Row{"state", fmt.Sprintf("degraded — %d failed files (%d unreadable); queryable", st.FailedFiles, st.UnreadableFiles)})
 	case st.Ready && st.EnrichmentComplete:
 		t.AppendRow(table.Row{
 			"state",
@@ -1350,6 +1354,11 @@ func renderDaemonHeader(w io.Writer, st daemon.StatusResponse) {
 		})
 	default:
 		t.AppendRow(table.Row{"state", "warming up (socket reachable, resolving references)"})
+	}
+	if !st.Ready && st.IndexHealthError != "" {
+		t.AppendRow(table.Row{"index", "degraded — index health unavailable"})
+	} else if !st.Ready && st.IndexDegraded {
+		t.AppendRow(table.Row{"index", fmt.Sprintf("degraded — %d failed files (%d unreadable)", st.FailedFiles, st.UnreadableFiles)})
 	}
 	t.AppendRow(table.Row{"sessions", st.Sessions})
 	if st.MemoryBytes > 0 {
@@ -1561,7 +1570,7 @@ func renderDaemonRepos(w io.Writer, st daemon.StatusResponse) {
 	// so it stays hidden.
 	showState := false
 	for _, r := range rows {
-		if r.Missing || r.Unloaded || repoIndexIsEmpty(r) {
+		if r.Missing || r.Unloaded || r.FailedFiles > 0 || r.IndexHealthError != "" || repoIndexIsEmpty(r) {
 			showState = true
 			break
 		}
@@ -1632,6 +1641,7 @@ func renderDaemonRepos(w io.Writer, st daemon.StatusResponse) {
 	t.Render()
 	renderMissingRepoWarning(w, rows)
 	renderEmptyIndexWarning(w, rows)
+	renderIndexFailureWarning(w, rows)
 }
 
 // repoStateLabel names a tracked repo's inventory state for the status
@@ -1644,6 +1654,8 @@ func repoStateLabel(r daemon.TrackedRepoStatus) string {
 		return "MISSING"
 	case r.Unloaded:
 		return "not indexed"
+	case r.FailedFiles > 0 || r.IndexHealthError != "":
+		return "DEGRADED"
 	case repoIndexIsEmpty(r):
 		return "EMPTY"
 	default:

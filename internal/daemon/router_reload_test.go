@@ -168,10 +168,22 @@ func TestRouter_EffectiveEnabledRemotes(t *testing.T) {
 // TestRouter_ReloadConfig_ConcurrentNoRace hammers ReloadConfig against
 // concurrent routing + reads; the race detector must stay clean and no
 // call may panic on a torn router.
+//
+// The reloaded roster points at a local httptest server, and the cwd resolver
+// is stubbed, because every routing iteration here reaches the remote hop for
+// real: with a bogus host each of the ~530 proxied calls paid a full DNS
+// resolution, which is cheap only where a single-label name fails fast. On
+// Windows, where the resolver also walks the DNS suffix list and falls back to
+// LLMNR/NetBIOS, that turned a 0.2s test into a 183s one.
 func TestRouter_ReloadConfig_ConcurrentNoRace(t *testing.T) {
+	remote := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = w.Write([]byte(`{"from":"remote"}`))
+	}))
+	t.Cleanup(remote.Close)
 	router := NewRouter(RouterConfig{
-		Servers: &ServersConfig{},
-		Rosters: NewWorkspaceRosterCache(time.Minute),
+		Servers:     &ServersConfig{},
+		Rosters:     NewWorkspaceRosterCache(time.Minute),
+		CwdResolver: func(string) (string, bool) { return "", false },
 		LocalExecute: func(context.Context, string, []byte) ([]byte, int, error) {
 			return []byte(`{}`), 200, nil
 		},
@@ -184,7 +196,7 @@ func TestRouter_ReloadConfig_ConcurrentNoRace(t *testing.T) {
 			for j := 0; j < 200; j++ {
 				switch (i + j) % 3 {
 				case 0:
-					cfg := &ServersConfig{Server: []ServerEntry{{Slug: "r2", URL: "https://r2:4747"}}}
+					cfg := &ServersConfig{Server: []ServerEntry{{Slug: "r2", URL: remote.URL}}}
 					router.ReloadConfig(cfg, NewWorkspaceRosterCache(time.Minute))
 				case 1:
 					_, _, _ = router.RouteToolCall(context.Background(), "find_usages", []byte(`{}`), RouteContext{})

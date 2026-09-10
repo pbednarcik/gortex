@@ -58,7 +58,7 @@ func TestPreparedMetadataRefreshDoesNotStampWriteDuringCommit(t *testing.T) {
 	require.NoError(t, os.Chtimes(path, firstMtime, firstMtime))
 	_, prepared := idx.prepareFileDelta(path)
 	require.True(t, prepared)
-	prior := base.GetFileNodes(idx.graphRelKey(path))
+	prior := base.GetFileNodes(idx.relKey(path))
 
 	type refreshResult struct {
 		applied bool
@@ -140,7 +140,7 @@ func TestIncrementalBatchDoesNotStampWriteDuringCommit(t *testing.T) {
 	require.Empty(t, versionChange)
 	require.Contains(t, reparsed, path)
 	require.Equal(t, secondMtime.UnixNano(), idx.FileMtimes()[idx.relKey(path)])
-	assertFileNodeName(t, base, idx.graphRelKey(path), "Second")
+	assertFileNodeName(t, base, idx.relKey(path), "Second")
 }
 
 func TestIncrementalManifestDoesNotStampWriteDuringCommit(t *testing.T) {

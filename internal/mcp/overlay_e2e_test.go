@@ -446,7 +446,9 @@ func TestOverlay_MCP_RegisterPushList(t *testing.T) {
 
 	listRes := callToolByName(t, srv, ctx, "overlay_list", map[string]any{})
 	listText := toolText(listRes)
-	require.Contains(t, listText, targetFile)
+	// The listing is a JSON body: a Windows path reaches it with its
+	// backslashes escaped, so match the JSON spelling of the path.
+	require.Contains(t, listText, jsonEscape(targetFile))
 	require.Contains(t, listText, `"count":1`)
 
 	summary := callToolByName(t, srv, ctx, "get_file_summary", map[string]any{

@@ -1051,7 +1051,7 @@ func (w *Watcher) matchingInitialReplayReceipts(
 		if _, supported := w.indexer.effectiveLanguage(path, nil); !supported {
 			continue
 		}
-		relPath := w.indexer.graphRelKey(path)
+		relPath := w.indexer.relKey(path)
 		candidates = append(candidates, initialReplayReceiptCandidate{
 			path:      path,
 			relPath:   relPath,
@@ -2436,7 +2436,7 @@ func (w *Watcher) patchGraphWithReceiptStateRawModern(
 		return nil
 	}
 
-	relPath := idx.graphRelKey(path)
+	relPath := idx.relKey(path)
 	callbackPath := idx.RelKey(path)
 	graphKey := idx.prefixPath(relPath)
 	priorNodes := idx.graph.GetFileNodes(graphKey)

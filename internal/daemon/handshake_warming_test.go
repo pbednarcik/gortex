@@ -1,7 +1,6 @@
 package daemon
 
 import (
-	"os"
 	"path/filepath"
 	"testing"
 	"time"
@@ -9,15 +8,15 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"go.uber.org/zap"
+
+	"github.com/zzet/gortex/internal/testenv"
 )
 
 // startWarmingTestServer brings up a daemon on a temp socket with the given
 // optional Ready probe and returns the live socket path.
 func startWarmingTestServer(t *testing.T, ready func() (bool, string)) string {
 	t.Helper()
-	dir, err := os.MkdirTemp("/tmp", "gx-warm")
-	require.NoError(t, err)
-	t.Cleanup(func() { _ = os.RemoveAll(dir) })
+	dir := testenv.ShortTempDir(t)
 	socket := filepath.Join(dir, "s")
 	t.Setenv("GORTEX_DAEMON_SOCKET", socket)
 	t.Setenv("GORTEX_DAEMON_PIDFILE", filepath.Join(dir, "p"))

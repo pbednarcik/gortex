@@ -164,8 +164,7 @@ func TestStartupBarrierMarkerCreationStaysFailClosed(t *testing.T) {
 	w, err := NewWatcher(idx, config.WatchConfig{DebounceMs: 1}, zap.NewNop())
 	require.NoError(t, err)
 	w.fsw = newStartupBarrierFakeWatcher()
-	require.NoError(t, os.Chmod(dir, 0o555))
-	t.Cleanup(func() { _ = os.Chmod(dir, 0o755) })
+	w.initialReplayMarkerCreating = blockStartupMarkerCreation(t, dir)
 
 	err = w.reconcileInitialReplayThroughMarkers([]string{dir}, time.Second)
 	require.Error(t, err)

@@ -22,7 +22,7 @@ func leanTestStatus() (*daemon.StatusResponse, error) {
 		UptimeSeconds: 3600,
 		Ready:         true,
 		TrackedRepos: []daemon.TrackedRepoStatus{
-			{Name: "gortex", Path: "/tmp/gortex", Workspace: "gortex", Nodes: 6604, Edges: 27403},
+			{Name: "gortex", Path: gortexTmpFixtureRoot, Workspace: "gortex", Nodes: 6604, Edges: 27403},
 		},
 		Workspaces: []daemon.WorkspaceSummary{{Slug: "gortex"}},
 	}, nil
@@ -35,7 +35,7 @@ func TestSessionStart_LeanTier_TrackedCwd(t *testing.T) {
 	withFakeStatus(t, leanTestStatus)
 	withHookTier(t, profiles.HookTierLean)
 
-	briefing := buildSessionStartBriefing("/tmp/gortex")
+	briefing := buildSessionStartBriefing(gortexTmpFixtureRoot)
 
 	if !strings.Contains(briefing, "enforcement active") {
 		t.Errorf("lean briefing lost the enforcement signal:\n%s", briefing)
@@ -49,7 +49,7 @@ func TestSessionStart_LeanTier_TrackedCwd(t *testing.T) {
 	}
 	// And the lean rendering must actually be smaller.
 	withHookTier(t, profiles.HookTierStandard)
-	standard := buildSessionStartBriefing("/tmp/gortex")
+	standard := buildSessionStartBriefing(gortexTmpFixtureRoot)
 	if len(briefing) >= len(standard) {
 		t.Errorf("lean briefing (%d bytes) is not smaller than standard (%d bytes)", len(briefing), len(standard))
 	}
@@ -61,7 +61,7 @@ func TestSessionStart_LeanTier_KeepsUncoveredWarning(t *testing.T) {
 	withFakeStatus(t, leanTestStatus)
 	withHookTier(t, profiles.HookTierLean)
 
-	briefing := buildSessionStartBriefing("/somewhere/else")
+	briefing := buildSessionStartBriefing(fixtureAbs("/somewhere/else"))
 	if !strings.Contains(briefing, "not covered by any tracked repo") {
 		t.Errorf("lean briefing lost the uncovered-cwd warning:\n%s", briefing)
 	}

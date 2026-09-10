@@ -2,6 +2,7 @@ package hooks
 
 import (
 	"os"
+	"path/filepath"
 	"reflect"
 	"testing"
 
@@ -25,30 +26,30 @@ func TestWriteTargetPaths(t *testing.T) {
 	}{
 		{
 			name: "Edit uses file_path",
-			tool: "Edit", input: map[string]any{"file_path": "/repo/a.go"},
-			want: []string{"/repo/a.go"},
+			tool: "Edit", input: map[string]any{"file_path": filepath.Join(repoFixtureRoot, "a.go")},
+			want: []string{filepath.Join(repoFixtureRoot, "a.go")},
 		},
 		{
 			name: "Write uses file_path",
-			tool: "Write", input: map[string]any{"file_path": "/repo/b.go"},
-			want: []string{"/repo/b.go"},
+			tool: "Write", input: map[string]any{"file_path": filepath.Join(repoFixtureRoot, "b.go")},
+			want: []string{filepath.Join(repoFixtureRoot, "b.go")},
 		},
 		{
 			// MultiEdit is outside preToolUsePolicyTools, so capture has to
 			// happen before that gate.
 			name: "MultiEdit uses one file_path for all edits",
-			tool: "MultiEdit", input: map[string]any{"file_path": "/repo/c.go"},
-			want: []string{"/repo/c.go"},
+			tool: "MultiEdit", input: map[string]any{"file_path": filepath.Join(repoFixtureRoot, "c.go")},
+			want: []string{filepath.Join(repoFixtureRoot, "c.go")},
 		},
 		{
 			name: "NotebookEdit prefers notebook_path",
-			tool: "NotebookEdit", input: map[string]any{"notebook_path": "/repo/n.ipynb"},
-			want: []string{"/repo/n.ipynb"},
+			tool: "NotebookEdit", input: map[string]any{"notebook_path": filepath.Join(repoFixtureRoot, "n.ipynb")},
+			want: []string{filepath.Join(repoFixtureRoot, "n.ipynb")},
 		},
 		{
 			name: "NotebookEdit falls back to file_path",
-			tool: "NotebookEdit", input: map[string]any{"file_path": "/repo/n2.ipynb"},
-			want: []string{"/repo/n2.ipynb"},
+			tool: "NotebookEdit", input: map[string]any{"file_path": filepath.Join(repoFixtureRoot, "n2.ipynb")},
+			want: []string{filepath.Join(repoFixtureRoot, "n2.ipynb")},
 		},
 		{
 			name: "Bash reuses the shell write classifier",
@@ -112,7 +113,7 @@ func TestWriteTargetPaths(t *testing.T) {
 		},
 		{
 			name: "Read records nothing",
-			tool: "Read", input: map[string]any{"file_path": "/repo/a.go"},
+			tool: "Read", input: map[string]any{"file_path": filepath.Join(repoFixtureRoot, "a.go")},
 			want: nil,
 		},
 	}
@@ -142,18 +143,18 @@ func TestWriteTargetPaths_RespectsPerCallCap(t *testing.T) {
 }
 
 func TestRepoRelativeForOwnership(t *testing.T) {
-	const root = "/Users/dev/code/gortex"
+	root := fixtureAbs("/Users/dev/code/gortex")
 	cases := []struct {
 		name, raw, want string
 	}{
-		{"absolute inside the repo", root + "/internal/a.go", "internal/a.go"},
-		{"absolute outside the repo", "/Users/dev/other/b.go", ""},
-		{"home-dir file outside the repo", "/Users/dev/.claude/MEMORY.md", ""},
+		{"absolute inside the repo", filepath.Join(root, "internal", "a.go"), "internal/a.go"},
+		{"absolute outside the repo", fixtureAbs("/Users/dev/other/b.go"), ""},
+		{"home-dir file outside the repo", fixtureAbs("/Users/dev/.claude/MEMORY.md"), ""},
 		{"already repo-relative", "internal/a.go", "internal/a.go"},
 		{"repo-prefixed stays unchanged", "gortex/internal/a.go", "gortex/internal/a.go"},
 		{"parent escape rejected", "../elsewhere/a.go", ""},
 		{"symbol id reduces to its path", "internal/a.go::Foo", "internal/a.go"},
-		{"absolute symbol id", root + "/internal/a.go::Foo", "internal/a.go"},
+		{"absolute symbol id", filepath.Join(root, "internal", "a.go") + "::Foo", "internal/a.go"},
 		{"blank", "   ", ""},
 	}
 	for _, tc := range cases {
@@ -167,8 +168,8 @@ func TestRepoRelativeForOwnership(t *testing.T) {
 
 func TestAttributeChanges_PartitionsOwnedAndRest(t *testing.T) {
 	withSessionDir(t)
-	withTrackedRepos(t, daemon.TrackedRepoStatus{Prefix: "gortex", Path: "/repo"})
-	saveSessionState("sess-a", sessionState{WrittenPaths: []string{"/repo/internal/mine.go"}})
+	withTrackedRepos(t, daemon.TrackedRepoStatus{Prefix: "gortex", Path: repoFixtureRoot})
+	saveSessionState("sess-a", sessionState{WrittenPaths: []string{filepath.Join(repoFixtureRoot, "internal", "mine.go")}})
 
 	changes := &changeSet{
 		ChangedFiles: []string{"internal/mine.go", ".goreleaser.yml", ".github/workflows/ci.yml"},
@@ -177,7 +178,7 @@ func TestAttributeChanges_PartitionsOwnedAndRest(t *testing.T) {
 			{ID: "gortex/.goreleaser.yml::builds", FilePath: "gortex/.goreleaser.yml"},
 		},
 	}
-	got := attributeChanges(sessionScope{SessionID: "sess-a", CWD: "/repo"}, changes)
+	got := attributeChanges(sessionScope{SessionID: "sess-a", CWD: repoFixtureRoot}, changes)
 
 	if !got.Attributed {
 		t.Fatal("expected attribution to resolve")
@@ -203,10 +204,10 @@ func TestAttributeChanges_PartitionsOwnedAndRest(t *testing.T) {
 // path carrying the prefix while changed_files does not.
 func TestAttributeChanges_PrefixCollision(t *testing.T) {
 	withSessionDir(t)
-	withTrackedRepos(t, daemon.TrackedRepoStatus{Prefix: "gortex", Path: "/repo"})
+	withTrackedRepos(t, daemon.TrackedRepoStatus{Prefix: "gortex", Path: repoFixtureRoot})
 	saveSessionState("sess-a", sessionState{WrittenPaths: []string{"gortex/internal/x.go"}})
 
-	got := attributeChanges(sessionScope{SessionID: "sess-a", CWD: "/repo"}, &changeSet{
+	got := attributeChanges(sessionScope{SessionID: "sess-a", CWD: repoFixtureRoot}, &changeSet{
 		ChangedFiles:   []string{"internal/x.go"},
 		ChangedSymbols: []changedSymbol{{ID: "gortex/internal/x.go::X", FilePath: "gortex/internal/x.go"}},
 	})
@@ -224,13 +225,13 @@ func TestAttributeChanges_PrefixCollision(t *testing.T) {
 func TestAttributeChanges_NoCrossRepoMatch(t *testing.T) {
 	withSessionDir(t)
 	withTrackedRepos(t,
-		daemon.TrackedRepoStatus{Prefix: "gortex", Path: "/repo"},
-		daemon.TrackedRepoStatus{Prefix: "other", Path: "/other"},
+		daemon.TrackedRepoStatus{Prefix: "gortex", Path: repoFixtureRoot},
+		daemon.TrackedRepoStatus{Prefix: "other", Path: otherFixtureRoot},
 	)
 	// The session edited /other/internal/x.go; the diff is of /repo.
-	saveSessionState("sess-a", sessionState{WrittenPaths: []string{"/other/internal/x.go"}})
+	saveSessionState("sess-a", sessionState{WrittenPaths: []string{filepath.Join(otherFixtureRoot, "internal", "x.go")}})
 
-	got := attributeChanges(sessionScope{SessionID: "sess-a", CWD: "/repo"}, &changeSet{
+	got := attributeChanges(sessionScope{SessionID: "sess-a", CWD: repoFixtureRoot}, &changeSet{
 		ChangedFiles:   []string{"internal/x.go"},
 		ChangedSymbols: []changedSymbol{{ID: "gortex/internal/x.go::X", FilePath: "gortex/internal/x.go"}},
 	})
@@ -251,23 +252,23 @@ func TestAttributeChanges_NoCrossRepoMatch(t *testing.T) {
 func TestOwnershipRepoScope_PrefersEcho(t *testing.T) {
 	t.Run("echo wins with no tracked repos at all", func(t *testing.T) {
 		withTrackedRepos(t) // simulates the timed-out status call
-		root, prefix := ownershipRepoScope("/repo", &changeSet{RepoRoot: "/repo", Repo: "gortex"})
-		if root != "/repo" || prefix != "gortex" {
-			t.Errorf("got (%q, %q), want (/repo, gortex)", root, prefix)
+		root, prefix := ownershipRepoScope(repoFixtureRoot, &changeSet{RepoRoot: repoFixtureRoot, Repo: "gortex"})
+		if root != repoFixtureRoot || prefix != "gortex" {
+			t.Errorf("got (%q, %q), want (%q, gortex)", root, prefix, repoFixtureRoot)
 		}
 	})
 	t.Run("echo wins over a different tracked repo", func(t *testing.T) {
-		withTrackedRepos(t, daemon.TrackedRepoStatus{Prefix: "other", Path: "/other"})
-		root, _ := ownershipRepoScope("/other", &changeSet{RepoRoot: "/repo", Repo: "gortex"})
-		if root != "/repo" {
-			t.Errorf("root = %q, want the echoed /repo", root)
+		withTrackedRepos(t, daemon.TrackedRepoStatus{Prefix: "other", Path: otherFixtureRoot})
+		root, _ := ownershipRepoScope(otherFixtureRoot, &changeSet{RepoRoot: repoFixtureRoot, Repo: "gortex"})
+		if root != repoFixtureRoot {
+			t.Errorf("root = %q, want the echoed %q", root, repoFixtureRoot)
 		}
 	})
 	t.Run("falls back to cwd when the echo is absent", func(t *testing.T) {
-		withTrackedRepos(t, daemon.TrackedRepoStatus{Prefix: "gortex", Path: "/repo"})
-		root, prefix := ownershipRepoScope("/repo", &changeSet{})
-		if root != "/repo" || prefix != "gortex" {
-			t.Errorf("got (%q, %q), want (/repo, gortex)", root, prefix)
+		withTrackedRepos(t, daemon.TrackedRepoStatus{Prefix: "gortex", Path: repoFixtureRoot})
+		root, prefix := ownershipRepoScope(repoFixtureRoot, &changeSet{})
+		if root != repoFixtureRoot || prefix != "gortex" {
+			t.Errorf("got (%q, %q), want (%q, gortex)", root, prefix, repoFixtureRoot)
 		}
 	})
 	t.Run("ignores the server's non-absolute fallback root", func(t *testing.T) {
@@ -283,12 +284,12 @@ func TestOwnershipRepoScope_PrefersEcho(t *testing.T) {
 func TestAttributeChanges_WorksWithoutDaemonStatus(t *testing.T) {
 	withSessionDir(t)
 	withTrackedRepos(t) // status unavailable / timed out
-	saveSessionState("sess-a", sessionState{WrittenPaths: []string{"/repo/internal/mine.go"}})
+	saveSessionState("sess-a", sessionState{WrittenPaths: []string{filepath.Join(repoFixtureRoot, "internal", "mine.go")}})
 
-	got := attributeChanges(sessionScope{SessionID: "sess-a", CWD: "/repo"}, &changeSet{
+	got := attributeChanges(sessionScope{SessionID: "sess-a", CWD: repoFixtureRoot}, &changeSet{
 		ChangedFiles:   []string{"internal/mine.go", "theirs.go"},
 		ChangedSymbols: []changedSymbol{{ID: "gortex/internal/mine.go::Mine", FilePath: "gortex/internal/mine.go"}},
-		RepoRoot:       "/repo",
+		RepoRoot:       repoFixtureRoot,
 		Repo:           "gortex",
 	})
 
@@ -311,21 +312,21 @@ func TestAttributeChanges_UnresolvableFallsBack(t *testing.T) {
 	}
 
 	t.Run("no session id", func(t *testing.T) {
-		withTrackedRepos(t, daemon.TrackedRepoStatus{Path: "/repo"})
-		if attributeChanges(sessionScope{CWD: "/repo"}, changes).Attributed {
+		withTrackedRepos(t, daemon.TrackedRepoStatus{Path: repoFixtureRoot})
+		if attributeChanges(sessionScope{CWD: repoFixtureRoot}, changes).Attributed {
 			t.Error("expected fallback with no session id")
 		}
 	})
 	t.Run("no recorded writes", func(t *testing.T) {
-		withTrackedRepos(t, daemon.TrackedRepoStatus{Path: "/repo"})
-		if attributeChanges(sessionScope{SessionID: "sess-fresh", CWD: "/repo"}, changes).Attributed {
+		withTrackedRepos(t, daemon.TrackedRepoStatus{Path: repoFixtureRoot})
+		if attributeChanges(sessionScope{SessionID: "sess-fresh", CWD: repoFixtureRoot}, changes).Attributed {
 			t.Error("expected fallback for a session that wrote nothing")
 		}
 	})
 	t.Run("daemon unreachable", func(t *testing.T) {
 		withTrackedRepos(t)
-		saveSessionState("sess-b", sessionState{WrittenPaths: []string{"/repo/a.go"}})
-		if attributeChanges(sessionScope{SessionID: "sess-b", CWD: "/repo"}, changes).Attributed {
+		saveSessionState("sess-b", sessionState{WrittenPaths: []string{filepath.Join(repoFixtureRoot, "a.go")}})
+		if attributeChanges(sessionScope{SessionID: "sess-b", CWD: repoFixtureRoot}, changes).Attributed {
 			t.Error("expected fallback when no repo resolves")
 		}
 	})
@@ -336,9 +337,9 @@ func TestRecordSessionWriteTargets(t *testing.T) {
 		withSessionDir(t)
 		recordSessionWriteTargets(HookInput{
 			SessionID: "s1", ToolName: "Edit",
-			ToolInput: map[string]any{"file_path": "/repo/a.go"},
+			ToolInput: map[string]any{"file_path": filepath.Join(repoFixtureRoot, "a.go")},
 		})
-		if got := loadSessionState("s1").WrittenPaths; !reflect.DeepEqual(got, []string{"/repo/a.go"}) {
+		if got := loadSessionState("s1").WrittenPaths; !reflect.DeepEqual(got, []string{filepath.Join(repoFixtureRoot, "a.go")}) {
 			t.Errorf("WrittenPaths = %v", got)
 		}
 	})
@@ -347,7 +348,7 @@ func TestRecordSessionWriteTargets(t *testing.T) {
 		dir := withSessionDir(t)
 		recordSessionWriteTargets(HookInput{
 			ToolName:  "Edit",
-			ToolInput: map[string]any{"file_path": "/repo/a.go"},
+			ToolInput: map[string]any{"file_path": filepath.Join(repoFixtureRoot, "a.go")},
 		})
 		assertNoStateFiles(t, dir)
 	})
@@ -356,7 +357,7 @@ func TestRecordSessionWriteTargets(t *testing.T) {
 		dir := withSessionDir(t)
 		recordSessionWriteTargets(HookInput{
 			SessionID: "s2", ToolName: "Read",
-			ToolInput: map[string]any{"file_path": "/repo/a.go"},
+			ToolInput: map[string]any{"file_path": filepath.Join(repoFixtureRoot, "a.go")},
 		})
 		assertNoStateFiles(t, dir)
 	})
@@ -366,7 +367,7 @@ func TestRecordSessionWriteTargets(t *testing.T) {
 		for i := 0; i < 3; i++ {
 			recordSessionWriteTargets(HookInput{
 				SessionID: "s3", ToolName: "Edit",
-				ToolInput: map[string]any{"file_path": "/repo/a.go"},
+				ToolInput: map[string]any{"file_path": filepath.Join(repoFixtureRoot, "a.go")},
 			})
 		}
 		if got := loadSessionState("s3").WrittenPaths; len(got) != 1 {
@@ -378,13 +379,13 @@ func TestRecordSessionWriteTargets(t *testing.T) {
 		withSessionDir(t)
 		seed := make([]string, sessionWrittenPathsCap)
 		for i := range seed {
-			seed[i] = "/repo/seed" + string(rune('a'+i%26)) + string(rune('a'+i/26)) + ".go"
+			seed[i] = filepath.Join(repoFixtureRoot, "seed"+string(rune('a'+i%26))+string(rune('a'+i/26))+".go")
 		}
 		saveSessionState("s4", sessionState{WrittenPaths: seed})
 
 		recordSessionWriteTargets(HookInput{
 			SessionID: "s4", ToolName: "Edit",
-			ToolInput: map[string]any{"file_path": "/repo/overflow.go"},
+			ToolInput: map[string]any{"file_path": filepath.Join(repoFixtureRoot, "overflow.go")},
 		})
 
 		st := loadSessionState("s4")

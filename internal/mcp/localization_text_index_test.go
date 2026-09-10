@@ -109,18 +109,24 @@ func TestLocalizationTextMatchDirectSymbolIDSkipsFileIndex(t *testing.T) {
 	}
 }
 
-func TestLocalizationTextMatchUsesWindowsPathAlias(t *testing.T) {
+// TestLocalizationTextMatchNormalisesNativePathToGraphKey pins the one
+// spelling reconciliation that survives: the index is keyed the way the graph
+// keys nodes (forward slashes on every platform), so a natively-spelled match
+// path has to be folded onto that key before the owner lookup. Windows-only —
+// on POSIX a backslash is an ordinary filename byte and the two paths are
+// genuinely different files.
+func TestLocalizationTextMatchNormalisesNativePathToGraphKey(t *testing.T) {
 	if filepath.Separator == '/' {
-		t.Skip("Windows graph path spelling uses a distinct separator only on Windows")
+		t.Skip("a native path differs from the graph spelling only on Windows")
 	}
 	server := &Server{graph: graph.New()}
-	matchPath := "repo/dir/handler.go"
-	aliasPath := graphMatchPathKey(matchPath, true)
-	owner := &graph.Node{ID: aliasPath + "::owner", Name: "owner", Kind: graph.KindFunction, FilePath: aliasPath, StartLine: 1, EndLine: 20}
-	indexes := map[string]*fileSymbolIndex{aliasPath: {syms: []*graph.Node{owner}}}
-	got, provenance := server.localizationTextMatchNode(context.Background(), enrichedTextMatch{Path: matchPath, Line: 10}, indexes)
+	graphPath := "repo/dir/handler.go"
+	nativePath := filepath.FromSlash(graphPath)
+	owner := &graph.Node{ID: graphPath + "::owner", Name: "owner", Kind: graph.KindFunction, FilePath: graphPath, StartLine: 1, EndLine: 20}
+	indexes := map[string]*fileSymbolIndex{graphPath: {syms: []*graph.Node{owner}}}
+	got, provenance := server.localizationTextMatchNode(context.Background(), enrichedTextMatch{Path: nativePath, Line: 10}, indexes)
 	if got != owner || provenance != "permitted_search_text_owner" {
-		t.Fatalf("Windows path alias = (%#v, %q), want owner", got, provenance)
+		t.Fatalf("native path fold = (%#v, %q), want owner", got, provenance)
 	}
 }
 

@@ -378,9 +378,9 @@ func TestGetFileSummary_MultiRepoRelativePath(t *testing.T) {
 	})
 
 	// A repo-relative path unique to one repo anchors to that repo's prefix,
-	// spelled the way node IDs are: prefix by "/", remainder by the OS
-	// separator. On POSIX the two are the same string.
-	require.Equal(t, "alpha/"+filepath.FromSlash("svc/a.go"), srv.graphRelPath(context.Background(), "svc/a.go"))
+	// spelled the way node IDs are: forward slashes throughout, on every
+	// platform.
+	require.Equal(t, "alpha/svc/a.go", srv.graphRelPath(context.Background(), "svc/a.go"))
 
 	// get_file_summary with the repo-relative path now finds the symbols
 	// rather than returning a file_not_indexed miss.
@@ -389,7 +389,7 @@ func TestGetFileSummary_MultiRepoRelativePath(t *testing.T) {
 	require.Contains(t, res.Content[0].(mcplib.TextContent).Text, "AlphaHandler")
 
 	// An already-prefixed path keeps working (idempotent normalisation).
-	require.Equal(t, "beta/"+filepath.FromSlash("other/b.go"), srv.graphRelPath(context.Background(), "beta/other/b.go"))
+	require.Equal(t, "beta/other/b.go", srv.graphRelPath(context.Background(), "beta/other/b.go"))
 }
 
 // TestFilterTextMatchesByPath_RepoPrefixed pins the multi-repo path

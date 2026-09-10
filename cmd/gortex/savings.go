@@ -85,6 +85,8 @@ func runSavings(_ *cobra.Command, _ []string) error {
 	if err != nil {
 		return fmt.Errorf("open savings ledger: %w", err)
 	}
+	// One-shot CLI read: release the sidecar handle on every exit path.
+	defer func() { _ = store.Close() }()
 	// Legacy flat-file import runs only against the default locations:
 	// pointing the dashboard at a directory with --cache-dir must never
 	// rename files there as a side effect of looking.

@@ -88,8 +88,21 @@ func (idx *Indexer) reindexIncrementalFilesBatched(
 	markerBatch *reparsePendingEnrichmentBatch,
 	surfaceFirstVersionChange bool,
 ) (DerivedInvalidationPlan, []string, []string, []string) {
+	idx.loadFileIndexFailures()
+	defer idx.flushFileIndexFailures()
+	// Capture persisted ownership before a deletion or structural reparse
+	// retires its source edges. Later contract refresh uses this registry to
+	// describe removed records and schedule the existing derived frontier.
+	// A true no-op batch must not hydrate any contract state.
+	if len(staleFiles) > 0 || len(deletedFiles) > 0 {
+		idx.ensureIncrementalContractRegistry()
+	}
 	var invalidation DerivedInvalidationPlan
+	deleteTiming := startReconcilePhase(idx.logger, idx.repoPrefix, "graph_delete",
+		zap.Int("deleted_files", len(deletedFiles)))
+	defer deleteTiming.abort()
 	idx.evictDeletedFilesBatched(deletedFiles, &invalidation)
+	deleteTiming.complete(nil)
 
 	passPlan, reparsed, failed, versionChanged := idx.reindexIncrementalStalePass(
 		staleFiles, markerBatch, surfaceFirstVersionChange,
@@ -97,7 +110,7 @@ func (idx *Indexer) reindexIncrementalFilesBatched(
 	invalidation.Merge(passPlan)
 	for _, filePath := range failed {
 		idx.logger.Debug("incremental reindex: failed to index file",
-			zap.String("file", filePath))
+			zap.String("file", filePath), zap.Error(idx.fileIndexFailureError(filePath)))
 	}
 	if len(failed) == 0 {
 		if len(reparsed) > 0 {
@@ -115,20 +128,32 @@ func (idx *Indexer) reindexIncrementalFilesBatched(
 		return invalidation, reparsed, failed, versionChanged
 	}
 
+	var retryPaths, permissionFailed []string
+	for _, path := range failed {
+		if errors.Is(idx.fileIndexFailureError(path), os.ErrPermission) {
+			permissionFailed = append(permissionFailed, path)
+		} else {
+			retryPaths = append(retryPaths, path)
+		}
+	}
 	retryPlan, retryReparsed, retryFailed, retryVersionChanged := idx.reindexIncrementalStalePass(
-		failed, markerBatch, false,
+		retryPaths, markerBatch, false,
 	)
 	invalidation.Merge(retryPlan)
 	reparsed = appendUniqueSorted(reparsed, retryReparsed...)
 	versionChanged = appendUniqueSorted(versionChanged, retryVersionChanged...)
 	for _, filePath := range retryFailed {
+		err := idx.fileIndexFailureError(filePath)
+		if errors.Is(err, os.ErrPermission) {
+			continue // One aggregate permission warning is emitted for the repo.
+		}
 		idx.logger.Warn("incremental reindex: file failed after retry",
-			zap.String("file", filePath))
+			zap.String("file", filePath), zap.Error(err))
 	}
 	if len(reparsed) > 0 {
 		idx.reparsedThisRun.Store(true)
 	}
-	return invalidation, reparsed, retryFailed, versionChanged
+	return invalidation, reparsed, appendUniqueSorted(permissionFailed, retryFailed...), versionChanged
 }
 
 func (idx *Indexer) reindexIncrementalStalePass(
@@ -169,10 +194,17 @@ func (idx *Indexer) reindexIncrementalChunk(
 	}
 
 	graphPaths := make([]string, len(files))
+	priorTiming := startReconcilePhase(idx.logger, idx.repoPrefix, "chunk_prior_graph",
+		zap.Int("candidate_files", len(files)))
+	defer priorTiming.abort()
 	for i, filePath := range files {
-		graphPaths[i] = idx.prefixPath(idx.graphRelKey(filePath))
+		graphPaths[i] = idx.prefixPath(idx.relKey(filePath))
 	}
 	priorByFile := idx.graph.GetFileNodesByPaths(graphPaths)
+	priorTiming.complete(nil)
+	parseTiming := startReconcilePhase(idx.logger, idx.repoPrefix, "chunk_parse",
+		zap.Int("candidate_files", len(files)), zap.Bool("includes_admission_wait", true))
+	defer parseTiming.abort()
 
 	stages := make([]*incrementalBatchStage, 0, len(files))
 	// Each staged result carries the tree-sitter tree its extraction
@@ -188,6 +220,7 @@ func (idx *Indexer) reindexIncrementalChunk(
 	receipts := make([]fileReadReceipt, 0, len(files))
 	nodeCount, edgeCount := 0, 0
 	var retainedBytes int64
+	var readFailed []string
 	consumed := 0
 	for i, filePath := range files {
 		graphPath := graphPaths[i]
@@ -217,6 +250,11 @@ func (idx *Indexer) reindexIncrementalChunk(
 		}
 
 		if !probeOK {
+			if probe.readErr != nil {
+				idx.noteFileIndexFailure(filePath, probe.readErr)
+				readFailed = append(readFailed, filePath)
+				continue
+			}
 			fallbacks = append(fallbacks, incrementalFallback{
 				filePath: filePath, graphPath: graphPath, priorNodes: priorNodes,
 				storedGraph: storedGraph, storedDerived: storedDerived,
@@ -261,6 +299,9 @@ func (idx *Indexer) reindexIncrementalChunk(
 		}
 	}
 
+	parseTiming.complete(nil, zap.Int("consumed_files", consumed), zap.Int("staged_files", len(stages)),
+		zap.Int("inert_files", plan.InertFiles), zap.Int("read_failed_files", len(readFailed)),
+		zap.Int("fallback_files", len(fallbacks)), zap.Int("nodes", nodeCount), zap.Int("edges", edgeCount))
 	if len(stages) > 0 {
 		plan.Merge(idx.commitIncrementalStages(stages, markerBatch))
 		for _, stage := range stages {
@@ -275,17 +316,36 @@ func (idx *Indexer) reindexIncrementalChunk(
 			stage.releasePrepared()
 		}
 	}
+	receiptTiming := startReconcilePhase(idx.logger, idx.repoPrefix, "chunk_receipts",
+		zap.Int("receipts", len(receipts)))
+	defer receiptTiming.abort()
 	freshPaths, stalePaths := idx.recordFileReadVersionsBatched(receipts)
+	receiptTiming.complete(nil, zap.Int("fresh_files", len(freshPaths)), zap.Int("stale_files", len(stalePaths)))
 	freshSet := make(map[string]struct{}, len(freshPaths))
 	for _, filePath := range freshPaths {
 		freshSet[filePath] = struct{}{}
 	}
 
 	var reparsed []string
-	failed := append([]string(nil), stalePaths...)
-	versionChanged := append([]string(nil), stalePaths...)
+	failed := append(readFailed, stalePaths...)
+	var versionChanged []string
+	for _, path := range failed {
+		if errors.Is(idx.fileIndexFailureError(path), errFileVersionChanged) {
+			versionChanged = append(versionChanged, path)
+		}
+	}
+	var fallbackTiming *reconcilePhaseTiming
+	if len(fallbacks) > 0 {
+		// Legacy fallback combines extraction and graph mutation; do not label
+		// this interval as parse-only or silently charge it to graph apply.
+		fallbackTiming = startReconcilePhase(idx.logger, idx.repoPrefix, "chunk_fallback_parse_apply",
+			zap.Int("files", len(fallbacks)))
+		defer fallbackTiming.abort()
+	}
+	failedBeforeFallback := len(failed)
 	for _, fallback := range fallbacks {
 		if err := idx.reindexIncrementalFallback(fallback, markerBatch, &plan); err != nil {
+			idx.noteFileIndexFailure(fallback.filePath, err)
 			idx.discardPreparedExtraction(fallback.filePath)
 			failed = append(failed, fallback.filePath)
 			if errors.Is(err, errFileVersionChanged) {
@@ -293,7 +353,12 @@ func (idx *Indexer) reindexIncrementalChunk(
 			}
 			continue
 		}
+		idx.noteFileIndexFailure(fallback.filePath, nil)
 		reparsed = append(reparsed, fallback.filePath)
+	}
+	if fallbackTiming != nil {
+		// Prior read/receipt failures belong to earlier phases, not fallback.
+		fallbackTiming.complete(nil, zap.Int("failed_files", len(failed)-failedBeforeFallback))
 	}
 	for _, stage := range stages {
 		if _, fresh := freshSet[stage.absPath]; fresh && !stage.metadataOnly {
@@ -422,6 +487,9 @@ func (idx *Indexer) commitIncrementalStages(
 	stages []*incrementalBatchStage,
 	markerBatch *reparsePendingEnrichmentBatch,
 ) DerivedInvalidationPlan {
+	timing := startReconcilePhase(idx.logger, idx.repoPrefix, "chunk_graph_apply",
+		zap.Int("staged_files", len(stages)))
+	defer timing.abort()
 	var plan DerivedInvalidationPlan
 	view := loadIncrementalPriorView(idx.graph, stages)
 
@@ -557,6 +625,7 @@ func (idx *Indexer) commitIncrementalStages(
 			stage.graphPath, stage.priorNodes, stage.result.Nodes,
 		))
 	}
+	timing.complete(nil, zap.Int("structural_files", len(structural)), zap.Int("metadata_files", len(metadata)))
 	return plan
 }
 
@@ -775,7 +844,7 @@ func (idx *Indexer) commitStructuralIncrementalBatch(
 ) {
 	deferResolverCatchup := markerBatch != nil && markerBatch.deferResolverCatchup
 	paths := make([]string, 0, len(stages))
-	oldNodeIDs := make([]string, 0)
+	oldFTSNodeIDs := make([]string, 0)
 	oldFuncIDs := make([]string, 0)
 	var nodes []*graph.Node
 	var edges []*graph.Edge
@@ -789,7 +858,9 @@ func (idx *Indexer) commitStructuralIncrementalBatch(
 			if node == nil {
 				continue
 			}
-			oldNodeIDs = append(oldNodeIDs, node.ID)
+			if node.Kind != graph.KindContract {
+				oldFTSNodeIDs = append(oldFTSNodeIDs, node.ID)
+			}
 			idx.removeFromSearch(node)
 			if node.Kind == graph.KindFunction || node.Kind == graph.KindMethod {
 				oldFuncIDs = append(oldFuncIDs, node.ID)
@@ -798,7 +869,9 @@ func (idx *Indexer) commitStructuralIncrementalBatch(
 	}
 
 	restubIncomingRefsFromView(idx.graph, stages, view)
-	idx.deleteSymbolFTS(oldNodeIDs)
+	// Canonical FTS lifetime follows the backend's atomic owner decision.
+	// Retained contracts keep existing rows; actual orphans are deleted there.
+	idx.deleteSymbolFTS(oldFTSNodeIDs)
 	evictFilesBatched(idx.graph, paths)
 	idx.graph.AddBatch(nodes, edges)
 
@@ -1033,6 +1106,7 @@ func (idx *Indexer) recordFileReadVersionsBatched(receipts []fileReadReceipt) (f
 	mtimes := make(map[string]int64, len(receipts))
 	for _, receipt := range receipts {
 		if !receipt.readVersion.valid {
+			idx.noteFileIndexFailure(receipt.absPath, errFileVersionChanged)
 			stale = append(stale, receipt.absPath)
 			continue
 		}
@@ -1040,15 +1114,23 @@ func (idx *Indexer) recordFileReadVersionsBatched(receipts []fileReadReceipt) (f
 			// Read from an immutable content source: nothing on disk to
 			// restat, and no working-tree mtime to advance the ledger to.
 			fresh = append(fresh, receipt.absPath)
+			idx.noteFileIndexFailure(receipt.absPath, nil)
 			continue
 		}
 		current, err := os.Stat(receipt.absPath)
-		if err != nil || !sameFileVersion(receipt.readVersion.info, current) {
+		if err != nil {
+			idx.noteFileIndexFailure(receipt.absPath, err)
+			stale = append(stale, receipt.absPath)
+			continue
+		}
+		if !sameFileVersion(receipt.readVersion.info, current) {
+			idx.noteFileIndexFailure(receipt.absPath, errFileVersionChanged)
 			stale = append(stale, receipt.absPath)
 			continue
 		}
 		mtimes[receipt.mtimeKey] = receipt.readVersion.mtime
 		fresh = append(fresh, receipt.absPath)
+		idx.noteFileIndexFailure(receipt.absPath, nil)
 	}
 	if len(mtimes) == 0 {
 		return fresh, stale
@@ -1469,9 +1551,12 @@ func (idx *Indexer) evictFileIncrementalRaw(relPath string) forcedFileEviction {
 	// bounded deletion core is idempotent and must still clear orphan mtimes,
 	// search content, ref facts, contracts, and enrichment state.
 	dependencyFiles := idx.semanticDependencyFrontierForDeletedFiles([]string{relPath})
+	// Once source ownership edges disappear, a reopened registry cannot
+	// recover this file's records from a sibling's canonical scalar payload.
+	idx.ensureIncrementalContractRegistry()
 	var invalidation DerivedInvalidationPlan
 	nodesRemoved, edgesRemoved := idx.evictDeletedFilesBatched([]string{relPath}, &invalidation)
-	graphPath := idx.prefixPath(filepath.FromSlash(relPath))
+	graphPath := idx.prefixPath(relPath)
 	idx.removeIncrementalContractsForFile(graphPath, &invalidation)
 	invalidation.Files = appendUniqueSorted(invalidation.Files, dependencyFiles...)
 
@@ -1524,16 +1609,20 @@ func (idx *Indexer) evictDeletedFilesBatched(deleted []string, plan *DerivedInva
 	if len(deleted) == 0 {
 		return 0, 0
 	}
+	defer idx.flushFileIndexFailures()
+	for _, path := range deleted {
+		idx.noteFileIndexFailure(filepath.Join(idx.rootPath, filepath.FromSlash(path)), nil)
+	}
 	for start := 0; start < len(deleted); start += deletedBatchFiles {
 		end := min(start+deletedBatchFiles, len(deleted))
 		relPaths := deleted[start:end]
 		graphPaths := make([]string, len(relPaths))
 		for i, relPath := range relPaths {
-			graphPaths[i] = idx.prefixPath(filepath.FromSlash(relPath))
+			graphPaths[i] = idx.prefixPath(relPath)
 		}
 		nodesByFile := idx.graph.GetFileNodesByPaths(graphPaths)
 		stages := make([]*incrementalBatchStage, 0, len(graphPaths))
-		var nodeIDs []string
+		var nodeIDs, ftsNodeIDs []string
 		for i, graphPath := range graphPaths {
 			priorNodes := nodesByFile[graphPath]
 			stage := &incrementalBatchStage{graphPath: graphPath, priorNodes: priorNodes}
@@ -1549,6 +1638,9 @@ func (idx *Indexer) evictDeletedFilesBatched(deleted []string, plan *DerivedInva
 					continue
 				}
 				nodeIDs = append(nodeIDs, node.ID)
+				if node.Kind != graph.KindContract {
+					ftsNodeIDs = append(ftsNodeIDs, node.ID)
+				}
 				idx.removeFromSearch(node)
 			}
 			_ = i
@@ -1560,7 +1652,8 @@ func (idx *Indexer) evictDeletedFilesBatched(deleted []string, plan *DerivedInva
 		)
 		restubIncomingRefsFromView(idx.graph, stages, view)
 		idx.deleteEnrichmentByNodeIDs(nodeIDs)
-		idx.deleteSymbolFTS(nodeIDs)
+		// Canonical FTS lifetime is decided with its owners in the backend.
+		idx.deleteSymbolFTS(ftsNodeIDs)
 		idx.deleteRefFactsForFiles(idx.repoPrefix, graphPaths)
 		idx.deleteIncrementalSidecars(graphPaths)
 		idx.clearIncrementalContent(graphPaths)
@@ -1574,6 +1667,7 @@ func (idx *Indexer) evictDeletedFilesBatched(deleted []string, plan *DerivedInva
 		delete(idx.fileMtimes, relPath)
 	}
 	idx.mtimeMu.Unlock()
+	idx.clearRecoveredParseErrors(nil, nil, deleted)
 	return nodesRemoved, edgesRemoved
 }
 

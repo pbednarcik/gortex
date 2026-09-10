@@ -1,6 +1,7 @@
 package hooks
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
 	"testing"
@@ -24,15 +25,16 @@ func writeGlobalConfig(t *testing.T, body string) string {
 // downstream, "no repo owns this path" downgrades an indexed-file decision to
 // generic guidance.
 func TestLoadTrackedRepos_IncludesProjectNestedRepos(t *testing.T) {
-	path := writeGlobalConfig(t, `
+	alpha, beta, gamma := fixtureAbs("/work/alpha"), fixtureAbs("/work/beta"), fixtureAbs("/work/gamma")
+	path := writeGlobalConfig(t, fmt.Sprintf(`
 repos:
-  - path: /work/alpha
+  - path: '%s'
 projects:
   side:
     repos:
-      - path: /work/beta
-      - path: /work/gamma
-`)
+      - path: '%s'
+      - path: '%s'
+`, alpha, beta, gamma))
 	repos, ok := loadTrackedReposFromPath(path)
 	require.True(t, ok)
 
@@ -41,9 +43,9 @@ projects:
 		got[r.Path] = r.Prefix
 	}
 	assert.Equal(t, map[string]string{
-		"/work/alpha": "alpha",
-		"/work/beta":  "beta",
-		"/work/gamma": "gamma",
+		alpha: "alpha",
+		beta:  "beta",
+		gamma: "gamma",
 	}, got, "top-level and project-nested repos are both tracked")
 }
 
@@ -51,12 +53,12 @@ projects:
 // path's base. hookRepoScope hands this value out as the graph repo prefix, so
 // a wrong one mis-attributes a Stop-time diff.
 func TestLoadTrackedRepos_PrefixPrefersExplicitName(t *testing.T) {
-	path := writeGlobalConfig(t, `
+	path := writeGlobalConfig(t, fmt.Sprintf(`
 repos:
-  - path: /work/checkout
+  - path: '%s'
     name: canonical
-  - path: /work/plain
-`)
+  - path: '%s'
+`, fixtureAbs("/work/checkout"), fixtureAbs("/work/plain")))
 	repos, ok := loadTrackedReposFromPath(path)
 	require.True(t, ok)
 	require.Len(t, repos, 2)
@@ -66,14 +68,14 @@ repos:
 
 // The same path reachable twice (top-level and under a project) is one repo.
 func TestLoadTrackedRepos_DedupesRepeatedPath(t *testing.T) {
-	path := writeGlobalConfig(t, `
+	path := writeGlobalConfig(t, fmt.Sprintf(`
 repos:
-  - path: /work/alpha
+  - path: '%s'
 projects:
   dup:
     repos:
-      - path: /work/alpha
-`)
+      - path: '%s'
+`, fixtureAbs("/work/alpha"), fixtureAbs("/work/alpha")))
 	repos, ok := loadTrackedReposFromPath(path)
 	require.True(t, ok)
 	assert.Len(t, repos, 1)
@@ -107,26 +109,28 @@ func TestLoadTrackedRepos_UnestablishedRegistryFallsBack(t *testing.T) {
 // A blank path entry cannot own any file and must not become a row — an empty
 // Path would prefix-match nothing but still pad the registry.
 func TestLoadTrackedRepos_SkipsBlankPaths(t *testing.T) {
-	path := writeGlobalConfig(t, `
+	real := fixtureAbs("/work/real")
+	path := writeGlobalConfig(t, fmt.Sprintf(`
 repos:
   - path: ""
-  - path: /work/real
-`)
+  - path: '%s'
+`, real))
 	repos, ok := loadTrackedReposFromPath(path)
 	require.True(t, ok)
 	require.Len(t, repos, 1)
-	assert.Equal(t, "/work/real", repos[0].Path)
+	assert.Equal(t, real, repos[0].Path)
 }
 
 // The registry feeds trackedRepoForPath, whose longest-match rule resolves
 // nested checkouts. Proving it here pins the end-to-end contract the PreToolUse
 // probe depends on, not just the parse.
 func TestLoadTrackedRepos_FeedsLongestMatchLookup(t *testing.T) {
-	path := writeGlobalConfig(t, `
+	outer, inner := fixtureAbs("/work/outer"), fixtureAbs("/work/outer/inner")
+	path := writeGlobalConfig(t, fmt.Sprintf(`
 repos:
-  - path: /work/outer
-  - path: /work/outer/inner
-`)
+  - path: '%s'
+  - path: '%s'
+`, outer, inner))
 	repos, ok := loadTrackedReposFromPath(path)
 	require.True(t, ok)
 
@@ -134,15 +138,15 @@ repos:
 	hookTrackedReposFn = func() []daemon.TrackedRepoStatus { return repos }
 	t.Cleanup(func() { hookTrackedReposFn = prev })
 
-	got, found := trackedRepoForPath(filepath.Join("/work/outer/inner", "pkg", "f.go"))
+	got, found := trackedRepoForPath(filepath.Join(inner, "pkg", "f.go"))
 	require.True(t, found)
-	assert.Equal(t, "/work/outer/inner", got.Path,
+	assert.Equal(t, inner, got.Path,
 		"the nested checkout owns its own files, not the outer one")
 
-	got, found = trackedRepoForPath(filepath.Join("/work/outer", "pkg", "f.go"))
+	got, found = trackedRepoForPath(filepath.Join(outer, "pkg", "f.go"))
 	require.True(t, found)
-	assert.Equal(t, "/work/outer", got.Path)
+	assert.Equal(t, outer, got.Path)
 
-	_, found = trackedRepoForPath("/elsewhere/pkg/f.go")
+	_, found = trackedRepoForPath(filepath.Join(fixtureAbs("/elsewhere"), "pkg", "f.go"))
 	assert.False(t, found, "a path outside every tracked repo owns no repo")
 }

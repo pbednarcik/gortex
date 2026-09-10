@@ -45,9 +45,13 @@ func siblingDiffGitRepo(t *testing.T) (root, fileA, fileB, fileC string) {
 	run("config", "diff.mnemonicPrefix", "false")
 	run("config", "diff.noprefix", "false")
 
-	fileA = filepath.Join("internal", "alpha", "a.go")
-	fileB = filepath.Join("internal", "alpha", "b.go")
-	fileC = filepath.Join("internal", "beta", "c.go")
+	// '/'-spelled on every platform: these are repo-relative paths, which is
+	// what git prints, what the graph keys file nodes under, and what the
+	// review handlers compare. filepath.Join here would build a third
+	// spelling that matches neither on Windows.
+	fileA = "internal/alpha/a.go"
+	fileB = "internal/alpha/b.go"
+	fileC = "internal/beta/c.go"
 	write := func(rel, src string) {
 		abs := filepath.Join(dir, rel)
 		require.NoError(t, os.MkdirAll(filepath.Dir(abs), 0o755))
@@ -276,7 +280,7 @@ func reviewGitRepo(t *testing.T) (root, file string) {
 	run("config", "user.name", "t")
 	run("config", "diff.noprefix", "false")
 
-	file = filepath.Join("internal", "svc", "handler.go")
+	file = "internal/svc/handler.go"
 	write := func(rel, src string) {
 		abs := filepath.Join(dir, rel)
 		require.NoError(t, os.MkdirAll(filepath.Dir(abs), 0o755))

@@ -1,6 +1,7 @@
 package hooks
 
 import (
+	"path/filepath"
 	"testing"
 
 	"github.com/zzet/gortex/internal/daemon"
@@ -25,7 +26,7 @@ func stubTrackedRepos(t *testing.T, paths ...string) {
 // a pattern that existed in some *other* tracked repo hard-denied a search of
 // an untracked one.
 func TestUntrackedCwdSilencesEveryHostToolPolicy(t *testing.T) {
-	stubTrackedRepos(t, "/tracked")
+	stubTrackedRepos(t, trackedFixtureRoot)
 	stubTrackedScope(t, false)
 	stubProbe(t, []grepSymbolHit{{Name: "Handler", FilePath: "pkg/a.go", Line: 1}}, nil)
 	stubIndexedFile(t, true, 9)
@@ -44,7 +45,7 @@ func TestUntrackedCwdSilencesEveryHostToolPolicy(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			tc.input.CWD = "/untracked"
+			tc.input.CWD = untrackedFixtureRoot
 			result := enrich(tc.input, 0)
 			if result.deny || result.context != "" {
 				t.Fatalf("policy fired in an untracked checkout: %#v", result)
@@ -57,13 +58,13 @@ func TestUntrackedCwdSilencesEveryHostToolPolicy(t *testing.T) {
 // checkout can still name a file in a tracked one, and that file's repo is the
 // one with an answer.
 func TestTrackedTargetOutsideCwdStillEnforced(t *testing.T) {
-	stubTrackedRepos(t, "/tracked")
+	stubTrackedRepos(t, trackedFixtureRoot)
 	stubIndexedFile(t, true, 9)
 
 	result := enrich(HookInput{
 		ToolName:  "Read",
-		ToolInput: map[string]any{"file_path": "/tracked/pkg/a.go"},
-		CWD:       "/untracked",
+		ToolInput: map[string]any{"file_path": filepath.Join(trackedFixtureRoot, "pkg", "a.go")},
+		CWD:       untrackedFixtureRoot,
 	}, 0)
 	if !result.deny {
 		t.Fatalf("Read of an indexed file in a tracked repo must still be denied: %#v", result)
@@ -73,13 +74,13 @@ func TestTrackedTargetOutsideCwdStillEnforced(t *testing.T) {
 // The mirror of the case above: a cwd inside a tracked repo does not license a
 // redirect for a file that lives outside every tracked repo.
 func TestUntrackedTargetFromTrackedCwdIsSilent(t *testing.T) {
-	stubTrackedRepos(t, "/tracked")
+	stubTrackedRepos(t, trackedFixtureRoot)
 	stubIndexedFile(t, true, 9)
 
 	result := enrich(HookInput{
 		ToolName:  "Read",
-		ToolInput: map[string]any{"file_path": "/elsewhere/pkg/a.go"},
-		CWD:       "/tracked",
+		ToolInput: map[string]any{"file_path": filepath.Join(elsewhereFixtureRoot, "pkg", "a.go")},
+		CWD:       trackedFixtureRoot,
 	}, 0)
 	if result.deny || result.context != "" {
 		t.Fatalf("policy fired on a target outside every tracked repo: %#v", result)
@@ -87,13 +88,13 @@ func TestUntrackedTargetFromTrackedCwdIsSilent(t *testing.T) {
 }
 
 func TestTrackedCwdKeepsEnforcement(t *testing.T) {
-	stubTrackedRepos(t, "/tracked")
+	stubTrackedRepos(t, trackedFixtureRoot)
 	stubTrackedScope(t, true)
 
 	result := enrich(HookInput{
 		ToolName:  "Grep",
 		ToolInput: map[string]any{"pattern": "Handler"},
-		CWD:       "/tracked/internal",
+		CWD:       filepath.Join(trackedFixtureRoot, "internal"),
 	}, 0)
 	if !result.deny {
 		t.Fatalf("tracked cwd must keep the indexed-search deny: %#v", result)
@@ -109,7 +110,7 @@ func TestUnknownTrackedRepoListLeavesPostureUnchanged(t *testing.T) {
 	result := enrich(HookInput{
 		ToolName:  "Grep",
 		ToolInput: map[string]any{"pattern": "Handler"},
-		CWD:       "/anywhere",
+		CWD:       fixtureAbs("/anywhere"),
 	}, 0)
 	if !result.deny {
 		t.Fatalf("an unknown tracked-repo list must not disable the policy: %#v", result)
@@ -117,12 +118,12 @@ func TestUnknownTrackedRepoListLeavesPostureUnchanged(t *testing.T) {
 }
 
 func TestGortexMCPCallsAreNotRepoGated(t *testing.T) {
-	stubTrackedRepos(t, "/tracked")
+	stubTrackedRepos(t, trackedFixtureRoot)
 
 	result := enrich(HookInput{
 		ToolName:  gortexReadFileTool,
 		ToolInput: map[string]any{"path": "pkg/a.go"},
-		CWD:       "/untracked",
+		CWD:       untrackedFixtureRoot,
 	}, 0)
 	if result.context == "" && !result.deny {
 		t.Fatal("a Gortex MCP read is not repo-scoped and must still be enriched")
@@ -145,7 +146,7 @@ func TestGrepRestrictedToNonSourceStaysSilent(t *testing.T) {
 		{"pattern": "Handler", "path": "README.md"},
 		{"pattern": "Handler", "path": ".github/workflows/ci.yml"},
 	} {
-		result := enrichGrep(toolInput, 0, "/repo")
+		result := enrichGrep(toolInput, 0, repoFixtureRoot)
 		if result.deny || result.context != "" {
 			t.Fatalf("non-source Grep %v fired: %#v", toolInput, result)
 		}
@@ -164,7 +165,7 @@ func TestGrepWithSourceFilterStillEnforced(t *testing.T) {
 		{"pattern": "Handler", "type": "not-a-known-type"},
 		{"pattern": "Handler"},
 	} {
-		result := enrichGrep(toolInput, 0, "/repo")
+		result := enrichGrep(toolInput, 0, repoFixtureRoot)
 		if !result.deny {
 			t.Fatalf("source-scoped Grep %v was not denied: %#v", toolInput, result)
 		}
@@ -177,7 +178,7 @@ func TestGlobNonSourceScopeStaysSilent(t *testing.T) {
 	result := enrichGlob(map[string]any{
 		"pattern": "**/*.go",
 		"path":    "docs/README.md",
-	}, "/repo")
+	}, repoFixtureRoot)
 	if result.deny || result.context != "" {
 		t.Fatalf("Glob scoped to a non-source file fired: %#v", result)
 	}
@@ -187,7 +188,7 @@ func TestGlobNonSourceScopeStaysSilent(t *testing.T) {
 // search verb cannot be satisfied by a graph query, so it must pass through
 // untouched even in a fully tracked, fully indexed repo.
 func TestBashWithoutSearchVerbNeverFires(t *testing.T) {
-	stubTrackedRepos(t, "/tracked")
+	stubTrackedRepos(t, trackedFixtureRoot)
 	stubIndexedFile(t, true, 12)
 	stubProbe(t, []grepSymbolHit{{Name: "version", FilePath: "pkg/a.go", Line: 1}}, nil)
 
@@ -204,7 +205,7 @@ func TestBashWithoutSearchVerbNeverFires(t *testing.T) {
 		result := enrich(HookInput{
 			ToolName:  "Bash",
 			ToolInput: map[string]any{"command": command},
-			CWD:       "/tracked",
+			CWD:       trackedFixtureRoot,
 		}, 0)
 		if result.deny || result.context != "" {
 			t.Fatalf("Bash %q has no search verb but fired: %#v", command, result)
@@ -240,16 +241,16 @@ func TestHookAbsScopePathRequiresAnAnchor(t *testing.T) {
 	if _, ok := hookAbsScopePath("pkg/a.go", "relative/cwd"); ok {
 		t.Fatal("a relative cwd cannot anchor a relative path")
 	}
-	abs, ok := hookAbsScopePath("pkg/a.go", "/repo")
-	if !ok || abs != "/repo/pkg/a.go" {
-		t.Fatalf("hookAbsScopePath = %q, %v", abs, ok)
+	abs, ok := hookAbsScopePath("pkg/a.go", repoFixtureRoot)
+	if want := filepath.Join(repoFixtureRoot, "pkg", "a.go"); !ok || abs != want {
+		t.Fatalf("hookAbsScopePath = %q, %v; want %q", abs, ok, want)
 	}
 }
 
 // An unresolvable path proves nothing about where the call lives, so it must
 // leave the historical posture in place rather than silence the policy.
 func TestUnresolvablePathLeavesPostureUnchanged(t *testing.T) {
-	stubTrackedRepos(t, "/tracked")
+	stubTrackedRepos(t, trackedFixtureRoot)
 	if !hookCallTargetsTrackedRepo("Read", map[string]any{"file_path": "pkg/a.go"}, "") {
 		t.Fatal("an unanchored relative path must not be treated as untracked")
 	}

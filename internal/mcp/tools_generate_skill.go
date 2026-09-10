@@ -87,6 +87,13 @@ func (s *Server) handleGenerateSkill(ctx context.Context, req mcp.CallToolReques
 	if skillName == "" {
 		return mcp.NewToolResultError("skill_name could not be derived from directory; pass it explicitly"), nil
 	}
+	// skill_name becomes a path component of the default output directory, so
+	// it has to BE a single component. Refuse rather than sanitise: silently
+	// writing a differently-named skill than the caller asked for is worse
+	// than an error they can act on.
+	if err := validateSkillNameComponent(skillName); err != nil {
+		return mcp.NewToolResultError(err.Error()), nil
+	}
 
 	description := strings.TrimSpace(req.GetString("description", ""))
 	// A blank description is filled in after the walk so it can quote
@@ -110,6 +117,14 @@ func (s *Server) handleGenerateSkill(ctx context.Context, req mcp.CallToolReques
 			repoRoot = absDir
 		}
 		absOutputDir = filepath.Join(repoRoot, ".claude", "skills", skillName)
+		// Confine the default destination on the same terms as an explicit
+		// output_dir. validateSkillNameComponent already keeps the name from
+		// walking up; this is the structural backstop that does not depend on
+		// it — it also catches a .claude/skills symlinked out of the root, and
+		// it keeps the invariant if the name rules ever loosen.
+		if gerr := s.guardSymlinkWithinRepo(ctx, absOutputDir); gerr != nil {
+			return mcp.NewToolResultError(gerr.Error()), nil
+		}
 	} else {
 		// Confine the override: resolveFilePath refuses any path outside
 		// every indexed repo root, so an absolute output_dir can no longer
@@ -245,7 +260,10 @@ func (s *Server) handleGenerateSkill(ctx context.Context, req mcp.CallToolReques
 func buildSkillMarkdown(name, description string, refs []generateSkillRef, symbols []skillSymbol) string {
 	var b strings.Builder
 	b.WriteString("---\n")
-	b.WriteString("name: " + name + "\n")
+	// Both scalars are quoted and escaped: validateSkillNameComponent already
+	// keeps the name to a safe charset, but the frontmatter must be
+	// well-formed on its own terms rather than by trusting an upstream check.
+	b.WriteString("name: \"" + escapeYAMLDoubleQuoted(name) + "\"\n")
 	b.WriteString("description: \"" + escapeYAMLDoubleQuoted(description) + "\"\n")
 	b.WriteString("---\n\n")
 	b.WriteString("# " + name + "\n\n")
@@ -395,6 +413,14 @@ func collapseWhitespace(s string) string {
 func escapeYAMLDoubleQuoted(s string) string {
 	s = strings.ReplaceAll(s, `\`, `\\`)
 	s = strings.ReplaceAll(s, `"`, `\"`)
+	// Line breaks and tabs become escape sequences rather than riding into
+	// the file literally. A raw newline parses today only because a
+	// double-quoted scalar folds across lines; keeping the scalar on one
+	// physical line means the frontmatter does not depend on that folding
+	// behaviour being identical in every YAML reader that loads the skill.
+	s = strings.ReplaceAll(s, "\r", `\r`)
+	s = strings.ReplaceAll(s, "\n", `\n`)
+	s = strings.ReplaceAll(s, "\t", `\t`)
 	return s
 }
 
@@ -417,6 +443,51 @@ func sluggify(in string) string {
 		}
 	}
 	return strings.TrimRight(b.String(), "-")
+}
+
+// validateSkillNameComponent refuses a skill_name that is not a single, safe
+// path component.
+//
+// skill_name is joined into the default output directory
+// (<repo-root>/.claude/skills/<name>), so a separator, a "..", an absolute
+// path or a Windows volume name relocates everything the tool writes — the
+// SKILL.md and the whole references/ tree — outside the indexed repository
+// root. GHSA-w42c-h7hr-f67p closed the explicit output_dir arm by routing it
+// through resolveFilePath; the default arm never went through that choke
+// point, so the same escape survived here.
+//
+// SKILL.md is agent-instruction content, and Gortex installs its own curated
+// skills at ~/.claude/skills/gortex-*/SKILL.md, so an escape does not just
+// litter the filesystem: it plants (or overwrites) instructions that load
+// into every later agent session.
+func validateSkillNameComponent(name string) error {
+	switch {
+	case name == "":
+		return fmt.Errorf("skill_name is empty")
+	case strings.ContainsAny(name, `/\`):
+		return fmt.Errorf("skill_name %q must be a single path component: path separators are not allowed", name)
+	case filepath.IsAbs(name), filepath.VolumeName(name) != "":
+		return fmt.Errorf("skill_name %q must be a single path component, not a path", name)
+	case name == ".", name == "..", filepath.Clean(name) != name:
+		return fmt.Errorf("skill_name %q must be a single path component, not a directory traversal", name)
+	}
+	// The name is also emitted as the YAML `name:` key and used as an
+	// on-disk directory name, so restrict it to the kebab-case charset the
+	// tool documents. Without this a newline in the name injects further
+	// frontmatter keys — `allowed-tools:` among them — into the generated
+	// SKILL.md, and the response payload then reports a skill_name that the
+	// file on disk does not declare. Deliberately ASCII: skill names are
+	// ecosystem identifiers, and every default derived here comes from
+	// sluggify, which already emits [a-z0-9-] only.
+	for _, r := range name {
+		switch {
+		case r >= 'a' && r <= 'z', r >= 'A' && r <= 'Z', r >= '0' && r <= '9':
+		case r == '-', r == '_', r == '.':
+		default:
+			return fmt.Errorf("skill_name %q may only contain letters, digits, '-', '_' and '.' (got %q)", name, r)
+		}
+	}
+	return nil
 }
 
 // isAlwaysSkipped lists the directory bases that are noise in every

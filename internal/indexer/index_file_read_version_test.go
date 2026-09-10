@@ -70,12 +70,12 @@ func TestIndexFileDoesNotStampWriteThatLandsDuringParse(t *testing.T) {
 
 	key := idx.relKey(path)
 	require.NotEqual(t, secondMtime.UnixNano(), idx.FileMtimes()[key])
-	require.Equal(t, []string{"First"}, watcherSymbolNames(g.GetFileNodes(idx.graphRelKey(path))))
+	require.Equal(t, []string{"First"}, watcherSymbolNames(g.GetFileNodes(idx.relKey(path))))
 
 	registry.Register(goExtractor)
 	require.NoError(t, idx.IndexFile(path))
 	require.Equal(t, secondMtime.UnixNano(), idx.FileMtimes()[key])
-	require.Equal(t, []string{"Second"}, watcherSymbolNames(g.GetFileNodes(idx.graphRelKey(path))))
+	require.Equal(t, []string{"Second"}, watcherSymbolNames(g.GetFileNodes(idx.relKey(path))))
 }
 
 func TestIndexFileSyntheticSkipsStampAcceptedReadVersion(t *testing.T) {

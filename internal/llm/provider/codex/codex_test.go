@@ -2,10 +2,13 @@ package codex
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -13,69 +16,126 @@ import (
 	"github.com/zzet/gortex/internal/llm"
 )
 
-// fakeCodex writes a shell script that impersonates the `codex` CLI.
-// It logs args + stdin to sidecar files for assertions, writes
-// opts.lastMessage to whatever path follows --output-last-message
-// (mirroring real `codex exec`), echoes opts.stdout as progress noise,
-// and exits with opts.exitCode.
+// fakeCLIEnv carries the fake-CLI script to a re-exec'd copy of this test
+// binary. TestMain acts on it before the test framework starts, so the
+// provider can be pointed at this binary as if it were `codex`.
+const fakeCLIEnv = "GORTEX_FAKE_CODEX"
+
+// TestMain doubles as the fake `codex` CLI. The provider spawns its binary as
+// a subprocess, and the fake used to be a /bin/sh script — which is not
+// executable on Windows ("%1 is not a valid Win32 application"). Re-execing
+// the test binary is the portable equivalent: it impersonates the CLI on
+// every OS, exercising the same paths (argv construction, stdin piping, the
+// --output-last-message sidecar, the stdout fallback, exit status and stderr
+// handling) the script did.
+func TestMain(m *testing.M) {
+	if spec := os.Getenv(fakeCLIEnv); spec != "" {
+		os.Exit(runFakeCLI(spec))
+	}
+	os.Exit(m.Run())
+}
+
+// fakeOpts is the scripted behaviour of one fake-CLI invocation. It is
+// JSON-encoded into fakeCLIEnv, so every field has to be exported.
+type fakeOpts struct {
+	Dir         string        `json:"dir"`          // where args.txt / stdin.txt land
+	LastMessage string        `json:"last_message"` // written to the --output-last-message sidecar
+	Stdout      string        `json:"stdout"`       // emitted on stdout (progress logs)
+	Stderr      string        `json:"stderr"`
+	ExitCode    int           `json:"exit_code"`
+	Sleep       time.Duration `json:"sleep"`
+}
+
+// runFakeCLI is the child-process half: it records the argv and stdin it was
+// given, mirrors real `codex exec` by writing LastMessage to whatever path
+// follows --output-last-message, emits the scripted payloads, and returns the
+// scripted exit code.
+func runFakeCLI(spec string) int {
+	var opts fakeOpts
+	if err := json.Unmarshal([]byte(spec), &opts); err != nil {
+		fmt.Fprintf(os.Stderr, "fake codex: bad spec: %v\n", err)
+		return 111
+	}
+	args := os.Args[1:]
+	// One argument per line, matching the sidecar shape the assertions read.
+	if err := os.WriteFile(filepath.Join(opts.Dir, "args.txt"), []byte(strings.Join(args, "\n")+"\n"), 0o600); err != nil {
+		fmt.Fprintf(os.Stderr, "fake codex: record argv: %v\n", err)
+		return 111
+	}
+	stdin, err := io.ReadAll(os.Stdin)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "fake codex: read stdin: %v\n", err)
+		return 111
+	}
+	if err := os.WriteFile(filepath.Join(opts.Dir, "stdin.txt"), stdin, 0o600); err != nil {
+		fmt.Fprintf(os.Stderr, "fake codex: record stdin: %v\n", err)
+		return 111
+	}
+	if opts.Sleep > 0 {
+		time.Sleep(opts.Sleep + time.Second)
+	}
+	if opts.LastMessage != "" {
+		if out := flagValue(args, "--output-last-message"); out != "" {
+			if err := os.WriteFile(out, []byte(opts.LastMessage), 0o600); err != nil {
+				fmt.Fprintf(os.Stderr, "fake codex: write last message: %v\n", err)
+				return 111
+			}
+		}
+	}
+	if opts.Stderr != "" {
+		fmt.Fprint(os.Stderr, opts.Stderr)
+	}
+	if opts.Stdout != "" {
+		fmt.Fprint(os.Stdout, opts.Stdout)
+	}
+	return opts.ExitCode
+}
+
+// flagValue returns the argument following flag, or "" when the flag is
+// absent or trailing.
+func flagValue(args []string, flag string) string {
+	for i, a := range args {
+		if a == flag && i+1 < len(args) {
+			return args[i+1]
+		}
+	}
+	return ""
+}
+
+// fakeCLI is the parent-process handle on one armed fake: the binary path to
+// hand the provider, plus the directory its sidecar recordings land in.
+type fakeCLI struct {
+	binary string
+	dir    string
+}
+
+// fakeCodex arms the fake `codex` CLI for one test and returns the handle.
+// The provider is pointed at this test binary; fakeCLIEnv (inherited by the
+// spawn) tells the child to impersonate the CLI instead of running tests.
 //
-// A shell-script fake exercises every provider code path — arg
-// construction, stdin piping, the --output-last-message sidecar, the
-// stdout fallback, exit-status and stderr handling — without a real
-// codex install.
-func fakeCodex(t *testing.T, dir string, opts fakeOpts) string {
+// Because it uses t.Setenv, a test that calls it must not run in parallel.
+func fakeCodex(t *testing.T, dir string, opts fakeOpts) fakeCLI {
 	t.Helper()
 	if dir == "" {
 		dir = t.TempDir()
 	}
-	script := filepath.Join(dir, "fake-codex.sh")
+	opts.Dir = dir
+	spec, err := json.Marshal(opts)
+	if err != nil {
+		t.Fatalf("encode fake spec: %v", err)
+	}
+	t.Setenv(fakeCLIEnv, string(spec))
 
-	argsLog := filepath.Join(dir, "args.txt")
-	stdinLog := filepath.Join(dir, "stdin.txt")
-	q := func(s string) string { return strings.ReplaceAll(s, "'", "'\\''") }
-
-	body := "#!/bin/sh\n" +
-		"printf '%s\\n' \"$@\" > '" + argsLog + "'\n" +
-		"cat > '" + stdinLog + "'\n" +
-		"prev=''\n" +
-		"outfile=''\n" +
-		"for a in \"$@\"; do\n" +
-		"  if [ \"$prev\" = '--output-last-message' ]; then outfile=\"$a\"; fi\n" +
-		"  prev=\"$a\"\n" +
-		"done\n"
-	if opts.sleep > 0 {
-		body += fmt.Sprintf("sleep %d\n", int(opts.sleep.Seconds()+1))
+	bin, err := os.Executable()
+	if err != nil {
+		bin = os.Args[0]
 	}
-	if opts.lastMessage != "" {
-		body += "if [ -n \"$outfile\" ]; then printf '%s' '" + q(opts.lastMessage) + "' > \"$outfile\"; fi\n"
-	}
-	if opts.stderr != "" {
-		body += "printf '%s' '" + q(opts.stderr) + "' >&2\n"
-	}
-	if opts.stdout != "" {
-		body += "printf '%s' '" + q(opts.stdout) + "'\n"
-	}
-	if opts.exitCode != 0 {
-		body += fmt.Sprintf("exit %d\n", opts.exitCode)
-	}
-
-	if err := os.WriteFile(script, []byte(body), 0o700); err != nil {
-		t.Fatalf("write fake script: %v", err)
-	}
-	return script
+	return fakeCLI{binary: bin, dir: dir}
 }
 
-type fakeOpts struct {
-	lastMessage string // written to the --output-last-message sidecar
-	stdout      string // emitted on stdout (progress logs)
-	stderr      string
-	exitCode    int
-	sleep       time.Duration
-}
-
-func readSidecar(t *testing.T, scriptPath, name string) string {
+func (f fakeCLI) sidecar(t *testing.T, name string) string {
 	t.Helper()
-	b, err := os.ReadFile(filepath.Join(filepath.Dir(scriptPath), name))
+	b, err := os.ReadFile(filepath.Join(f.dir, name))
 	if err != nil {
 		t.Fatalf("read %s: %v", name, err)
 	}
@@ -90,8 +150,14 @@ func TestNew_BinaryNotFound(t *testing.T) {
 
 func TestNew_DefaultsBinary(t *testing.T) {
 	dir := t.TempDir()
-	bin := filepath.Join(dir, "codex")
-	if err := os.WriteFile(bin, []byte("#!/bin/sh\nexit 0\n"), 0o700); err != nil {
+	// exec.LookPath only resolves a name that carries a PATHEXT extension on
+	// Windows — an extensionless `codex` file is invisible to it — so the
+	// stub is named for the host. It is never executed; New only resolves it.
+	name, body := "codex", "#!/bin/sh\nexit 0\n"
+	if runtime.GOOS == "windows" {
+		name, body = "codex.cmd", "@echo off\r\nexit /b 0\r\n"
+	}
+	if err := os.WriteFile(filepath.Join(dir, name), []byte(body), 0o700); err != nil {
 		t.Fatalf("write fake binary: %v", err)
 	}
 	t.Setenv("PATH", dir+string(os.PathListSeparator)+os.Getenv("PATH"))
@@ -107,9 +173,9 @@ func TestNew_DefaultsBinary(t *testing.T) {
 }
 
 func TestComplete_FreeformSuccess(t *testing.T) {
-	script := fakeCodex(t, "", fakeOpts{lastMessage: "hello world", stdout: "[progress] thinking…"})
+	fake := fakeCodex(t, "", fakeOpts{LastMessage: "hello world", Stdout: "[progress] thinking…"})
 
-	p, err := New(llm.CodexConfig{Binary: script})
+	p, err := New(llm.CodexConfig{Binary: fake.binary})
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
@@ -128,13 +194,13 @@ func TestComplete_FreeformSuccess(t *testing.T) {
 		t.Errorf("text=%q want hello world (the sidecar must win over stdout noise)", resp.Text)
 	}
 
-	gotArgs := readSidecar(t, script, "args.txt")
+	gotArgs := fake.sidecar(t, "args.txt")
 	for _, want := range []string{"exec", "--skip-git-repo-check", "--sandbox", "read-only", "--output-last-message", "-"} {
 		if !strings.Contains(gotArgs, want) {
 			t.Errorf("args missing %q\nargs=\n%s", want, gotArgs)
 		}
 	}
-	stdin := readSidecar(t, script, "stdin.txt")
+	stdin := fake.sidecar(t, "stdin.txt")
 	if !strings.Contains(stdin, "User: hi") {
 		t.Errorf("stdin missing user turn:\n%s", stdin)
 	}
@@ -146,9 +212,9 @@ func TestComplete_FreeformSuccess(t *testing.T) {
 func TestComplete_StdoutFallback(t *testing.T) {
 	// No sidecar payload — the provider must fall back to stdout for
 	// an older codex build that does not honour --output-last-message.
-	script := fakeCodex(t, "", fakeOpts{stdout: "fallback answer"})
+	fake := fakeCodex(t, "", fakeOpts{Stdout: "fallback answer"})
 
-	p, _ := New(llm.CodexConfig{Binary: script})
+	p, _ := New(llm.CodexConfig{Binary: fake.binary})
 	defer p.Close()
 
 	resp, err := p.Complete(context.Background(), llm.CompletionRequest{
@@ -163,9 +229,9 @@ func TestComplete_StdoutFallback(t *testing.T) {
 }
 
 func TestComplete_PassesModel(t *testing.T) {
-	script := fakeCodex(t, "", fakeOpts{lastMessage: "ok"})
+	fake := fakeCodex(t, "", fakeOpts{LastMessage: "ok"})
 
-	p, _ := New(llm.CodexConfig{Binary: script, Model: "gpt-5-codex"})
+	p, _ := New(llm.CodexConfig{Binary: fake.binary, Model: "gpt-5-codex"})
 	defer p.Close()
 
 	if _, err := p.Complete(context.Background(), llm.CompletionRequest{
@@ -173,7 +239,7 @@ func TestComplete_PassesModel(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("Complete: %v", err)
 	}
-	args := readSidecar(t, script, "args.txt")
+	args := fake.sidecar(t, "args.txt")
 	if !strings.Contains(args, "--model\ngpt-5-codex") {
 		t.Errorf("args missing --model gpt-5-codex:\n%s", args)
 	}
@@ -181,9 +247,9 @@ func TestComplete_PassesModel(t *testing.T) {
 
 func TestComplete_StructuredExtractsJSON(t *testing.T) {
 	wrapped := "```json\n{\"terms\":[\"bcrypt\",\"argon2\"]}\n```\n"
-	script := fakeCodex(t, "", fakeOpts{lastMessage: wrapped})
+	fake := fakeCodex(t, "", fakeOpts{LastMessage: wrapped})
 
-	p, _ := New(llm.CodexConfig{Binary: script})
+	p, _ := New(llm.CodexConfig{Binary: fake.binary})
 	defer p.Close()
 
 	resp, err := p.Complete(context.Background(), llm.CompletionRequest{
@@ -196,16 +262,16 @@ func TestComplete_StructuredExtractsJSON(t *testing.T) {
 	if resp.Text != `{"terms":["bcrypt","argon2"]}` {
 		t.Errorf("text=%q want the unwrapped JSON object", resp.Text)
 	}
-	stdin := readSidecar(t, script, "stdin.txt")
+	stdin := fake.sidecar(t, "stdin.txt")
 	if !strings.Contains(stdin, "JSON Schema") {
 		t.Errorf("structured request must inject a JSON Schema rider; stdin=\n%s", stdin)
 	}
 }
 
 func TestComplete_StructuredNoJSONErrors(t *testing.T) {
-	script := fakeCodex(t, "", fakeOpts{lastMessage: "I cannot help with that."})
+	fake := fakeCodex(t, "", fakeOpts{LastMessage: "I cannot help with that."})
 
-	p, _ := New(llm.CodexConfig{Binary: script})
+	p, _ := New(llm.CodexConfig{Binary: fake.binary})
 	defer p.Close()
 
 	if _, err := p.Complete(context.Background(), llm.CompletionRequest{
@@ -217,9 +283,9 @@ func TestComplete_StructuredNoJSONErrors(t *testing.T) {
 }
 
 func TestComplete_NonZeroExit(t *testing.T) {
-	script := fakeCodex(t, "", fakeOpts{exitCode: 2, stderr: "not signed in"})
+	fake := fakeCodex(t, "", fakeOpts{ExitCode: 2, Stderr: "not signed in"})
 
-	p, _ := New(llm.CodexConfig{Binary: script})
+	p, _ := New(llm.CodexConfig{Binary: fake.binary})
 	defer p.Close()
 
 	_, err := p.Complete(context.Background(), llm.CompletionRequest{
@@ -234,9 +300,9 @@ func TestComplete_NonZeroExit(t *testing.T) {
 }
 
 func TestComplete_EmptyResponseErrors(t *testing.T) {
-	script := fakeCodex(t, "", fakeOpts{})
+	fake := fakeCodex(t, "", fakeOpts{})
 
-	p, _ := New(llm.CodexConfig{Binary: script})
+	p, _ := New(llm.CodexConfig{Binary: fake.binary})
 	defer p.Close()
 
 	if _, err := p.Complete(context.Background(), llm.CompletionRequest{
@@ -247,9 +313,9 @@ func TestComplete_EmptyResponseErrors(t *testing.T) {
 }
 
 func TestComplete_ContextCancellation(t *testing.T) {
-	script := fakeCodex(t, "", fakeOpts{lastMessage: "late", sleep: 2 * time.Second})
+	fake := fakeCodex(t, "", fakeOpts{LastMessage: "late", Sleep: 2 * time.Second})
 
-	p, _ := New(llm.CodexConfig{Binary: script, TimeoutSeconds: 1})
+	p, _ := New(llm.CodexConfig{Binary: fake.binary, TimeoutSeconds: 1})
 	defer p.Close()
 
 	if _, err := p.Complete(context.Background(), llm.CompletionRequest{
@@ -260,9 +326,9 @@ func TestComplete_ContextCancellation(t *testing.T) {
 }
 
 func TestComplete_ExtraArgsForwarded(t *testing.T) {
-	script := fakeCodex(t, "", fakeOpts{lastMessage: "ok"})
+	fake := fakeCodex(t, "", fakeOpts{LastMessage: "ok"})
 
-	p, _ := New(llm.CodexConfig{Binary: script, Args: []string{"--sandbox", "workspace-write"}})
+	p, _ := New(llm.CodexConfig{Binary: fake.binary, Args: []string{"--sandbox", "workspace-write"}})
 	defer p.Close()
 
 	if _, err := p.Complete(context.Background(), llm.CompletionRequest{
@@ -270,7 +336,7 @@ func TestComplete_ExtraArgsForwarded(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("Complete: %v", err)
 	}
-	args := readSidecar(t, script, "args.txt")
+	args := fake.sidecar(t, "args.txt")
 	if !strings.Contains(args, "workspace-write") {
 		t.Errorf("args missing forwarded extra arg:\n%s", args)
 	}
@@ -302,16 +368,21 @@ func TestBuildPrompt_NoSystem(t *testing.T) {
 	}
 }
 
-// Sanity check: the test helper itself can run a child process.
-func TestHelper_FakeScriptIsExecutable(t *testing.T) {
-	script := fakeCodex(t, "", fakeOpts{stdout: "alive"})
-	cmd := exec.Command(script, "ping")
+// Sanity check on the harness itself: re-execing the test binary really does
+// impersonate the CLI, on every OS. If this fails, every other subprocess
+// test in this file is testing nothing.
+func TestHelper_FakeCLIIsExecutable(t *testing.T) {
+	fake := fakeCodex(t, "", fakeOpts{Stdout: "alive"})
+	cmd := exec.Command(fake.binary, "ping")
 	cmd.Stdin = strings.NewReader("")
 	out, err := cmd.Output()
 	if err != nil {
-		t.Skipf("cannot exec fake script: %v", err)
+		t.Fatalf("exec fake CLI: %v", err)
 	}
 	if !strings.Contains(string(out), "alive") {
 		t.Errorf("output=%q", out)
+	}
+	if args := fake.sidecar(t, "args.txt"); args != "ping\n" {
+		t.Errorf("args=%q, want \"ping\\n\"", args)
 	}
 }

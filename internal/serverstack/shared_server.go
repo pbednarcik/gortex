@@ -24,6 +24,7 @@ import (
 	gortexmcp "github.com/zzet/gortex/internal/mcp"
 	"github.com/zzet/gortex/internal/parser"
 	"github.com/zzet/gortex/internal/parser/languages"
+	"github.com/zzet/gortex/internal/persistence"
 	"github.com/zzet/gortex/internal/platform"
 	"github.com/zzet/gortex/internal/query"
 	"github.com/zzet/gortex/internal/savings"
@@ -158,13 +159,30 @@ type SharedServer struct {
 	LSPRouter           *lsp.Router
 
 	cleanup []func() // run LIFO by Close (backend close, savings flush).
+	// sidecarPaths are the sidecar databases this stack caused to be
+	// opened — the side stores and the savings ledger. They are released
+	// after the teardown chain, not inside it.
+	sidecarPaths []string
 }
 
-// Close runs the teardown chain LIFO.
+// Close runs the teardown chain LIFO, then releases every sidecar database
+// the stack opened.
+//
+// The sidecar handles go last, outside the chain: every cleanup step that
+// might still write a note, a memory or a saving has finished by then.
+// Leaving them open pins the sidecar files for the life of the process,
+// which the daemon can afford and a one-shot stack cannot — on Windows an
+// open file cannot be deleted, so the directory holding it survives
+// teardown. persistence.CloseSidecar is a no-op for a path nothing opened,
+// so listing a store that stayed in memory costs nothing.
 func (s *SharedServer) Close() error {
 	for i := len(s.cleanup) - 1; i >= 0; i-- {
 		s.cleanup[i]()
 	}
+	for _, path := range s.sidecarPaths {
+		_ = persistence.CloseSidecar(path)
+	}
+	s.sidecarPaths = nil
 	return nil
 }
 
@@ -728,12 +746,25 @@ func NewSharedServer(cfg SharedServerConfig) (*SharedServer, error) {
 	// Side-stores. The HTTP path previously wired NONE of these; routing it
 	// through the shared constructor adds notes/memories/savings to it.
 	sideCfg := cfg.SideStores
+	// Every side store resolves its dir to <dir>/sidecar.sqlite and holds
+	// that handle open; record the files so Close can release them.
+	for _, dir := range []string{sideCfg.NotesDir, sideCfg.FeedbackDir} {
+		if dir != "" {
+			s.sidecarPaths = append(s.sidecarPaths, persistence.DefaultSidecarPath(dir))
+		}
+	}
 	srv.InitFeedback(sideCfg.FeedbackDir, sideCfg.FeedbackRepo)
 	srv.InitNotes(sideCfg.NotesDir, sideCfg.NotesRepo)
 	// Learned tool surface: re-promote tools this workspace promoted in
 	// prior sessions (demoting the ones that fell out of use). Runs after
 	// the NewServer register sweep, so the cold tools are already deferred.
 	srv.InitLearnedTools(sideCfg.NotesDir, sideCfg.NotesRepo)
+	// InitMemories opens a second store the SideStores dirs do not name: the
+	// user-level global memories, always mounted at platform.MemoriesDir()
+	// even when this stack configured no side-store dirs at all. Its sidecar
+	// handle is as durable as the others, so record it here or a stack whose
+	// SideStores are empty still leaves one file open at Close.
+	s.sidecarPaths = append(s.sidecarPaths, persistence.DefaultSidecarPath(platform.MemoriesDir()))
 	srv.InitMemories(sideCfg.NotesDir, sideCfg.NotesRepo)
 	srv.InitSuppressions(sideCfg.NotesDir, sideCfg.NotesRepo)
 	srv.InitNotebook(sideCfg.NotebookPath)
@@ -757,6 +788,7 @@ func NewSharedServer(cfg SharedServerConfig) (*SharedServer, error) {
 			logger.Warn("serverstack: legacy savings import failed", zap.Error(ierr))
 		}
 		srv.InitSavings(savingsStore, cfg.SavingsRepo)
+		s.sidecarPaths = append(s.sidecarPaths, savingsPath)
 		s.cleanup = append(s.cleanup, func() { _ = srv.FlushSavings() })
 	} else {
 		logger.Warn("serverstack: savings persistence disabled", zap.Error(err))

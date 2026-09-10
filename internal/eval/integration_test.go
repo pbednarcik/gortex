@@ -7,6 +7,7 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/mark3labs/mcp-go/mcp"
 	mcpserver "github.com/mark3labs/mcp-go/server"
@@ -63,6 +64,14 @@ func TestEvalServerLifecycle(t *testing.T) {
 
 	logger := zap.NewNop()
 	handler := NewHandler(srv, g, "0.1.0-test", logger)
+	// Uptime is reported from the handler's start instant, so backdate it
+	// rather than race the clock for a positive reading. Windows advances
+	// the runtime's monotonic clock in ~0.5-15.6 ms ticks, and a handler
+	// this test builds microseconds before the request still lands inside
+	// the tick it started in: time.Since returns exactly 0 there and the
+	// old "> 0" assertion failed on a correct handler.
+	const uptime = 3 * time.Second
+	handler.SetStartTimeForTest(time.Now().Add(-uptime))
 
 	// --- Start: use httptest.NewServer for a real HTTP server ---
 	ts := httptest.NewServer(handler)
@@ -87,7 +96,7 @@ func TestEvalServerLifecycle(t *testing.T) {
 		assert.Equal(t, 2, health.Nodes)
 		assert.Equal(t, 1, health.Edges)
 		assert.Equal(t, "0.1.0-test", health.Version)
-		assert.Greater(t, health.UptimeSeconds, float64(0))
+		assert.GreaterOrEqual(t, health.UptimeSeconds, uptime.Seconds())
 	})
 
 	// --- Step 2: Tool call (echo) ---

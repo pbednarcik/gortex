@@ -60,12 +60,22 @@ func KillProcess(pid int) error {
 	return p.Kill()
 }
 
-// DetachSysProcAttr returns the SysProcAttr that fully detaches a
-// spawned child: a new process group, so a Ctrl-C in the parent console
-// isn't forwarded, plus DETACHED_PROCESS so the child runs with no
-// inherited console.
+// DetachSysProcAttr returns the SysProcAttr that detaches a spawned child
+// from the parent's console: a new process group, so a Ctrl-C in the
+// parent console isn't forwarded, plus CREATE_NO_WINDOW so the child owns
+// a console of its own that has no window.
+//
+// Not DETACHED_PROCESS. A console-less daemon makes Windows allocate a
+// fresh, visible console for every console child that does not opt out —
+// and the children that cannot opt out are the ones spawned by code we
+// don't own: go/packages runs `go list` / `go env` through x/tools' own
+// exec.Command, which never sets HideWindow, so a Go repository's
+// enrichment popped a blank go.exe window per invocation (issue #783).
+// ConfigureBackgroundCommand covers the spawns we construct ourselves;
+// this covers everything underneath them, because a windowless console is
+// inherited by every descendant. The two flags are mutually exclusive.
 func DetachSysProcAttr() *syscall.SysProcAttr {
 	return &syscall.SysProcAttr{
-		CreationFlags: windows.CREATE_NEW_PROCESS_GROUP | windows.DETACHED_PROCESS,
+		CreationFlags: windows.CREATE_NEW_PROCESS_GROUP | windows.CREATE_NO_WINDOW,
 	}
 }

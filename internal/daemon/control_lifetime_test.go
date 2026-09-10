@@ -5,7 +5,6 @@ import (
 	"encoding/json"
 	"errors"
 	"net"
-	"os"
 	"path/filepath"
 	"testing"
 	"time"
@@ -13,6 +12,8 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"go.uber.org/zap"
+
+	"github.com/zzet/gortex/internal/testenv"
 )
 
 // blockingController blocks Status (and Shutdown) until released, standing in
@@ -215,9 +216,7 @@ func silentDaemon(t *testing.T) string {
 // at ~104 bytes and t.TempDir() with a long test name blows past it.
 func listenShort(t *testing.T) net.Listener {
 	t.Helper()
-	dir, err := os.MkdirTemp("/tmp", "gx")
-	require.NoError(t, err)
-	t.Cleanup(func() { _ = os.RemoveAll(dir) })
+	dir := testenv.ShortTempDir(t)
 	ln, err := net.Listen("unix", filepath.Join(dir, "s"))
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = ln.Close() })

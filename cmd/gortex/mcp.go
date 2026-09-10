@@ -171,8 +171,15 @@ func reapStaleEmbeddedStores(logger *zap.Logger) {
 			// Owned by a live one-shot server — nothing to reap here.
 			continue
 		}
-		rmErr := os.RemoveAll(dir)
+		// TryLock created (or reopened) the lock file INSIDE dir, and
+		// Windows refuses to delete a file that is still open — leaving the
+		// handle up until after RemoveAll makes the reap a silent no-op
+		// there. Unlock closes the handle, and releasing early is safe: a
+		// store directory is never adopted, only freshly created by
+		// newEmbeddedStorePath, so the only racer is another reaper, whose
+		// RemoveAll on an already-removed directory succeeds.
 		_ = lock.Unlock()
+		rmErr := os.RemoveAll(dir)
 		if rmErr != nil {
 			logger.Debug("mcp: could not reap stale embedded store", zap.String("dir", dir), zap.Error(rmErr))
 			continue

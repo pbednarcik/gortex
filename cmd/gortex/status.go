@@ -124,6 +124,10 @@ func runStatusViaDaemon(cmd *cobra.Command) error {
 			suffix = "MISSING — path no longer exists on disk"
 		case r.Unloaded:
 			suffix = "(not indexed — tracked in config, no index held)"
+		case r.IndexHealthError != "":
+			suffix = "DEGRADED — file indexing health unavailable"
+		case r.FailedFiles > 0:
+			suffix = fmt.Sprintf("DEGRADED — %d failed files (%d unreadable)", r.FailedFiles, r.UnreadableFiles)
 		case repoIndexIsEmpty(r):
 			suffix = "EMPTY — indexed 0 files; no parsable source, or an ignore rule excluded all of it"
 		}
@@ -139,6 +143,7 @@ func runStatusViaDaemon(cmd *cobra.Command) error {
 	}
 	renderMissingRepoWarning(w, st.TrackedRepos)
 	renderEmptyIndexWarning(w, st.TrackedRepos)
+	renderIndexFailureWarning(w, st.TrackedRepos)
 	return nil
 }
 

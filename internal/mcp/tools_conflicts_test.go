@@ -3,7 +3,6 @@ package mcp
 import (
 	"context"
 	"encoding/json"
-	"path/filepath"
 	"strconv"
 	"testing"
 
@@ -127,17 +126,14 @@ func TestCommunityConflicts_EmptyCommunityIDsIgnored(t *testing.T) {
 func conflictsTestServer(t *testing.T) (*Server, string, string) {
 	t.Helper()
 	g := graph.New()
-	// The returned names are the forge spelling a caller supplies; the graph
-	// keys use native separators, which is what the indexer writes even with
-	// no repo prefix.
+	// The forge spelling a caller supplies and the graph key are the same
+	// string: graph paths are '/'-joined on every platform.
 	fileA := "internal/a/svc.go"
 	fileB := "internal/b/svc.go"
-	storedA := filepath.FromSlash(fileA)
-	storedB := filepath.FromSlash(fileB)
-	idA := storedA + "::DoA"
-	idB := storedB + "::DoB"
-	g.AddNode(&graph.Node{ID: idA, Kind: graph.KindFunction, Name: "DoA", FilePath: storedA, StartLine: 1, EndLine: 5})
-	g.AddNode(&graph.Node{ID: idB, Kind: graph.KindFunction, Name: "DoB", FilePath: storedB, StartLine: 1, EndLine: 5})
+	idA := fileA + "::DoA"
+	idB := fileB + "::DoB"
+	g.AddNode(&graph.Node{ID: idA, Kind: graph.KindFunction, Name: "DoA", FilePath: fileA, StartLine: 1, EndLine: 5})
+	g.AddNode(&graph.Node{ID: idB, Kind: graph.KindFunction, Name: "DoB", FilePath: fileB, StartLine: 1, EndLine: 5})
 
 	srv := NewServer(query.NewEngine(g), g, nil, nil, zap.NewNop(), nil)
 	installCommunitiesForTest(srv, &analysis.CommunityResult{
@@ -264,11 +260,9 @@ func conflictsBudgetServer(t *testing.T) (*Server, map[string][]string, []forge.
 		for p := 0; p < 2; p++ {
 			prNum := c*2 + p + 1
 			file := "internal/x/" + comm + "_" + string(rune('a'+p)) + ".go"
-			// Same split as conflictsTestServer: supplied in the forge
-			// spelling, stored with native separators.
-			stored := filepath.FromSlash(file)
-			id := stored + "::F"
-			g.AddNode(&graph.Node{ID: id, Kind: graph.KindFunction, Name: "F", FilePath: stored, StartLine: 1, EndLine: 3})
+			// Same as conflictsTestServer: the forge spelling IS the graph key.
+			id := file + "::F"
+			g.AddNode(&graph.Node{ID: id, Kind: graph.KindFunction, Name: "F", FilePath: file, StartLine: 1, EndLine: 3})
 			nodeToComm[id] = comm
 			members3[c] = append(members3[c], id)
 			files[strconv.Itoa(prNum)] = []string{file}

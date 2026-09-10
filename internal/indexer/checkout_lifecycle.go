@@ -152,6 +152,15 @@ type CheckoutLifecycle struct {
 	// crash residue unless a process-local payload flight has adopted it.
 	buildingRecoveryCutoff int64
 
+	// observationMu bounds and coalesces first-request metadata work. Jobs
+	// belong to this lifecycle, not whichever request first waits for them.
+	observationMu     sync.Mutex
+	observationJobs   map[string]*checkoutObservationJob
+	observationWG     sync.WaitGroup
+	observationClosed bool
+	// observationInventory is a test-only latency seam; set before any jobs.
+	observationInventory func(context.Context, string) (*gitstate.FamilyInventory, error)
+
 	// retryMu owns one deadline timer per family. Filesystem events start the
 	// grace; these timers guarantee its expiry is reconciled even when Git is
 	// otherwise quiet. retryClosing rejects new timer and callback admission
@@ -276,18 +285,18 @@ func NewCheckoutLifecycle(cfg CheckoutLifecycleConfig) (*CheckoutLifecycle, erro
 		now:                    now,
 		buildingRecoveryCutoff: now().Unix(),
 		leases:                 cfg.ViewLeases,
-		coordinators:          map[string]*CheckoutCoordinator{},
-		coordinatorHeads:      map[string]checkoutHeadIdentity{},
-		coordinatorActivating: map[string]struct{}{},
-		initialInventoryTaken: map[string]bool{},
-		started:               map[string][]*CheckoutCoordinator{},
-		owed:                  map[int64]struct{}{},
-		familyRetries:     map[string]familyRetry{},
-		refViewRetention:  cfg.RefViews.withDefaults(),
-		indexBarrier:      cfg.indexBarrier,
-		transitionCtx:     transitionCtx,
-		cancelTransitions: cancelTransitions,
-		transitionRuns:    map[string]*modeTransitionRun{},
+		coordinators:           map[string]*CheckoutCoordinator{},
+		coordinatorHeads:       map[string]checkoutHeadIdentity{},
+		coordinatorActivating:  map[string]struct{}{},
+		initialInventoryTaken:  map[string]bool{},
+		started:                map[string][]*CheckoutCoordinator{},
+		owed:                   map[int64]struct{}{},
+		familyRetries:          map[string]familyRetry{},
+		refViewRetention:       cfg.RefViews.withDefaults(),
+		indexBarrier:           cfg.indexBarrier,
+		transitionCtx:          transitionCtx,
+		cancelTransitions:      cancelTransitions,
+		transitionRuns:         map[string]*modeTransitionRun{},
 	}
 	// The env override wins over the config-file setting either way, so a
 	// worktree-heavy tree can opt every discovered worktree into dormancy — or
@@ -1676,6 +1685,7 @@ func (l *CheckoutLifecycle) ActivateCheckout(checkoutID, reason string) bool {
 	// closing or the id is empty (nudgeCheckout's fallback relies on false).
 	started, already := l.beginCheckoutActivation(checkoutID)
 	if already {
+		l.prioritizeCheckout(checkoutID)
 		return true
 	}
 	if !started {
@@ -1685,6 +1695,29 @@ func (l *CheckoutLifecycle) ActivateCheckout(checkoutID, reason string) bool {
 		zap.String("checkout", checkoutID), zap.String("reason", reason))
 	go l.activateCheckout(l.transitionCtx, checkoutID)
 	return true
+}
+
+// prioritizeCheckout reaches both registered loops and transition-owned loops
+// that have started but are not installed yet. Selection changes only their
+// admission priority; no registry lock is held while touching a coordinator.
+func (l *CheckoutLifecycle) prioritizeCheckout(checkoutID string) {
+	l.coordMu.Lock()
+	if l.coordinatorClosing {
+		l.coordMu.Unlock()
+		return
+	}
+	coordinator := l.coordinators[checkoutID]
+	if coordinator == nil || !coordinator.Running() {
+		coordinator = nil
+		for _, candidate := range l.started[checkoutID] {
+			if candidate.Running() {
+				coordinator = candidate
+				break
+			}
+		}
+	}
+	l.coordMu.Unlock()
+	coordinator.PrioritizeSelection()
 }
 
 // beginCheckoutActivation admits one activation. It returns (true, false) when
@@ -1752,6 +1785,7 @@ func (l *CheckoutLifecycle) activateCheckout(ctx context.Context, checkoutID str
 	// coordinator's quiet window and delay that build — the same starvation
 	// ActivateCheckout avoids on a live coordinator.
 	l.ensureCoordinator(ctx, primary.GraphID, checkout)
+	l.prioritizeCheckout(checkoutID)
 }
 
 // ensureCoordinator brings up the coordinator for one automatic checkout, or
@@ -2093,6 +2127,7 @@ func (l *CheckoutLifecycle) Close() error {
 	if l == nil {
 		return nil
 	}
+	l.closeCheckoutObservations()
 	l.transitionMu.Lock()
 	if !l.transitionClosed {
 		l.transitionClosed = true

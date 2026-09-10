@@ -5,6 +5,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"runtime"
 	"sort"
 	"strings"
 	"testing"
@@ -226,6 +227,12 @@ func TestEmitPluginBundle_HookHandlerExecBit(t *testing.T) {
 	info, err := os.Stat(filepath.Join(dir, "hooks-handlers", "gortex-hook.sh"))
 	if err != nil {
 		t.Fatal(err)
+	}
+	if runtime.GOOS == "windows" {
+		// NTFS carries no POSIX permission bits: os.Chmod there only
+		// toggles the read-only attribute and every file reports 0666.
+		// The bundle still has to be emitted, which the Stat above pins.
+		return
 	}
 	if info.Mode()&0o111 == 0 {
 		t.Errorf("hooks-handlers/gortex-hook.sh should be executable (mode=%v)", info.Mode())

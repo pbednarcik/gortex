@@ -28,12 +28,12 @@ func TestHandleExternalAgent_SessionStartEmitsOrientation(t *testing.T) {
 	withFakeStatus(t, func() (*daemon.StatusResponse, error) {
 		return &daemon.StatusResponse{
 			Version: "1.0.0", Ready: true,
-			TrackedRepos: []daemon.TrackedRepoStatus{{Name: "repo", Path: "/tmp/repo", Workspace: "repo", Nodes: 10}},
+			TrackedRepos: []daemon.TrackedRepoStatus{{Name: "repo", Path: repoTmpFixtureRoot, Workspace: "repo", Nodes: 10}},
 			Workspaces:   []daemon.WorkspaceSummary{{Slug: "repo"}},
 		}, nil
 	})
 	out := captureStdout(t, func() {
-		handleExternalAgent([]byte(`{"hook_event_name":"SessionStart","cwd":"/tmp/repo"}`))
+		handleExternalAgent(mustJSON(t, map[string]any{"hook_event_name": "SessionStart", "cwd": repoTmpFixtureRoot}))
 	})
 	var payload HookOutput
 	if err := json.Unmarshal([]byte(out), &payload); err != nil {
@@ -52,7 +52,7 @@ func TestHandleExternalAgent_AfterToolDaemonDown(t *testing.T) {
 		return nil, errDaemonUnreachable
 	})
 	out := captureStdout(t, func() {
-		handleExternalAgent([]byte(`{"hook_event_name":"AfterTool","tool_name":"run_shell_command","cwd":"/tmp/repo"}`))
+		handleExternalAgent(mustJSON(t, map[string]any{"hook_event_name": "AfterTool", "tool_name": "run_shell_command", "cwd": repoTmpFixtureRoot}))
 	})
 	var payload HookOutput
 	if err := json.Unmarshal([]byte(out), &payload); err != nil {
@@ -71,11 +71,11 @@ func TestHandleExternalAgent_AfterToolQuietWhenReadyAndCovered(t *testing.T) {
 	withFakeStatus(t, func() (*daemon.StatusResponse, error) {
 		return &daemon.StatusResponse{
 			Ready:        true,
-			TrackedRepos: []daemon.TrackedRepoStatus{{Name: "repo", Path: "/tmp/repo"}},
+			TrackedRepos: []daemon.TrackedRepoStatus{{Name: "repo", Path: repoTmpFixtureRoot}},
 		}, nil
 	})
 	out := captureStdout(t, func() {
-		handleExternalAgent([]byte(`{"hook_event_name":"AfterTool","cwd":"/tmp/repo"}`))
+		handleExternalAgent(mustJSON(t, map[string]any{"hook_event_name": "AfterTool", "cwd": repoTmpFixtureRoot}))
 	})
 	if strings.TrimSpace(out) != "" {
 		t.Errorf("AfterTool should stay quiet when the graph is fresh and the cwd is covered, got:\n%s", out)
@@ -86,11 +86,11 @@ func TestHandleExternalAgent_AfterToolHintsUncoveredCwd(t *testing.T) {
 	withFakeStatus(t, func() (*daemon.StatusResponse, error) {
 		return &daemon.StatusResponse{
 			Ready:        true,
-			TrackedRepos: []daemon.TrackedRepoStatus{{Name: "other", Path: "/some/other/repo"}},
+			TrackedRepos: []daemon.TrackedRepoStatus{{Name: "other", Path: fixtureAbs("/some/other/repo")}},
 		}, nil
 	})
 	out := captureStdout(t, func() {
-		handleExternalAgent([]byte(`{"hook_event_name":"AfterTool","cwd":"/tmp/untracked"}`))
+		handleExternalAgent(mustJSON(t, map[string]any{"hook_event_name": "AfterTool", "cwd": fixtureAbs("/tmp/untracked")}))
 	})
 	if !strings.Contains(out, "is not tracked") {
 		t.Errorf("expected an untracked-cwd hint, got:\n%s", out)

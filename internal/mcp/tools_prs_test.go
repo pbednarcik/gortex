@@ -4,7 +4,6 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"path/filepath"
 	"strconv"
 	"testing"
 
@@ -25,15 +24,12 @@ import (
 func prToolsTestServer(t *testing.T) (*Server, string) {
 	t.Helper()
 	g := graph.New()
-	// `file` is the forge/git spelling a caller supplies; `stored` is what the
-	// indexer writes, which uses native separators even with no repo prefix.
-	// Hard-coding the '/' form as the graph key describes an index a Windows
-	// daemon never produces, and the join contract then cannot be observed.
+	// The forge/git spelling a caller supplies and the key the indexer writes
+	// are the same string: graph paths are '/'-joined on every platform.
 	file := "internal/auth/login.go"
-	stored := filepath.FromSlash(file)
-	hubID := stored + "::ValidateToken"
-	g.AddNode(&graph.Node{ID: hubID, Kind: graph.KindFunction, Name: "ValidateToken", FilePath: stored, StartLine: 1, EndLine: 10})
-	callerFile := filepath.FromSlash("pkg/c.go")
+	hubID := file + "::ValidateToken"
+	g.AddNode(&graph.Node{ID: hubID, Kind: graph.KindFunction, Name: "ValidateToken", FilePath: file, StartLine: 1, EndLine: 10})
+	const callerFile = "pkg/c.go"
 	for i := 0; i < 12; i++ {
 		cid := callerFile + "::caller" + strconv.Itoa(i)
 		g.AddNode(&graph.Node{ID: cid, Kind: graph.KindFunction, Name: "caller" + strconv.Itoa(i), FilePath: callerFile})
@@ -189,11 +185,9 @@ func TestGetPRImpact_RequiresNumber(t *testing.T) {
 // stay raw-first for unprefixed graphs, and never double-prefix.
 func TestChangedSymbolsForFiles_RepoPrefixJoin(t *testing.T) {
 	g := graph.New()
-	// The graph keys a file as "<prefix>/" + the remainder in the indexing
-	// machine's native separators (see internal/graphpath), so the fixture is
-	// built that way. Hard-coding the '/'-joined form describes a key a
-	// Windows daemon never produces.
-	prefixedFile := "myrepo/" + filepath.FromSlash("internal/auth/login.go")
+	// The graph keys a file as "<prefix>/" + the remainder, forward-slashed
+	// throughout on every platform, so the fixture is built that way.
+	const prefixedFile = "myrepo/internal/auth/login.go"
 	prefixedID := prefixedFile + "::ValidateToken"
 	g.AddNode(&graph.Node{ID: prefixedID, Kind: graph.KindFunction, Name: "ValidateToken", FilePath: prefixedFile, StartLine: 1, EndLine: 10})
 	srv := NewServer(query.NewEngine(g), g, nil, nil, zap.NewNop(), nil)
@@ -213,7 +207,7 @@ func TestChangedSymbolsForFiles_RepoPrefixJoin(t *testing.T) {
 	// prefixed is still prefixed: it names the nested file, not the
 	// same-named top-level one. Treating it as already-keyed used to
 	// resolve the wrong file — or, with no shadow present, nothing at all.
-	shadowFile := "myrepo/" + filepath.FromSlash("myrepo/internal/auth/login.go")
+	const shadowFile = "myrepo/myrepo/internal/auth/login.go"
 	g.AddNode(&graph.Node{ID: shadowFile + "::Nested", Kind: graph.KindFunction, Name: "Nested", FilePath: shadowFile, StartLine: 1, EndLine: 10})
 	_, nodes = srv.changedSymbolsForFiles(context.Background(), "myrepo", []string{"myrepo/internal/auth/login.go"})
 	require.Len(t, nodes, 1)

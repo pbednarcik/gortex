@@ -5,6 +5,7 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"path"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -376,9 +377,18 @@ func parseLineAnswer(out string) (int, bool) {
 
 // cleanPath normalises a path the same way the diff parser keys files, so a
 // caller-supplied path joins the ChangeView map.
+//
+// Review paths are a '/'-separated contract end to end: they come out of a
+// git diff header, they key the ChangeView, and they are rendered verbatim
+// into finding rows, the verification command and forge comment APIs. The
+// clean is therefore path.Clean over the slash spelling — filepath.Clean
+// would rewrite "internal/svc/handler.go" to "internal\svc\handler.go" on
+// Windows and both split the map keys and leak backslashes into the report.
+// filepath.ToSlash is the identity on POSIX, where a backslash is an
+// ordinary filename byte.
 func cleanPath(p string) string {
 	p = strings.TrimPrefix(p, "./")
-	return filepath.Clean(p)
+	return path.Clean(filepath.ToSlash(p))
 }
 
 // --- diff parsing (local, covers both sides) ---

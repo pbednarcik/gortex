@@ -49,6 +49,7 @@ type preparedExtraction struct {
 // fileDeltaProbe exposes phase timings and the three delta boundaries used by
 // the watcher: metadata-only, artifact-only, and semantic topology.
 type fileDeltaProbe struct {
+	readErr         error
 	fingerprints    fileDeltaFingerprints
 	derived         derivedFingerprints
 	read            time.Duration
@@ -90,6 +91,7 @@ func (idx *Indexer) prepareFileDeltaWithAdmission(filePath string, tryOnly bool)
 	} else {
 		parseLease, err = idx.acquireSharedParsePath(absPath)
 		if err != nil {
+			probe.readErr = err
 			return probe, false, false
 		}
 	}
@@ -104,17 +106,18 @@ func (idx *Indexer) prepareFileDeltaWithAdmission(filePath string, tryOnly bool)
 			parseLease.Release()
 		}
 	}()
-	// graphRelKey, not relKey: this path is stamped onto node IDs by the
-	// extractor below and becomes the graph key at prefixPath(). relKey
-	// slash-normalises, which on Windows mints "repo/a/b.go" while the
-	// cold walk already stored "repo/a\b.go" — a second node for the
-	// same file rather than an update of the first.
-	relPath := idx.graphRelKey(absPath)
+	// relKey: this path is stamped onto node IDs by the extractor below
+	// and becomes the graph key at prefixPath(), so it must be the same
+	// slash-separated spelling the cold walk stamped. A native-separator
+	// key would mint a second node for the same file on Windows rather
+	// than an update of the first.
+	relPath := idx.relKey(absPath)
 
 	started := time.Now()
 	src, readVersion, err := idx.readFileWithVersion(absPath)
 	probe.read = time.Since(started)
 	if err != nil {
+		probe.readErr = err
 		return probe, false, false
 	}
 	lang, ok := idx.effectiveLanguage(absPath, src)
@@ -581,15 +584,15 @@ func extractionFingerprints(result *parser.ExtractionResult) (fileDeltaFingerpri
 		}
 	}
 	return fileDeltaFingerprints{
-		metadata: stableFingerprintDigests(metadataRows),
-		semantic: stableFingerprintDigests(semanticRows),
-		core:     stableFingerprintDigests(coreRows),
-	}, derivedFingerprints{
-		declarations: stableFingerprintDigests(declarations),
-		imports:      stableFingerprintDigests(imports),
-		runtime:      stableFingerprintDigests(runtimeRows),
-		artifacts:    stableFingerprintDigests(artifacts),
-	}, true
+			metadata: stableFingerprintDigests(metadataRows),
+			semantic: stableFingerprintDigests(semanticRows),
+			core:     stableFingerprintDigests(coreRows),
+		}, derivedFingerprints{
+			declarations: stableFingerprintDigests(declarations),
+			imports:      stableFingerprintDigests(imports),
+			runtime:      stableFingerprintDigests(runtimeRows),
+			artifacts:    stableFingerprintDigests(artifacts),
+		}, true
 }
 
 func stampExtractionGraphFingerprints(result *parser.ExtractionResult, fingerprints fileDeltaFingerprints) {

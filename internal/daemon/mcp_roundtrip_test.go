@@ -4,7 +4,6 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"os"
 	"path/filepath"
 	"testing"
 	"time"
@@ -12,6 +11,8 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"go.uber.org/zap"
+
+	"github.com/zzet/gortex/internal/testenv"
 )
 
 // echoDispatcher returns a canned JSON-RPC response whenever a frame
@@ -47,9 +48,7 @@ func (e *echoDispatcher) Dispatch(_ context.Context, sess *Session, frame []byte
 // session context, response flows back to the proxy.
 func TestDaemon_MCPRoundTrip(t *testing.T) {
 	disp := &echoDispatcher{seen: make(chan echoFrame, 4)}
-	dir, err := os.MkdirTemp("/tmp", "gx")
-	require.NoError(t, err)
-	defer func() { _ = os.RemoveAll(dir) }()
+	dir := testenv.ShortTempDir(t)
 	socket := filepath.Join(dir, "s")
 	t.Setenv("GORTEX_DAEMON_SOCKET", socket)
 	t.Setenv("GORTEX_DAEMON_PIDFILE", filepath.Join(dir, "p"))
@@ -102,9 +101,7 @@ func TestDaemon_MCPRoundTrip(t *testing.T) {
 // cleanly when no dispatcher is attached — caller sees a JSON-RPC
 // error frame rather than a hang or a broken connection.
 func TestDaemon_MCPNoDispatcher(t *testing.T) {
-	dir, err := os.MkdirTemp("/tmp", "gx")
-	require.NoError(t, err)
-	defer func() { _ = os.RemoveAll(dir) }()
+	dir := testenv.ShortTempDir(t)
 	socket := filepath.Join(dir, "s")
 	t.Setenv("GORTEX_DAEMON_SOCKET", socket)
 	t.Setenv("GORTEX_DAEMON_PIDFILE", filepath.Join(dir, "p"))
@@ -155,9 +152,7 @@ func (h *hookDispatcher) SessionEnded(sess *Session) {
 // closes its connection. Without this, per-session state allocated in
 // the dispatcher would leak for the daemon's lifetime.
 func TestDaemon_SessionEndedHook_FiresOnDisconnect(t *testing.T) {
-	dir, err := os.MkdirTemp("/tmp", "gx")
-	require.NoError(t, err)
-	defer func() { _ = os.RemoveAll(dir) }()
+	dir := testenv.ShortTempDir(t)
 	socket := filepath.Join(dir, "s")
 	t.Setenv("GORTEX_DAEMON_SOCKET", socket)
 	t.Setenv("GORTEX_DAEMON_PIDFILE", filepath.Join(dir, "p"))
@@ -205,9 +200,7 @@ func (p *pushDispatcher) SessionStarted(_ *Session, write func([]byte) error) {
 // pending request — the transport leg that lets tools/list_changed
 // (and every other MCP push) reach unix-socket proxy clients.
 func TestDaemon_SessionStartedHook_PushesFrames(t *testing.T) {
-	dir, err := os.MkdirTemp("/tmp", "gx")
-	require.NoError(t, err)
-	defer func() { _ = os.RemoveAll(dir) }()
+	dir := testenv.ShortTempDir(t)
 	socket := filepath.Join(dir, "s")
 	t.Setenv("GORTEX_DAEMON_SOCKET", socket)
 	t.Setenv("GORTEX_DAEMON_PIDFILE", filepath.Join(dir, "p"))

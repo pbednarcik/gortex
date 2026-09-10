@@ -239,13 +239,12 @@ func ShouldFallBackToEmbedded(err error) bool {
 // broken." We treat connection-refused, no-such-file, and timeout as
 // "unavailable" because spinning up the daemon or falling back is the
 // right answer to all three.
+//
+// The errno set is per-platform (unavailableDialErrnos): Winsock reports its
+// own refusal code, which shares no value with the POSIX name.
 func isNoDaemonErr(err error) bool {
-	var se syscall.Errno
-	if errors.As(err, &se) {
-		switch se {
-		case syscall.ECONNREFUSED, syscall.ENOENT:
-			return true
-		}
+	if isUnavailableDialErrno(err) {
+		return true
 	}
 	var ne net.Error
 	if errors.As(err, &ne) && ne.Timeout() {
@@ -254,8 +253,21 @@ func isNoDaemonErr(err error) bool {
 	// net.OpError wrapping "no such file or directory" is how Go reports
 	// a missing socket path on some platforms.
 	var op *net.OpError
-	if errors.As(err, &op) {
-		if errors.Is(op.Err, syscall.ECONNREFUSED) || errors.Is(op.Err, syscall.ENOENT) {
+	if errors.As(err, &op) && isUnavailableDialErrno(op.Err) {
+		return true
+	}
+	return false
+}
+
+// isUnavailableDialErrno reports whether err carries (at any depth) an errno
+// this platform uses for "nothing is listening there".
+func isUnavailableDialErrno(err error) bool {
+	var se syscall.Errno
+	if !errors.As(err, &se) {
+		return false
+	}
+	for _, candidate := range unavailableDialErrnos {
+		if se == candidate {
 			return true
 		}
 	}

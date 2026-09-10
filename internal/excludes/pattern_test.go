@@ -1,6 +1,9 @@
 package excludes
 
-import "testing"
+import (
+	"runtime"
+	"testing"
+)
 
 // The regression this whole file exists for: pandas' .gitignore carries
 // "*$" on line 7 as an Emacs autosave pattern. go-gitignore used to
@@ -63,11 +66,18 @@ func TestMatcher_RegexOnlyMetacharactersAreLiteral(t *testing.T) {
 // go-gitignore discarded the error and dropped the line, so the ignore
 // silently stopped applying. Both must now be honoured as literal text.
 func TestMatcher_UncompilablePatternsStillApply(t *testing.T) {
-	cases := []struct{ pattern, excluded string }{
+	type patternCase struct{ pattern, excluded string }
+	cases := []patternCase{
 		{"lib[", "lib["},
 		{"build(", "build("},
 		{"a)b", "a)b"},
-		{"weird\\", "weird\\"},
+	}
+	// A trailing backslash is the fourth shape that failed to compile, but the
+	// file it names can only exist on a POSIX filesystem: on Windows "\" is the
+	// path separator, so MatchRel normalises "weird\" to the directory "weird"
+	// and there is no such filename left to exclude.
+	if runtime.GOOS != "windows" {
+		cases = append(cases, patternCase{"weird\\", "weird\\"})
 	}
 	for _, tc := range cases {
 		if !New([]string{tc.pattern}).MatchRel(tc.excluded) {

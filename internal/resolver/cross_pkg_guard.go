@@ -1,7 +1,6 @@
 package resolver
 
 import (
-	"path/filepath"
 	"sort"
 	"strings"
 
@@ -237,8 +236,8 @@ func (r *Resolver) targetImportReachable(callerFile string, callerNode, target *
 		// shown unreachable — leave the edge alone.
 		return true
 	}
-	callerDir := filepath.Dir(callerFile)
-	targetDir := filepath.Dir(target.FilePath)
+	callerDir := filePathDir(callerFile)
+	targetDir := filePathDir(target.FilePath)
 	if targetDir == callerDir {
 		return true
 	}
@@ -450,7 +449,7 @@ func (r *Resolver) buildImportClosureFiltered(repos map[string]struct{}) map[str
 	}
 	for file := range graph.FileNodeIdentitiesSeq(r.graph, repoPrefixes) {
 		if file.FilePath != "" && inScope(file.ID) {
-			add(file.FilePath, filepath.Dir(file.FilePath))
+			add(file.FilePath, filePathDir(file.FilePath))
 		}
 	}
 	// Materialise metadata-free import projections and batch-load only the
@@ -537,7 +536,7 @@ func (r *Resolver) buildImportClosureFiltered(repos map[string]struct{}) map[str
 		seen[file] = true
 		var dirs []string
 		for _, tf := range reexpTargets[file] {
-			dirs = append(dirs, filepath.Dir(tf))
+			dirs = append(dirs, filePathDir(tf))
 			dirs = append(dirs, barrelDirs(tf, seen)...)
 		}
 		barrelDirCache[file] = dirs
@@ -550,7 +549,7 @@ func (r *Resolver) buildImportClosureFiltered(repos map[string]struct{}) map[str
 			callerFile = from.FilePath
 		}
 		if target, ok := placements[e.To]; ok && target.FilePath != "" {
-			add(callerFile, filepath.Dir(target.FilePath))
+			add(callerFile, filePathDir(target.FilePath))
 			for _, d := range barrelDirs(target.FilePath, map[string]bool{}) {
 				add(callerFile, d)
 			}

@@ -45,7 +45,7 @@ func (s *Server) unindexedRenameRecovery(ctx context.Context, id, newName string
 		return nil
 	}
 
-	file := s.graphPathSpelling(relPath)
+	file := graphPathKey(relPath)
 	owner, relPath := s.indexerForRel(file)
 	if owner == nil || relPath == "" {
 		return nil

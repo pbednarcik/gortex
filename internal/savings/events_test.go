@@ -28,15 +28,19 @@ func appendLegacyEventLine(t *testing.T, path string, ev Event) {
 	}
 }
 
+// TestEventsPathFor asserts the sibling-path derivation. EventsPathFor
+// names a file on disk (never a '/'-separated graph key), so it builds
+// with filepath.Join and returns the host's native separators — the
+// fixtures are therefore spelled natively too.
 func TestEventsPathFor(t *testing.T) {
 	cases := []struct {
 		in   string
 		want string
 	}{
 		{"", ""},
-		{"/tmp/savings.json", "/tmp/savings.jsonl"},
-		{"/tmp/whatever.foo", "/tmp/whatever.jsonl"},
-		{"./bare", "bare.jsonl"},
+		{filepath.FromSlash("/cache/savings.json"), filepath.FromSlash("/cache/savings.jsonl")},
+		{filepath.FromSlash("/cache/whatever.foo"), filepath.FromSlash("/cache/whatever.jsonl")},
+		{filepath.FromSlash("./bare"), "bare.jsonl"},
 	}
 	for _, c := range cases {
 		got := EventsPathFor(c.in)

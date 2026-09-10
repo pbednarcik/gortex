@@ -5,6 +5,8 @@ import (
 	"path/filepath"
 	"runtime"
 	"testing"
+
+	"github.com/zzet/gortex/internal/testenv"
 )
 
 func TestCanonicalHasPathPrefixResolvesRootAndCWDAliases(t *testing.T) {
@@ -110,11 +112,7 @@ func TestCanonicalExistingRootDarwinTmpAlias(t *testing.T) {
 	if runtime.GOOS != "darwin" {
 		t.Skip("macOS /tmp alias regression")
 	}
-	root, err := os.MkdirTemp("/tmp", "gortex-pathkey-")
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { _ = os.RemoveAll(root) })
+	root := testenv.ShortTempDir(t)
 	want, err := filepath.EvalSymlinks(root)
 	if err != nil {
 		t.Fatal(err)

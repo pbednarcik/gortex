@@ -74,7 +74,12 @@ func DiscoverConfigFiles(root string) []string {
 			if rerr != nil {
 				rel = p
 			}
-			out = append(out, rel)
+			// Discovered paths are slash-separated: the entries above are
+			// slash-separated literals, and callers match them against that
+			// list and report them to agents. filepath.Rel hands back the
+			// native spelling, so a Windows walk would otherwise emit
+			// ".cursor\rules\foo.md" beside ".github/copilot-instructions.md".
+			out = append(out, filepath.ToSlash(rel))
 			return nil
 		})
 	}

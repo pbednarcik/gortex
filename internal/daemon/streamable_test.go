@@ -7,13 +7,14 @@ import (
 	"io"
 	"net"
 	"net/http"
-	"os"
 	"path/filepath"
 	"testing"
 	"time"
 
 	"github.com/stretchr/testify/require"
 	"go.uber.org/zap"
+
+	"github.com/zzet/gortex/internal/testenv"
 )
 
 // newDaemonNoServe is newDaemon's twin that stops short of calling
@@ -21,9 +22,7 @@ import (
 // HTTPHandler before the listener comes up.
 func newDaemonNoServe(t *testing.T, ctrl Controller) (*Server, string) {
 	t.Helper()
-	dir, err := os.MkdirTemp("/tmp", "gx")
-	require.NoError(t, err)
-	t.Cleanup(func() { _ = os.RemoveAll(dir) })
+	dir := testenv.ShortTempDir(t)
 
 	socket := filepath.Join(dir, "s")
 	t.Setenv("GORTEX_DAEMON_SOCKET", socket)

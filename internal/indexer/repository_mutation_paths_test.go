@@ -4,6 +4,7 @@ import (
 	"context"
 	"os"
 	"path/filepath"
+	"runtime"
 	"testing"
 
 	"github.com/stretchr/testify/require"
@@ -57,7 +58,16 @@ func TestCanonicalRepositoryMutationPathsValidation(t *testing.T) {
 
 	t.Run("invalid stat is rejected", func(t *testing.T) {
 		_, err := canonicalRepositoryMutationPaths(root, []string{"bad\x00.go"})
-		require.ErrorContains(t, err, "repository mutation stat")
+		// A NUL byte is rejected at a different stage per platform, and both
+		// stages are the caller-local refusal this pins. POSIX absolutises the
+		// path by string manipulation alone and only the stat syscall refuses
+		// it; Windows resolves through syscall.FullPath inside filepath.Abs,
+		// which rejects the NUL one step earlier.
+		want := "repository mutation stat"
+		if runtime.GOOS == "windows" {
+			want = "repository mutation path"
+		}
+		require.ErrorContains(t, err, want)
 	})
 }
 

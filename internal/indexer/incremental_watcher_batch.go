@@ -2,7 +2,6 @@ package indexer
 
 import (
 	"fmt"
-	"path/filepath"
 	"sort"
 	"strings"
 
@@ -246,7 +245,7 @@ func (idx *Indexer) incrementalEvictWatcherPath(path string) (nodesRemoved, edge
 	// Captured BEFORE eviction: deleting a global-usings file (or a
 	// csproj, which draws the unit boundaries) removes visibility every
 	// dependent's extension bind was narrowed under.
-	graphPath := idx.prefixPath(filepath.FromSlash(path))
+	graphPath := idx.prefixPath(path)
 	evictedGlobals := csharpVisibilityStampForNodes(idx.graph.GetFileNodes(graphPath)).globals != "" ||
 		strings.HasSuffix(strings.ToLower(graphPath), ".csproj")
 

@@ -7,6 +7,8 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"runtime"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -28,6 +30,8 @@ type teardownProbe struct {
 	watcherStops atomic.Int32
 	sharedCloses atomic.Int32
 	store        *store_sqlite.Store
+	closeOnce    sync.Once
+	closeErr     error
 }
 
 func newTeardownProbe(t *testing.T) *teardownProbe {
@@ -38,17 +42,30 @@ func newTeardownProbe(t *testing.T) *teardownProbe {
 	store.AddBatch([]*graph.Node{
 		{ID: "pkg/a.go::Alpha", Kind: graph.KindFunction, Name: "Alpha", FilePath: "pkg/a.go"},
 	}, nil)
-	return &teardownProbe{store: store}
+	p := &teardownProbe{store: store}
+	// A test that never reaches the teardown (an early skip, a failed
+	// assertion) would otherwise leave the sqlite handle open, and an open
+	// file cannot be deleted on Windows — t.TempDir's RemoveAll then fails
+	// the test that was already done.
+	t.Cleanup(func() { _ = p.closeStore() })
+	return p
 }
 
 func (p *teardownProbe) stopWatcher() { p.watcherStops.Add(1) }
+
+// closeStore closes the backing store at most once, so the cleanup safety net
+// and the teardown chain cannot both check-point a closed database.
+func (p *teardownProbe) closeStore() error {
+	p.closeOnce.Do(func() { p.closeErr = p.store.Close() })
+	return p.closeErr
+}
 
 // closeShared stands in for the shared stack's Close: it runs the backend
 // close that checkpoints the WAL. Closing an already-closed store is exactly
 // the double-teardown this chain must not perform, so the count matters.
 func (p *teardownProbe) closeShared() error {
 	p.sharedCloses.Add(1)
-	return p.store.Close()
+	return p.closeStore()
 }
 
 // TestDaemonTeardownRunsOnASignalledExit drives the real signal path. The
@@ -58,6 +75,13 @@ func (p *teardownProbe) closeShared() error {
 // daemon skipped watcher shutdown, the savings flush, and the final WAL
 // checkpoint outright — the store was left as the process found it.
 func TestDaemonTeardownRunsOnASignalledExit(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		// os/exec aside, a Windows process cannot deliver a signal to
+		// itself: Process.Signal returns "not supported by windows" for
+		// everything except Kill. Skipping before the listener is up
+		// keeps the serve goroutine from outliving the test.
+		t.Skip("a process cannot signal itself on Windows")
+	}
 	shutdownSignals := platform.ShutdownSignals()
 	if len(shutdownSignals) == 0 {
 		t.Skip("no shutdown signals on this platform")

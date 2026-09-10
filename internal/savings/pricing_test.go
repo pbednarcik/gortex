@@ -92,7 +92,7 @@ func TestDefaultPricingCoversCurrentGeneration(t *testing.T) {
 		"claude-mythos-5":   10.00,
 		"claude-opus-5":     5.00,
 		"claude-opus-4-8":   5.00,
-		"claude-sonnet-5":   3.00,
+		"claude-sonnet-5":   2.00,
 		"claude-sonnet-4-6": 3.00,
 		"claude-haiku-4-5":  1.00,
 		// OpenAI slugs the codex CLI reports into savings attribution.
@@ -121,8 +121,8 @@ func TestPricingExactMatchBeatsSubstring(t *testing.T) {
 	if got := CostAvoided(1_000_000, "claude-opus-5"); got != 5.00 {
 		t.Errorf("CostAvoided(1M, claude-opus-5) = %.4f, want 5.00", got)
 	}
-	if got := CostAvoided(1_000_000, "claude-sonnet-5"); got != 3.00 {
-		t.Errorf("CostAvoided(1M, claude-sonnet-5) = %.4f, want 3.00", got)
+	if got := CostAvoided(1_000_000, "claude-sonnet-5"); got != 2.00 {
+		t.Errorf("CostAvoided(1M, claude-sonnet-5) = %.4f, want 2.00", got)
 	}
 	if got := CostAvoided(1_000_000, "claude-fable-5"); got != 10.00 {
 		t.Errorf("CostAvoided(1M, claude-fable-5) = %.4f, want 10.00", got)

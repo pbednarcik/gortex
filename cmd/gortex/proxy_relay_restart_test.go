@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/zzet/gortex/internal/daemon"
+	"github.com/zzet/gortex/internal/testenv"
 	"go.uber.org/zap"
 )
 
@@ -85,11 +86,7 @@ func TestRelayProxySessionRestoresProtocolAgainstRealRestartedDaemon(t *testing.
 	proxyDialRetryInterval = time.Millisecond
 	t.Setenv("XDG_CACHE_HOME", t.TempDir())
 
-	dir, err := os.MkdirTemp("/tmp", "gxpr")
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { _ = os.RemoveAll(dir) })
+	dir := testenv.ShortTempDir(t)
 	socket := filepath.Join(dir, "s")
 	h := daemon.Handshake{
 		Version:          daemon.ProtocolVersion,
@@ -207,10 +204,7 @@ func startProxyRestartDaemon(t *testing.T, socket string, dispatcher daemon.MCPD
 
 func testProtocolRestoreClient(t *testing.T) (*daemon.Client, func()) {
 	t.Helper()
-	dir, err := os.MkdirTemp("/tmp", "gxpd")
-	if err != nil {
-		t.Fatal(err)
-	}
+	dir := testenv.ShortTempDir(t)
 	socket := filepath.Join(dir, "s")
 	server, done := startProxyRestartDaemon(t, socket, &proxyRestartDispatcher{})
 	client, err := daemon.DialTo(socket, daemon.Handshake{
@@ -222,13 +216,11 @@ func testProtocolRestoreClient(t *testing.T) (*daemon.Client, func()) {
 	})
 	if err != nil {
 		stopProxyRestartDaemon(t, server, done)
-		_ = os.RemoveAll(dir)
 		t.Fatal(err)
 	}
 	cleanup := func() {
 		_ = client.Close()
 		stopProxyRestartDaemon(t, server, done)
-		_ = os.RemoveAll(dir)
 	}
 	return client, cleanup
 }
@@ -256,11 +248,7 @@ func stopProxyRestartDaemon(t *testing.T, server *daemon.Server, done <-chan err
 }
 
 func BenchmarkProxyRestartDaemonLifecycle(b *testing.B) {
-	dir, err := os.MkdirTemp("/tmp", "gxpb")
-	if err != nil {
-		b.Fatal(err)
-	}
-	b.Cleanup(func() { _ = os.RemoveAll(dir) })
+	dir := testenv.ShortTempDir(b)
 	b.Setenv("XDG_CACHE_HOME", filepath.Join(dir, "cache"))
 	b.Setenv("GORTEX_DAEMON_PIDFILE", filepath.Join(dir, "p"))
 	socket := filepath.Join(dir, "s")

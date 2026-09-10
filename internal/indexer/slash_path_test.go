@@ -14,13 +14,13 @@ import (
 // TestIncrementalReindex_NestedFileNoDuplicate guards the
 // slash-path duplicate indexing regression on Windows.
 //
-// The cold bulk walk keys a nested file's graph nodes under OS-native
-// separators — "myrepo/pkg\sub\thing.go" on Windows. The incremental
-// re-index must evict via the SAME OS-native key (graphRelKey), not the
-// relKey slash form; otherwise graph.GetFileNodes / EvictFile (which
-// match the key byte-for-byte, with no separator folding) miss the cold
-// nodes, the stale set survives, and the re-parse appends a second,
-// forward-slash-keyed copy — a duplicate that grows on every save.
+// The cold bulk walk and the incremental re-index must key a nested
+// file's graph nodes under the SAME spelling — relKey's
+// "myrepo/pkg/sub/thing.go" — because graph.GetFileNodes / EvictFile
+// match the key byte-for-byte, with no separator folding. When the two
+// disagreed on Windows the evict missed the cold nodes, the stale set
+// survived, and the re-parse appended a second copy under the other
+// separator — a duplicate that grew on every save.
 //
 // On POSIX filepath.Rel already yields '/', so the two key forms
 // coincide and this is a Windows-only correction; the assertions below
@@ -61,7 +61,7 @@ func TestIncrementalReindex_NestedFileNoDuplicate(t *testing.T) {
 
 	// And the whole file's node set must be reachable under that one key
 	// — never split across a slash and a backslash spelling.
-	nodesUnderColdKey := g.GetFileNodes(idx.prefixPath(idx.graphRelKey(nested)))
+	nodesUnderColdKey := g.GetFileNodes(idx.prefixPath(idx.relKey(nested)))
 	assert.NotEmpty(t, nodesUnderColdKey,
 		"the file's nodes must be retrievable under the graph key form")
 }

@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+	"testing/synctest"
 	"time"
 
 	"github.com/stretchr/testify/assert"
@@ -16,17 +17,20 @@ import (
 	"github.com/zzet/gortex/internal/semantic"
 )
 
-// TestLSP_Enrich_ConfirmDoesNotStarveAddPhase is the WS-D acceptance: a slow
-// references server that — with the old sequential, full-deadline confirm pass
-// — would burn the entire per-repo window before any hover / hierarchy work
-// ran, now leaves the add phase productive. Two levers make it so: the confirm
-// reference sweep fans out across maxParallel, and a fraction of the deadline
-// is reserved for the post-confirm sweep. The result is that both the confirm
-// counters AND the hover / hierarchy add counters come back non-zero under a
-// deadline that a sequential confirm pass alone (8 files x 60ms = 480ms > 400ms
-// budget) would have exhausted.
+// TestLSP_Enrich_ConfirmDoesNotStarveAddPhase verifies that a slow references
+// server leaves the reserved post-confirm budget productive. The fake server
+// dispatches requests serially: all eight references would consume 480ms of a
+// 400ms budget without the reserve. This tests the phase budget, not RPC fanout.
 func TestLSP_Enrich_ConfirmDoesNotStarveAddPhase(t *testing.T) {
 	t.Setenv("GORTEX_LSP_SWEEP", "full") // exercise the full post-confirm sweep, not the demand-gated default
+	// Keep every timer, pipe, and RPC goroutine in the same clock bubble. CPU
+	// contention and race/coverage instrumentation must not spend the budget;
+	// only the fake server's intentional delays should advance it.
+	synctest.Test(t, testConfirmDoesNotStarveAddPhase)
+}
+
+func testConfirmDoesNotStarveAddPhase(t *testing.T) {
+	t.Helper()
 	const n = 8
 	const refDelay = 60 * time.Millisecond
 

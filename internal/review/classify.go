@@ -1,6 +1,7 @@
 package review
 
 import (
+	"path"
 	"path/filepath"
 	"sort"
 	"strings"
@@ -224,7 +225,10 @@ func goVerificationCommand(testTargets []string) string {
 		if t == "" {
 			continue
 		}
-		dir := filepath.ToSlash(filepath.Dir(t))
+		// cleanPath already returned the '/' spelling, so the directory
+		// split is path.Dir — the `go test ./pkg/...` argument must be
+		// slash-separated whatever host renders it.
+		dir := path.Dir(t)
 		if dir == "" || dir == "." {
 			dirs["."] = true
 			continue

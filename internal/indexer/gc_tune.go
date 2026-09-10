@@ -340,12 +340,23 @@ func shouldRaiseGCPercent(calculated, installed int64) bool {
 // only the first concurrent caller mutates the runtime, and only the last
 // restore reverts it — so a sibling index can't clobber another's restore.
 func applyIndexGCTuning(logger *zap.Logger) func() {
+	return applyIndexGCTuningWithBudget(
+		logger, indexMemoryBudget(hostPhysicalMemory(), cgroupMemoryLimit()))
+}
+
+// applyIndexGCTuningWithBudget is applyIndexGCTuning with the window's memory
+// budget passed in rather than read from the host. The budget is the single
+// input that decides whether the GC-percent knob is installed at all, and
+// hostPhysicalMemory has no portable reader everywhere — it returns 0 on any
+// platform without one, which makes the knob a property of the runner rather
+// than of this code. Supplying it keeps that decision testable, the same way
+// indexMemoryBudget takes its own inputs as parameters.
+func applyIndexGCTuningWithBudget(logger *zap.Logger, budget int64) func() {
 	if !gcTuneEnabled() {
 		return func() {}
 	}
 
 	gcPct := indexGCPercent()
-	budget := indexMemoryBudget(hostPhysicalMemory(), cgroupMemoryLimit())
 
 	gcTuneMu.Lock()
 	if gcTuneDepth == 0 {

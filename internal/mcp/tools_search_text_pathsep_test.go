@@ -20,17 +20,19 @@ import (
 	"github.com/zzet/gortex/internal/search/trigram"
 )
 
-// TestGraphMatchPathKey pins the two spellings apart: a trigram match path
-// is always forward-slash, while a graph node ID joins the repo prefix with
-// "/" and keeps the repo-relative remainder in the OS separator.
-func TestGraphMatchPathKey(t *testing.T) {
-	require.Equal(t, "beta/"+filepath.FromSlash("pkg/sub/main.go"),
-		graphMatchPathKey("beta/pkg/sub/main.go", true),
-		"a repo-prefixed match keeps the prefix separator and OS-spells the remainder")
-	require.Equal(t, filepath.FromSlash("pkg/sub/main.go"),
-		graphMatchPathKey("pkg/sub/main.go", false),
-		"an unprefixed match is OS-spelled whole")
-	require.Equal(t, "beta/main.go", graphMatchPathKey("beta/main.go", true),
+// TestGraphPathKey pins the one graph spelling: forward slashes on every
+// platform, prefix and remainder alike. A trigram match path already arrives
+// that way, so it passes through untouched; a natively-spelled path — what
+// filepath.Rel / filepath.Join produce on Windows — is converted.
+func TestGraphPathKey(t *testing.T) {
+	require.Equal(t, "beta/pkg/sub/main.go", graphPathKey("beta/pkg/sub/main.go"),
+		"a forward-slash path is already the graph spelling")
+	require.Equal(t, "beta/pkg/sub/main.go",
+		graphPathKey("beta/"+filepath.FromSlash("pkg/sub/main.go")),
+		"a natively-spelled remainder is folded onto the graph spelling")
+	require.Equal(t, "pkg/sub/main.go", graphPathKey(filepath.FromSlash("pkg/sub/main.go")),
+		"an unprefixed native path is folded whole")
+	require.Equal(t, "beta/main.go", graphPathKey("beta/main.go"),
 		"a repo-root file has one spelling on every platform")
 }
 
@@ -72,22 +74,22 @@ func nestedRepoServer(t *testing.T, entries []config.RepoEntry) (*Server, *graph
 }
 
 // TestGraphRelPath_LoneRepoForwardSlash covers the read side of the same
-// separator gap. resolveFilePath echoes a caller-supplied relative path back
-// verbatim, so a forward-slash path — what agents write, and what every tool
-// description shows — reached the graph unchanged and missed the node below
-// the repo root on Windows: get_file_summary answered file_not_indexed for a
-// file that was indexed.
+// separator question. resolveFilePath derives its relative form with
+// filepath.Rel / filepath.Join, so on Windows it hands back `solo/pkg\sub\main.go`
+// while the graph keys the node `solo/pkg/sub/main.go` — the path missed
+// every node below the repo root and get_file_summary answered
+// file_not_indexed for a file that was indexed.
 func TestGraphRelPath_LoneRepoForwardSlash(t *testing.T) {
 	solo := setupNestedRepo(t, "solo", "shared", "package sub\n\nfunc SoloHandler() {}\n")
 	srv, g := nestedRepoServer(t, []config.RepoEntry{{Path: solo, Name: "solo", Project: "backend"}})
 
-	nodeKey := "solo/" + filepath.FromSlash("pkg/sub/main.go")
+	const nodeKey = "solo/pkg/sub/main.go"
 	require.NotNil(t, g.GetNode(nodeKey), "fixture invariant: a lone repo's node ids carry its prefix")
 
 	require.Equal(t, nodeKey, srv.graphRelPath(context.Background(), "solo/pkg/sub/main.go"),
 		"a forward-slash path must be normalised to the graph's spelling")
 	require.Equal(t, nodeKey, srv.graphRelPath(context.Background(), nodeKey),
-		"an already OS-spelled path is unchanged (idempotent)")
+		"the graph spelling is unchanged (idempotent)")
 
 	res := callTool(t, srv, "get_file_summary", map[string]any{"path": "pkg/sub/main.go"})
 	require.False(t, res.IsError, "a forward-slash repo-relative path must resolve")
@@ -96,15 +98,16 @@ func TestGraphRelPath_LoneRepoForwardSlash(t *testing.T) {
 
 // TestFilterTextMatchesByResolvedScope_BelowRepoRoot is the regression for
 // search_text returning zero results on Windows. Scope narrowing attributes
-// every match to a graph node and fails closed when it cannot. The lookup
-// key was the raw forward-slash match path, which equals the node ID only
-// for a file at the repo root — so on Windows every match below the root was
-// silently dropped and a repo-wide search reported no hits at all.
+// every match to a graph node and fails closed when it cannot, so any
+// disagreement between the match-path spelling and the node-ID spelling
+// silently drops every hit and a repo-wide search reports nothing at all.
+// Both are forward-slash — trigram emits them, and the indexer folds every
+// key through filepath.ToSlash — and this pins that agreement.
 //
-// The existing fail-closed fixture uses a root-level file, where the two
-// spellings coincide on every platform; these put the file in a
-// subdirectory, and cover both node-ID shapes: prefixed (several tracked
-// repos) and a lone repo, whose ids carry its prefix too.
+// The existing fail-closed fixture uses a root-level file, where any
+// separator question is moot; these put the file in a subdirectory, and
+// cover both node-ID shapes: prefixed (several tracked repos) and a lone
+// repo, whose ids carry its prefix too.
 func TestFilterTextMatchesByResolvedScope_BelowRepoRoot(t *testing.T) {
 	t.Run("prefixed node ids", func(t *testing.T) {
 		alpha := setupNestedRepo(t, "alpha", "shared", "package sub\n\n// marker\nfunc A() {}\n")
@@ -114,7 +117,7 @@ func TestFilterTextMatchesByResolvedScope_BelowRepoRoot(t *testing.T) {
 			{Path: beta, Name: "beta", Project: "backend"},
 		})
 
-		nodeKey := "beta/" + filepath.FromSlash("pkg/sub/main.go")
+		const nodeKey = "beta/pkg/sub/main.go"
 		require.NotNil(t, g.GetNode(nodeKey),
 			"fixture invariant: several tracked repos mint prefixed node ids")
 
@@ -133,7 +136,7 @@ func TestFilterTextMatchesByResolvedScope_BelowRepoRoot(t *testing.T) {
 			{Path: solo, Name: "solo", Project: "backend"},
 		})
 
-		require.NotNil(t, g.GetNode("solo/"+filepath.FromSlash("pkg/sub/main.go")),
+		require.NotNil(t, g.GetNode("solo/pkg/sub/main.go"),
 			"fixture invariant: a lone repo's node ids carry its prefix")
 
 		got := srv.filterTextMatchesByResolvedScope(
@@ -142,6 +145,6 @@ func TestFilterTextMatchesByResolvedScope_BelowRepoRoot(t *testing.T) {
 			ResolvedScope{WorkspaceID: "shared", RepoAllow: map[string]bool{"solo": true}},
 		)
 		require.Len(t, got, 1,
-			"the unprefixed retry must also cross the separator gap")
+			"a lone repo's prefixed node id must attribute the match too")
 	})
 }

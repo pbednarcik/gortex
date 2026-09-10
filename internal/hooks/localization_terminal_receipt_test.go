@@ -3,6 +3,7 @@ package hooks
 import (
 	"encoding/json"
 	"os"
+	"runtime"
 	"slices"
 	"strings"
 	"sync"
@@ -512,7 +513,9 @@ func TestLocalizationProblemRewriteDirectAndPluginIsIdempotent(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			if got := info.Mode().Perm(); got != 0o600 {
+			// Windows has no POSIX mode bits: os.Chmod only toggles the
+			// read-only attribute, so a writable file always reports 0666.
+			if got := info.Mode().Perm(); runtime.GOOS != "windows" && got != 0o600 {
 				t.Fatalf("turn state mode = %o, want 600", got)
 			}
 			rawState, err := os.ReadFile(statePath)

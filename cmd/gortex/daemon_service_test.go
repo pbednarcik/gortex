@@ -144,16 +144,19 @@ func TestRenderSystemdUnit_PropagatesXDG(t *testing.T) {
 // relative values are ignored (the latter per the XDG spec, matching
 // platform.unifiedDir).
 func TestXDGServiceEnv_OnlyAbsoluteSet(t *testing.T) {
-	t.Setenv("XDG_CONFIG_HOME", "/abs/config")
-	t.Setenv("XDG_DATA_HOME", "relative/data") // ignored — not absolute
-	t.Setenv("XDG_CACHE_HOME", "")              // ignored — empty/unset
+	// The absolute fixture has to be native: filepath.IsAbs("/abs/config")
+	// is false on Windows, where an absolute path carries a volume.
+	absConfig := filepath.Join(t.TempDir(), "config")
+	t.Setenv("XDG_CONFIG_HOME", absConfig)
+	t.Setenv("XDG_DATA_HOME", filepath.Join("relative", "data")) // ignored — not absolute
+	t.Setenv("XDG_CACHE_HOME", "")                               // ignored — empty/unset
 
 	got := map[string]string{}
 	for _, e := range xdgServiceEnv() {
 		got[e.Key] = e.Value
 	}
 
-	assert.Equal(t, "/abs/config", got["XDG_CONFIG_HOME"])
+	assert.Equal(t, absConfig, got["XDG_CONFIG_HOME"])
 	_, hasData := got["XDG_DATA_HOME"]
 	assert.False(t, hasData, "relative XDG_DATA_HOME must be ignored")
 	_, hasCache := got["XDG_CACHE_HOME"]

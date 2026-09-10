@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"io"
 	"os"
+	"path"
 	"path/filepath"
 	"sort"
 	"strings"
@@ -239,7 +240,7 @@ func citedFilesFromResult(payload string) []string {
 	out := make([]string, 0, 8)
 	add := func(p string) {
 		p = strings.TrimSpace(p)
-		if p == "" || filepath.IsAbs(p) || seen[p] || len(out) >= maxRetrievalCitationScan {
+		if p == "" || citationIsAbsolute(p) || seen[p] || len(out) >= maxRetrievalCitationScan {
 			return
 		}
 		seen[p] = true
@@ -279,6 +280,18 @@ func citedFilesFromResult(payload string) []string {
 		}
 	}
 	return out
+}
+
+// citationIsAbsolute reports whether a cited path names an absolute location
+// in either spelling. filepath.IsAbs only understands the running platform's:
+// on Windows it answers false for the '/'-rooted form, which is exactly what
+// the path_abs columns carry — every wire format Gortex emits spells paths
+// with forward slashes regardless of who wrote them. So the absolute-path
+// filter passed `/abs/only.go` straight through and the ledger credited it as
+// a repo-relative citation. Treating a leading '/' as absolute costs nothing
+// on POSIX, where filepath.IsAbs already says the same thing.
+func citationIsAbsolute(p string) bool {
+	return filepath.IsAbs(p) || path.IsAbs(filepath.ToSlash(p))
 }
 
 // maxToonCitationBytes bounds the TOON decode attempt so a very large text

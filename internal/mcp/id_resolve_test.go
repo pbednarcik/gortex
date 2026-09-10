@@ -32,10 +32,10 @@ func nameResolveServer(t *testing.T) *Server {
 //
 // The absolute-path spelling is deliberate: it exercises the rung on every
 // platform, so the linux/macos matrix protects this. On Windows the same rung
-// additionally reconciles the separator, which is what graphPathSpelling exists
-// for — the store holds `pkga\a.go::Foo` while every agent writes
-// `pkga/a.go::Foo`, and move_symbol answered "symbol not found" for an indexed
-// symbol.
+// additionally reconciles the separator, which is what graphPathKey exists
+// for — filepath.Rel hands back `pkga\a.go` while the store holds
+// `pkga/a.go::Foo`, and move_symbol answered "symbol not found" for an
+// indexed symbol.
 func TestResolveSymbolID_WithoutMultiIndexer_StillAnchorsThePath(t *testing.T) {
 	srv, dir := setupMoveInlineRepo(t, map[string]string{
 		"pkga/a.go": "package pkga\n\nfunc Foo() int { return 42 }\n",

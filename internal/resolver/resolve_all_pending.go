@@ -2,7 +2,6 @@ package resolver
 
 import (
 	"context"
-	"path/filepath"
 	"sort"
 	"strings"
 	"time"
@@ -343,7 +342,7 @@ func (p *resolveAllPassIndexes) ensureDir(prefixes []string) {
 		p.resolver.lastDirIndex = make(map[string][]graph.FileNodeIdentity, 128)
 	}
 	for file := range graph.FileNodeIdentitiesSeq(p.resolver.graph, missing) {
-		dir := filepath.Dir(file.FilePath)
+		dir := filePathDir(file.FilePath)
 		p.resolver.dirIndex[dir] = append(p.resolver.dirIndex[dir], file)
 		last := lastPathComponent(dir)
 		if last != "" && last != dir {

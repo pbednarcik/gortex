@@ -21,6 +21,7 @@ import (
 	"github.com/zzet/gortex/internal/parser"
 	"github.com/zzet/gortex/internal/parser/languages"
 	"github.com/zzet/gortex/internal/query"
+	"github.com/zzet/gortex/internal/testenv"
 )
 
 // spinUpDaemon builds a daemon with the real realController +
@@ -45,9 +46,7 @@ func spinUpDaemonWithConfig(t *testing.T) (configPath, socket, trackedRoot strin
 
 	// Short base dir so the unix socket stays under the 104-char limit
 	// on macOS even with test-name suffixes.
-	dir, err := os.MkdirTemp("/tmp", "gxi")
-	require.NoError(t, err)
-	t.Cleanup(func() { _ = os.RemoveAll(dir) })
+	dir := testenv.ShortTempDir(t)
 
 	socket = filepath.Join(dir, "s")
 	t.Setenv("GORTEX_DAEMON_SOCKET", socket)

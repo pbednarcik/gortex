@@ -10,6 +10,25 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
+// compileDBDir renders an absolute directory the way a compile_commands.json
+// carries it: forward-separated, so the JSON body stays valid. A Windows
+// t.TempDir() is "C:\Users\...\001", and pasting those backslashes into a JSON
+// string literal makes "\U" / "\A" invalid escapes — the whole database then
+// fails to parse and every translation unit disappears. CMake and Ninja emit
+// forward slashes on Windows for the same reason, and filepath.IsAbs / Join /
+// Rel all accept that spelling.
+func compileDBDir(root string) string { return filepath.ToSlash(root) }
+
+// toolchainIncludeDir is an absolute include directory outside the repository,
+// the shape a `-isystem` flag carries. Prefixing the root's volume is what makes
+// it absolute on Windows: filepath.IsAbs("/usr/include") is false there, so the
+// bare POSIX spelling would be joined onto the build directory and land back
+// INSIDE the repo instead of being dropped. VolumeName is "" on POSIX, so the
+// spelling is unchanged there.
+func toolchainIncludeDir(root string) string {
+	return filepath.ToSlash(filepath.VolumeName(root)) + "/usr/include"
+}
+
 // writeCompileDB writes a compile_commands.json at path and registers cleanup of
 // the per-root include-dir cache so each test starts cold.
 func writeCompileDB(t *testing.T, repoRoot, path, body string) {
@@ -21,11 +40,12 @@ func writeCompileDB(t *testing.T, repoRoot, path, body string) {
 
 func TestLoadCompileCommands_CommandString(t *testing.T) {
 	root := t.TempDir()
+	dbDir := compileDBDir(root)
 	writeCompileDB(t, root, filepath.Join(root, "compile_commands.json"), `[
 	  {
-	    "directory": "`+root+`/build",
+	    "directory": "`+dbDir+`/build",
 	    "file": "../src/main.c",
-	    "command": "clang -I../gen/include -isystem /usr/include -c ../src/main.c -o main.o"
+	    "command": "clang -I../gen/include -isystem `+toolchainIncludeDir(root)+` -c ../src/main.c -o main.o"
 	  }
 	]`)
 
@@ -40,9 +60,10 @@ func TestLoadCompileCommands_CommandString(t *testing.T) {
 
 func TestLoadCompileCommands_ArgumentsArray(t *testing.T) {
 	root := t.TempDir()
+	dbDir := compileDBDir(root)
 	writeCompileDB(t, root, filepath.Join(root, "compile_commands.json"), `[
 	  {
-	    "directory": "`+root+`",
+	    "directory": "`+dbDir+`",
 	    "file": "src/main.cpp",
 	    "arguments": ["clang++", "-Igen/include", "-I", "vendor/inc", "-iquote", "local", "-c", "src/main.cpp"]
 	  }
@@ -56,10 +77,11 @@ func TestLoadCompileCommands_ArgumentsArray(t *testing.T) {
 
 func TestLoadCompileCommands_BuildDirGlob(t *testing.T) {
 	root := t.TempDir()
+	dbDir := compileDBDir(root)
 	// No root compile_commands.json — only build-debug/compile_commands.json.
 	writeCompileDB(t, root, filepath.Join(root, "build-debug", "compile_commands.json"), `[
 	  {
-	    "directory": "`+root+`/build-debug",
+	    "directory": "`+dbDir+`/build-debug",
 	    "file": "../src/app.c",
 	    "command": "cc -I../include -c ../src/app.c"
 	  }
@@ -115,6 +137,7 @@ func TestHeuristicIncludeDirs_Empty(t *testing.T) {
 func TestLoadCompileCommands_CacheAndClear(t *testing.T) {
 	root := t.TempDir()
 	path := filepath.Join(root, "compile_commands.json")
+	dbDir := compileDBDir(root)
 	t.Cleanup(func() { clearCppIncludeDirCache(root) })
 
 	// write replaces the DB body while preserving its modtime, so this test
@@ -125,7 +148,7 @@ func TestLoadCompileCommands_CacheAndClear(t *testing.T) {
 		if fi, err := os.Stat(path); err == nil {
 			keep = fi.ModTime()
 		}
-		body := `[{"directory":"` + root + `","file":"src/main.c","command":"cc -I` + incDir + ` -c src/main.c"}]`
+		body := `[{"directory":"` + dbDir + `","file":"src/main.c","command":"cc -I` + incDir + ` -c src/main.c"}]`
 		require.NoError(t, os.WriteFile(path, []byte(body), 0o644))
 		if !keep.IsZero() {
 			require.NoError(t, os.Chtimes(path, keep, keep))
@@ -154,10 +177,11 @@ func TestLoadCompileCommands_CacheAndClear(t *testing.T) {
 func TestLoadCompileCommands_MtimeReload(t *testing.T) {
 	root := t.TempDir()
 	path := filepath.Join(root, "compile_commands.json")
+	dbDir := compileDBDir(root)
 	t.Cleanup(func() { clearCppIncludeDirCache(root) })
 
 	write := func(incDir string, mtime time.Time) {
-		body := `[{"directory":"` + root + `","file":"src/main.c","command":"cc -I` + incDir + ` -c src/main.c"}]`
+		body := `[{"directory":"` + dbDir + `","file":"src/main.c","command":"cc -I` + incDir + ` -c src/main.c"}]`
 		require.NoError(t, os.WriteFile(path, []byte(body), 0o644))
 		require.NoError(t, os.Chtimes(path, mtime, mtime))
 	}

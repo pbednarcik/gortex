@@ -1,6 +1,8 @@
 package mcp
 
 import (
+	"path/filepath"
+	"runtime"
 	"sync"
 	"testing"
 
@@ -10,6 +12,25 @@ import (
 
 	"github.com/zzet/gortex/internal/semantic/lsp"
 )
+
+// wantFileURI is the file:// URI the broadcasters must publish for the
+// POSIX-shaped fixture path p.
+//
+// On POSIX p is already absolute and the URI is the literal "file://" + p.
+// On Windows the very same string is drive-RELATIVE — filepath.IsAbs
+// ("/work/main.go") is false there — so lspuri.PathToURI resolves it
+// against the current drive before building the URI and the result carries
+// that drive: "file:///D:/work/main.go". Deriving only the Windows
+// expectation keeps the POSIX assertion an exact literal.
+func wantFileURI(t *testing.T, p string) string {
+	t.Helper()
+	if runtime.GOOS != "windows" {
+		return "file://" + p
+	}
+	abs, err := filepath.Abs(p)
+	require.NoError(t, err)
+	return "file:///" + filepath.ToSlash(abs)
+}
 
 // fakeSpecificSender records every SendNotificationToSpecificClient
 // call so tests can assert delivery target + payload.
@@ -166,7 +187,7 @@ func TestDiagnosticsBroadcaster_PayloadShape(t *testing.T) {
 	require.Len(t, calls, 1)
 	assert.Equal(t, "session-A", calls[0].sessionID)
 	assert.Equal(t, "notifications/diagnostics", calls[0].method)
-	assert.Equal(t, "file:///work/main.go", calls[0].params["uri"])
+	assert.Equal(t, wantFileURI(t, "/work/main.go"), calls[0].params["uri"])
 	assert.Equal(t, "/work/main.go", calls[0].params["path"])
 	assert.Equal(t, "gopls", calls[0].params["server"])
 	wire, ok := calls[0].params["diagnostics"].([]map[string]any)
@@ -317,10 +338,10 @@ func TestServer_ReleaseSession_UnsubscribesDiagnostics(t *testing.T) {
 	assert.Equal(t, 0, b.subscriberCount(), "ReleaseSession should drop the subscriber")
 }
 
-// TestPathToFileURI_Absolute — POSIX path round-trips into the
+// TestPathToFileURI_Absolute — an absolute path round-trips into the
 // expected file:// URI.
 func TestPathToFileURI_Absolute(t *testing.T) {
-	assert.Equal(t, "file:///work/main.go", pathToFileURI("/work/main.go"))
+	assert.Equal(t, wantFileURI(t, "/work/main.go"), pathToFileURI("/work/main.go"))
 	assert.Equal(t, "", pathToFileURI(""))
 }
 

@@ -138,10 +138,12 @@ func rankFileRisk(diff *analysis.DiffResult, impact map[string]*analysis.ImpactR
 	// risk to that unchanged shadow.
 	fromGraphKey := func(file string) string {
 		// Normalize to the '/' comparison form BEFORE removing the prefix.
-		// cleanPath ends in filepath.Clean, so on Windows the graph key
-		// "repo-a/repo-a\widget.go" becomes "repo-a\repo-a\widget.go" and the
-		// '/'-joined prefix no longer matches: the row keeps its prefix while
-		// the repo-relative side produces a second row for the same file.
+		// A Windows graph key is "repo-a/repo-a\widget.go" (one '/' after the
+		// repo prefix, native separators below it), so a '/'-joined prefix
+		// only matches once the whole key is normalized: without it the row
+		// keeps its prefix while the repo-relative side produces a second
+		// row for the same file. cleanPath already returns the '/' spelling;
+		// graphpath.Norm keeps that guarantee local to this strip.
 		file = graphpath.Norm(cleanPath(file))
 		if repoPrefix != "" {
 			file = strings.TrimPrefix(file, repoPrefix+"/")

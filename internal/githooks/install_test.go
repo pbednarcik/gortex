@@ -4,6 +4,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 )
@@ -52,8 +53,14 @@ func TestInstallHookPostCommit_FreshFile(t *testing.T) {
 	if err != nil {
 		t.Fatalf("stat hook: %v", err)
 	}
-	if mode := info.Mode().Perm(); mode&0o100 == 0 {
-		t.Errorf("hook not executable: mode = %v", mode)
+	// NTFS has no exec bit — every file there reports 0666 and os.Chmod
+	// only toggles the read-only attribute, so the mode says nothing about
+	// whether Git will run the hook. Git for Windows runs hooks through its
+	// bundled sh regardless of permissions.
+	if runtime.GOOS != "windows" {
+		if mode := info.Mode().Perm(); mode&0o100 == 0 {
+			t.Errorf("hook not executable: mode = %v", mode)
+		}
 	}
 }
 

@@ -1,11 +1,15 @@
 package claudecli
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -13,63 +17,110 @@ import (
 	"github.com/zzet/gortex/internal/llm"
 )
 
-// fakeClaude writes a tiny shell script that impersonates the
-// `claude` CLI: it echoes the script-baked stdout payload, optionally
-// captures the args + stdin into sidecar files for assertions, and
-// exits with the script-baked exit code. The returned path is the
-// absolute path to the script.
+// fakeCLIEnv carries the fake-CLI script to a re-exec'd copy of this test
+// binary. TestMain acts on it before the test framework starts, so the
+// provider can be pointed at this binary as if it were `claude`.
+const fakeCLIEnv = "GORTEX_FAKE_CLAUDE"
+
+// TestMain doubles as the fake `claude` CLI. The provider spawns its binary
+// as a subprocess, and the fake used to be a /bin/sh script — which is not
+// executable on Windows ("%1 is not a valid Win32 application"). Re-execing
+// the test binary is the portable equivalent: it impersonates the CLI on
+// every OS, exercising the same paths (argv construction, stdin piping,
+// stdout/stderr capture, exit status) the script did.
+func TestMain(m *testing.M) {
+	if spec := os.Getenv(fakeCLIEnv); spec != "" {
+		os.Exit(runFakeCLI(spec))
+	}
+	os.Exit(m.Run())
+}
+
+// fakeOpts is the scripted behaviour of one fake-CLI invocation. It is
+// JSON-encoded into fakeCLIEnv, so every field has to be exported.
+type fakeOpts struct {
+	Dir      string        `json:"dir"` // where args.txt / stdin.txt land
+	Stdout   string        `json:"stdout"`
+	Stderr   string        `json:"stderr"`
+	ExitCode int           `json:"exit_code"`
+	Sleep    time.Duration `json:"sleep"`
+}
+
+// runFakeCLI is the child-process half: it records the argv and stdin it was
+// given, emits the scripted payloads, and returns the scripted exit code. The
+// order matches the shell script it replaces — record, then sleep, then
+// stderr, then stdout.
+func runFakeCLI(spec string) int {
+	var opts fakeOpts
+	if err := json.Unmarshal([]byte(spec), &opts); err != nil {
+		fmt.Fprintf(os.Stderr, "fake claude: bad spec: %v\n", err)
+		return 111
+	}
+	// NUL-separated so an argument carrying newlines (the JSON-Schema rider
+	// does) still round-trips as exactly one argv entry.
+	var argv bytes.Buffer
+	for _, a := range os.Args[1:] {
+		argv.WriteString(a)
+		argv.WriteByte(0)
+	}
+	if err := os.WriteFile(filepath.Join(opts.Dir, "args.txt"), argv.Bytes(), 0o600); err != nil {
+		fmt.Fprintf(os.Stderr, "fake claude: record argv: %v\n", err)
+		return 111
+	}
+	stdin, err := io.ReadAll(os.Stdin)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "fake claude: read stdin: %v\n", err)
+		return 111
+	}
+	if err := os.WriteFile(filepath.Join(opts.Dir, "stdin.txt"), stdin, 0o600); err != nil {
+		fmt.Fprintf(os.Stderr, "fake claude: record stdin: %v\n", err)
+		return 111
+	}
+	if opts.Sleep > 0 {
+		time.Sleep(opts.Sleep + time.Second)
+	}
+	if opts.Stderr != "" {
+		fmt.Fprint(os.Stderr, opts.Stderr)
+	}
+	if opts.Stdout != "" {
+		fmt.Fprint(os.Stdout, opts.Stdout)
+	}
+	return opts.ExitCode
+}
+
+// fakeCLI is the parent-process handle on one armed fake: the binary path to
+// hand the provider, plus the directory its sidecar recordings land in.
+type fakeCLI struct {
+	binary string
+	dir    string
+}
+
+// fakeClaude arms the fake `claude` CLI for one test and returns the handle.
+// The provider is pointed at this test binary; fakeCLIEnv (inherited by the
+// spawn) tells the child to impersonate the CLI instead of running tests.
 //
-// A shell-script fake is the smallest portable surface that exercises
-// every code path the provider has — arg construction, stdin
-// piping, exit-status handling, stderr capture — without pulling in
-// the full TestHelperProcess re-exec dance.
-func fakeClaude(t *testing.T, dir string, opts fakeOpts) string {
+// Because it uses t.Setenv, a test that calls it must not run in parallel.
+func fakeClaude(t *testing.T, dir string, opts fakeOpts) fakeCLI {
 	t.Helper()
 	if dir == "" {
 		dir = t.TempDir()
 	}
-	script := filepath.Join(dir, "fake-claude.sh")
+	opts.Dir = dir
+	spec, err := json.Marshal(opts)
+	if err != nil {
+		t.Fatalf("encode fake spec: %v", err)
+	}
+	t.Setenv(fakeCLIEnv, string(spec))
 
-	argsLog := filepath.Join(dir, "args.txt")
-	stdinLog := filepath.Join(dir, "stdin.txt")
-	stderrPayload := strings.ReplaceAll(opts.stderr, "'", "'\\''")
-	stdoutPayload := strings.ReplaceAll(opts.stdout, "'", "'\\''")
-
-	// NUL-separated so an argument carrying newlines (the JSON-Schema
-	// rider does) still round-trips as exactly one argv entry.
-	body := "#!/bin/sh\n" +
-		"set -e\n" +
-		"printf '%s\\0' \"$@\" > '" + argsLog + "'\n" +
-		"cat > '" + stdinLog + "'\n"
-	if opts.sleep > 0 {
-		body += fmt.Sprintf("sleep %d\n", int(opts.sleep.Seconds()+1))
+	bin, err := os.Executable()
+	if err != nil {
+		bin = os.Args[0]
 	}
-	if stderrPayload != "" {
-		body += "printf '%s' '" + stderrPayload + "' >&2\n"
-	}
-	if stdoutPayload != "" {
-		body += "printf '%s' '" + stdoutPayload + "'\n"
-	}
-	if opts.exitCode != 0 {
-		body += fmt.Sprintf("exit %d\n", opts.exitCode)
-	}
-
-	if err := os.WriteFile(script, []byte(body), 0o700); err != nil {
-		t.Fatalf("write fake script: %v", err)
-	}
-	return script
+	return fakeCLI{binary: bin, dir: dir}
 }
 
-type fakeOpts struct {
-	stdout   string
-	stderr   string
-	exitCode int
-	sleep    time.Duration
-}
-
-func readSidecar(t *testing.T, scriptPath, name string) string {
+func (f fakeCLI) sidecar(t *testing.T, name string) string {
 	t.Helper()
-	b, err := os.ReadFile(filepath.Join(filepath.Dir(scriptPath), name))
+	b, err := os.ReadFile(filepath.Join(f.dir, name))
 	if err != nil {
 		t.Fatalf("read %s: %v", name, err)
 	}
@@ -77,9 +128,9 @@ func readSidecar(t *testing.T, scriptPath, name string) string {
 }
 
 // argv reconstructs the exact argument vector the fake CLI received.
-func argv(t *testing.T, scriptPath string) []string {
+func (f fakeCLI) argv(t *testing.T) []string {
 	t.Helper()
-	raw := readSidecar(t, scriptPath, "args.txt")
+	raw := f.sidecar(t, "args.txt")
 	raw = strings.TrimSuffix(raw, "\x00")
 	if raw == "" {
 		return nil
@@ -119,8 +170,14 @@ func TestNew_BinaryNotFound(t *testing.T) {
 
 func TestNew_DefaultsBinary(t *testing.T) {
 	dir := t.TempDir()
-	bin := filepath.Join(dir, "claude")
-	if err := os.WriteFile(bin, []byte("#!/bin/sh\nexit 0\n"), 0o700); err != nil {
+	// exec.LookPath only resolves a name that carries a PATHEXT extension on
+	// Windows — an extensionless `claude` file is invisible to it — so the
+	// stub is named for the host. It is never executed; New only resolves it.
+	name, body := "claude", "#!/bin/sh\nexit 0\n"
+	if runtime.GOOS == "windows" {
+		name, body = "claude.cmd", "@echo off\r\nexit /b 0\r\n"
+	}
+	if err := os.WriteFile(filepath.Join(dir, name), []byte(body), 0o700); err != nil {
 		t.Fatalf("write fake binary: %v", err)
 	}
 	// Stash a fake `claude` on PATH so the default binary name resolves.
@@ -137,9 +194,9 @@ func TestNew_DefaultsBinary(t *testing.T) {
 }
 
 func TestComplete_FreeformSuccess(t *testing.T) {
-	script := fakeClaude(t, "", fakeOpts{stdout: "hello world"})
+	fake := fakeClaude(t, "", fakeOpts{Stdout: "hello world"})
 
-	p, err := New(llm.ClaudeCLIConfig{Binary: script})
+	p, err := New(llm.ClaudeCLIConfig{Binary: fake.binary})
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
@@ -158,7 +215,7 @@ func TestComplete_FreeformSuccess(t *testing.T) {
 		t.Errorf("text=%q want hello world", resp.Text)
 	}
 
-	args := argv(t, script)
+	args := fake.argv(t)
 	for _, want := range []string{"--print", "--output-format", "text"} {
 		if !hasArg(args, want) {
 			t.Errorf("args missing %q\nargs=%q", want, args)
@@ -167,7 +224,7 @@ func TestComplete_FreeformSuccess(t *testing.T) {
 	if got, ok := flagValue(args, "--system-prompt"); !ok || got != "be terse" {
 		t.Errorf("--system-prompt=%q present=%v, want %q", got, ok, "be terse")
 	}
-	stdin := readSidecar(t, script, "stdin.txt")
+	stdin := fake.sidecar(t, "stdin.txt")
 	if !strings.Contains(stdin, "User: hi") {
 		t.Errorf("stdin missing user turn:\n%s", stdin)
 	}
@@ -181,9 +238,9 @@ func TestComplete_FreeformSuccess(t *testing.T) {
 // the discovered CLAUDE.md files and the injected cwd/environment block
 // in force, and that context beats the structured-output instruction.
 func TestComplete_ReplacesDefaultSystemPrompt(t *testing.T) {
-	script := fakeClaude(t, "", fakeOpts{stdout: "ok"})
+	fake := fakeClaude(t, "", fakeOpts{Stdout: "ok"})
 
-	p, _ := New(llm.ClaudeCLIConfig{Binary: script})
+	p, _ := New(llm.ClaudeCLIConfig{Binary: fake.binary})
 	defer p.Close()
 
 	if _, err := p.Complete(context.Background(), llm.CompletionRequest{
@@ -191,7 +248,7 @@ func TestComplete_ReplacesDefaultSystemPrompt(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("Complete: %v", err)
 	}
-	args := argv(t, script)
+	args := fake.argv(t)
 	if hasArg(args, "--append-system-prompt") {
 		t.Errorf("must not append to the default system prompt; args=%q", args)
 	}
@@ -207,9 +264,9 @@ func TestComplete_ReplacesDefaultSystemPrompt(t *testing.T) {
 // SessionEnd hook exiting nonzero failed the whole call), no native
 // toolset, no MCP servers.
 func TestComplete_HeadlessDefaults(t *testing.T) {
-	script := fakeClaude(t, "", fakeOpts{stdout: "ok"})
+	fake := fakeClaude(t, "", fakeOpts{Stdout: "ok"})
 
-	p, _ := New(llm.ClaudeCLIConfig{Binary: script})
+	p, _ := New(llm.ClaudeCLIConfig{Binary: fake.binary})
 	defer p.Close()
 
 	if _, err := p.Complete(context.Background(), llm.CompletionRequest{
@@ -217,7 +274,7 @@ func TestComplete_HeadlessDefaults(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("Complete: %v", err)
 	}
-	args := argv(t, script)
+	args := fake.argv(t)
 
 	if got, ok := flagValue(args, "--settings"); !ok || !strings.Contains(got, `"disableAllHooks":true`) {
 		t.Errorf("--settings=%q present=%v, want disableAllHooks", got, ok)
@@ -233,9 +290,9 @@ func TestComplete_HeadlessDefaults(t *testing.T) {
 // --tools is variadic: it swallows every following argument up to the
 // next flag. The value must therefore always be followed by one.
 func TestComplete_ToolsFlagIsFollowedByAFlag(t *testing.T) {
-	script := fakeClaude(t, "", fakeOpts{stdout: "ok"})
+	fake := fakeClaude(t, "", fakeOpts{Stdout: "ok"})
 
-	p, _ := New(llm.ClaudeCLIConfig{Binary: script})
+	p, _ := New(llm.ClaudeCLIConfig{Binary: fake.binary})
 	defer p.Close()
 
 	if _, err := p.Complete(context.Background(), llm.CompletionRequest{
@@ -243,7 +300,7 @@ func TestComplete_ToolsFlagIsFollowedByAFlag(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("Complete: %v", err)
 	}
-	args := argv(t, script)
+	args := fake.argv(t)
 	i := -1
 	for n, a := range args {
 		if a == "--tools" {
@@ -265,10 +322,10 @@ func TestComplete_ToolsFlagIsFollowedByAFlag(t *testing.T) {
 // Any flag in llm.claudecli.args wins over the matching headless
 // default — the config file stays the final word.
 func TestComplete_ArgsOverrideHeadlessDefaults(t *testing.T) {
-	script := fakeClaude(t, "", fakeOpts{stdout: "ok"})
+	fake := fakeClaude(t, "", fakeOpts{Stdout: "ok"})
 
 	p, _ := New(llm.ClaudeCLIConfig{
-		Binary: script,
+		Binary: fake.binary,
 		Args:   []string{"--tools", "default", "--settings=/etc/claude.json"},
 	})
 	defer p.Close()
@@ -278,7 +335,7 @@ func TestComplete_ArgsOverrideHeadlessDefaults(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("Complete: %v", err)
 	}
-	args := argv(t, script)
+	args := fake.argv(t)
 
 	var tools, settings int
 	for _, a := range args {
@@ -308,10 +365,10 @@ func TestComplete_ArgsOverrideHeadlessDefaults(t *testing.T) {
 // provider's own instruction (which carries the JSON-Schema rider) must
 // survive as an append rather than be dropped.
 func TestComplete_UserSystemPromptKeepsSchemaRider(t *testing.T) {
-	script := fakeClaude(t, "", fakeOpts{stdout: `{"terms":["a"]}`})
+	fake := fakeClaude(t, "", fakeOpts{Stdout: `{"terms":["a"]}`})
 
 	p, _ := New(llm.ClaudeCLIConfig{
-		Binary: script,
+		Binary: fake.binary,
 		Args:   []string{"--system-prompt", "you are terse"},
 	})
 	defer p.Close()
@@ -322,7 +379,7 @@ func TestComplete_UserSystemPromptKeepsSchemaRider(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("Complete: %v", err)
 	}
-	args := argv(t, script)
+	args := fake.argv(t)
 
 	if got, ok := flagValue(args, "--system-prompt"); !ok || got != "you are terse" {
 		t.Errorf("--system-prompt=%q present=%v, want the user's", got, ok)
@@ -337,9 +394,9 @@ func TestComplete_UserSystemPromptKeepsSchemaRider(t *testing.T) {
 }
 
 func TestComplete_PassesModel(t *testing.T) {
-	script := fakeClaude(t, "", fakeOpts{stdout: "ok"})
+	fake := fakeClaude(t, "", fakeOpts{Stdout: "ok"})
 
-	p, _ := New(llm.ClaudeCLIConfig{Binary: script, Model: "sonnet"})
+	p, _ := New(llm.ClaudeCLIConfig{Binary: fake.binary, Model: "sonnet"})
 	defer p.Close()
 
 	if _, err := p.Complete(context.Background(), llm.CompletionRequest{
@@ -347,16 +404,16 @@ func TestComplete_PassesModel(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("Complete: %v", err)
 	}
-	if got, ok := flagValue(argv(t, script), "--model"); !ok || got != "sonnet" {
+	if got, ok := flagValue(fake.argv(t), "--model"); !ok || got != "sonnet" {
 		t.Errorf("--model=%q present=%v, want sonnet", got, ok)
 	}
 }
 
 func TestComplete_StructuredExtractsJSON(t *testing.T) {
 	wrapped := "Sure, here you go:\n```json\n{\"terms\":[\"bcrypt\",\"argon2\"]}\n```\n"
-	script := fakeClaude(t, "", fakeOpts{stdout: wrapped})
+	fake := fakeClaude(t, "", fakeOpts{Stdout: wrapped})
 
-	p, _ := New(llm.ClaudeCLIConfig{Binary: script})
+	p, _ := New(llm.ClaudeCLIConfig{Binary: fake.binary})
 	defer p.Close()
 
 	resp, err := p.Complete(context.Background(), llm.CompletionRequest{
@@ -370,16 +427,16 @@ func TestComplete_StructuredExtractsJSON(t *testing.T) {
 		t.Errorf("text=%q want the unwrapped JSON object", resp.Text)
 	}
 
-	rider, ok := flagValue(argv(t, script), "--system-prompt")
+	rider, ok := flagValue(fake.argv(t), "--system-prompt")
 	if !ok || !strings.Contains(rider, "JSON Schema") {
 		t.Errorf("structured request must inject a JSON Schema rider; got %q", rider)
 	}
 }
 
 func TestComplete_StructuredNoJSONErrors(t *testing.T) {
-	script := fakeClaude(t, "", fakeOpts{stdout: "I cannot help with that."})
+	fake := fakeClaude(t, "", fakeOpts{Stdout: "I cannot help with that."})
 
-	p, _ := New(llm.ClaudeCLIConfig{Binary: script})
+	p, _ := New(llm.ClaudeCLIConfig{Binary: fake.binary})
 	defer p.Close()
 
 	if _, err := p.Complete(context.Background(), llm.CompletionRequest{
@@ -391,9 +448,9 @@ func TestComplete_StructuredNoJSONErrors(t *testing.T) {
 }
 
 func TestComplete_NonZeroExit(t *testing.T) {
-	script := fakeClaude(t, "", fakeOpts{exitCode: 2, stderr: "auth required"})
+	fake := fakeClaude(t, "", fakeOpts{ExitCode: 2, Stderr: "auth required"})
 
-	p, _ := New(llm.ClaudeCLIConfig{Binary: script})
+	p, _ := New(llm.ClaudeCLIConfig{Binary: fake.binary})
 	defer p.Close()
 
 	_, err := p.Complete(context.Background(), llm.CompletionRequest{
@@ -411,9 +468,9 @@ func TestComplete_NonZeroExit(t *testing.T) {
 // empty, so a stderr-only error message collapses a real diagnosis into
 // an opaque "exit status 1".
 func TestComplete_NonZeroExitFallsBackToStdout(t *testing.T) {
-	script := fakeClaude(t, "", fakeOpts{exitCode: 1, stdout: "Error: Reached max turns (1)"})
+	fake := fakeClaude(t, "", fakeOpts{ExitCode: 1, Stdout: "Error: Reached max turns (1)"})
 
-	p, _ := New(llm.ClaudeCLIConfig{Binary: script})
+	p, _ := New(llm.ClaudeCLIConfig{Binary: fake.binary})
 	defer p.Close()
 
 	_, err := p.Complete(context.Background(), llm.CompletionRequest{
@@ -428,9 +485,9 @@ func TestComplete_NonZeroExitFallsBackToStdout(t *testing.T) {
 }
 
 func TestComplete_EmptyResponseErrors(t *testing.T) {
-	script := fakeClaude(t, "", fakeOpts{stdout: ""})
+	fake := fakeClaude(t, "", fakeOpts{Stdout: ""})
 
-	p, _ := New(llm.ClaudeCLIConfig{Binary: script})
+	p, _ := New(llm.ClaudeCLIConfig{Binary: fake.binary})
 	defer p.Close()
 
 	if _, err := p.Complete(context.Background(), llm.CompletionRequest{
@@ -441,9 +498,9 @@ func TestComplete_EmptyResponseErrors(t *testing.T) {
 }
 
 func TestComplete_ContextCancellation(t *testing.T) {
-	script := fakeClaude(t, "", fakeOpts{stdout: "late", sleep: 2 * time.Second})
+	fake := fakeClaude(t, "", fakeOpts{Stdout: "late", Sleep: 2 * time.Second})
 
-	p, _ := New(llm.ClaudeCLIConfig{Binary: script, TimeoutSeconds: 1})
+	p, _ := New(llm.ClaudeCLIConfig{Binary: fake.binary, TimeoutSeconds: 1})
 	defer p.Close()
 
 	if _, err := p.Complete(context.Background(), llm.CompletionRequest{
@@ -454,9 +511,9 @@ func TestComplete_ContextCancellation(t *testing.T) {
 }
 
 func TestComplete_ExtraArgsForwarded(t *testing.T) {
-	script := fakeClaude(t, "", fakeOpts{stdout: "ok"})
+	fake := fakeClaude(t, "", fakeOpts{Stdout: "ok"})
 
-	p, _ := New(llm.ClaudeCLIConfig{Binary: script, Args: []string{"--permission-mode", "plan"}})
+	p, _ := New(llm.ClaudeCLIConfig{Binary: fake.binary, Args: []string{"--permission-mode", "plan"}})
 	defer p.Close()
 
 	if _, err := p.Complete(context.Background(), llm.CompletionRequest{
@@ -464,7 +521,7 @@ func TestComplete_ExtraArgsForwarded(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("Complete: %v", err)
 	}
-	if got, ok := flagValue(argv(t, script), "--permission-mode"); !ok || got != "plan" {
+	if got, ok := flagValue(fake.argv(t), "--permission-mode"); !ok || got != "plan" {
 		t.Errorf("--permission-mode=%q present=%v, want plan", got, ok)
 	}
 }
@@ -488,20 +545,21 @@ func TestFlatten_Roles(t *testing.T) {
 	}
 }
 
-// Sanity check: the test helper itself can run a child process. If
-// this fails the environment doesn't support `/bin/sh` and every
-// other subprocess test in this file will skip cleanly.
-func TestHelper_FakeScriptIsExecutable(t *testing.T) {
-	script := fakeClaude(t, "", fakeOpts{stdout: "alive"})
-	cmd := exec.Command(script, "ping")
+// Sanity check on the harness itself: re-execing the test binary really does
+// impersonate the CLI, on every OS. If this fails, every other subprocess
+// test in this file is testing nothing.
+func TestHelper_FakeCLIIsExecutable(t *testing.T) {
+	fake := fakeClaude(t, "", fakeOpts{Stdout: "alive"})
+	cmd := exec.Command(fake.binary, "ping")
 	cmd.Stdin = strings.NewReader("")
 	out, err := cmd.Output()
 	if err != nil {
-		// On a CI runner without /bin/sh, surface as skip instead of
-		// fail so we don't paint subprocess CI red.
-		t.Skipf("cannot exec fake script: %v", err)
+		t.Fatalf("exec fake CLI: %v", err)
 	}
 	if !strings.Contains(string(out), "alive") {
 		t.Errorf("output=%q", out)
+	}
+	if args := fake.argv(t); len(args) != 1 || args[0] != "ping" {
+		t.Errorf("argv=%q, want [ping]", args)
 	}
 }

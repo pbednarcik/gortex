@@ -211,6 +211,9 @@ func seedSidecarRows(t *testing.T, store *Store) {
 	}, nil)
 
 	mustNoErr(t, "file mtimes", store.BulkSetFileMtimes(sidecarSeedRepo, map[string]int64{"a.go": 11}))
+	mustNoErr(t, "file indexing failures", store.ReplaceFileIndexFailures(sidecarSeedRepo, []graph.FileIndexFailure{{
+		Path: "repo/unreadable.go", Error: "permission denied", PermissionDenied: true,
+	}}))
 	mustNoErr(t, "repo index state", store.SetRepoIndexState(graph.RepoIndexState{
 		RepoPrefix: sidecarSeedRepo, IndexedSHA: "sha-1", Dirty: true, IndexedAt: 42,
 		WorkspaceFP: "fp-1", NodeCount: 3, EdgeCount: 0, ExtractorVersions: `{"go":1}`,
@@ -280,6 +283,11 @@ func mustNoErr(t *testing.T, what string, err error) {
 func downgradeSidecarsToV14(t *testing.T, db *sql.DB) {
 	t.Helper()
 	for _, sidecar := range viewGenSidecars {
+		if sidecar.table == "file_index_failures" {
+			// This sidecar was introduced at v21; v14 had no table or rows.
+			execDDL(t, db, `DROP TABLE file_index_failures`)
+			continue
+		}
 		legacy, ok := legacySidecarShapes[sidecar.table]
 		if !ok {
 			t.Fatalf("no v14 fixture shape for sidecar %q", sidecar.table)
@@ -416,6 +424,12 @@ func TestSchemaV14StoreGainsSidecarViewGenerationKeys(t *testing.T) {
 	// Every sidecar kept exactly its seeded rows, all at the base generation.
 	for _, sidecar := range viewGenSidecars {
 		gens := rowViewGens(t, migrated.writerDB, sidecar.table)
+		if sidecar.table == "file_index_failures" {
+			if len(gens) != 0 {
+				t.Fatal("new failure sidecar must start empty after migrating v14")
+			}
+			continue
+		}
 		if len(gens) == 0 {
 			t.Fatalf("%s lost every row across the migration", sidecar.table)
 		}

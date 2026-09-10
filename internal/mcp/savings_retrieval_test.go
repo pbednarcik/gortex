@@ -191,9 +191,13 @@ func TestRetrievalBaselineCapsFilesPerCall(t *testing.T) {
 	srv, _, dir := newRetrievalSavingsServer(t, files)
 	ctx := WithSessionID(context.Background(), "session-cap")
 
+	// Graph paths are '/'-joined on every platform (the indexer folds every
+	// key through filepath.ToSlash), and so is every citation lifted off the
+	// wire — filepath.Join here would hand resolveGraphPath `myrepo\mod0.go`,
+	// which matches no repo prefix on Windows and credits nothing.
 	cited := make([]string, 0, files)
 	for i := range files {
-		cited = append(cited, filepath.Join("myrepo", fmt.Sprintf("mod%d.go", i)))
+		cited = append(cited, fmt.Sprintf("myrepo/mod%d.go", i))
 	}
 	srv.recordFileSetBaselineSavings(ctx, "search_symbols", cited, "a retrieval page")
 

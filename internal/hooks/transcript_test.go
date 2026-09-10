@@ -54,9 +54,15 @@ func TestCaptureModelHint_FromTranscript(t *testing.T) {
 	if err := os.WriteFile(tp, []byte(`{"type":"assistant","message":{"model":"gpt-4.1"}}`+"\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	// PreToolUse has no model field — it falls back to the transcript.
-	payload := `{"hook_event_name":"PreToolUse","cwd":"/work/repo","transcript_path":"` + tp + `"}`
-	captureModelHint([]byte(payload))
+	// PreToolUse has no model field — it falls back to the transcript. The
+	// payload is marshalled rather than concatenated because tp is a native
+	// path: pasting `C:\Users\…` into a JSON string literal produces invalid
+	// escapes and the whole payload fails to decode.
+	captureModelHint(mustJSON(t, map[string]any{
+		"hook_event_name": "PreToolUse",
+		"cwd":             "/work/repo",
+		"transcript_path": tp,
+	}))
 	if h, ok := modelhint.Read("/work/repo"); !ok || h.Model != "gpt-4.1" {
 		t.Fatalf("hint from transcript = %+v, ok=%v", h, ok)
 	}

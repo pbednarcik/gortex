@@ -122,7 +122,7 @@ func Publish(token string, receipt Receipt) bool {
 	if err := tmp.Close(); err != nil {
 		return false
 	}
-	if err := os.Rename(tmpPath, path); err != nil {
+	if err := platform.ReplaceFile(tmpPath, path); err != nil {
 		return false
 	}
 	committed = true
@@ -132,23 +132,19 @@ func Publish(token string, receipt Receipt) bool {
 
 // Consume atomically claims and removes one receipt. Concurrent or repeated
 // consumers cannot observe the same terminal result.
+//
+// The claim is an exclusive marker rather than a rename: POSIX rename(2)
+// hands a contended receipt to exactly one caller, but on Windows two racing
+// MoveFileEx calls on one source can both fail with a sharing violation and
+// leave the receipt claimed by nobody, which silently disarms the terminal
+// contract. platform.ConsumeFile arbitrates the race the same way everywhere.
 func Consume(token string) (Receipt, bool) {
 	path, digest, ok := receiptPath(token)
 	if !ok {
 		return Receipt{}, false
 	}
-	claimToken, ok := NewToken()
+	data, ok := platform.ConsumeFile(path)
 	if !ok {
-		return Receipt{}, false
-	}
-	claimPath := path + ".consume-" + claimToken + ".json"
-	if err := os.Rename(path, claimPath); err != nil {
-		return Receipt{}, false
-	}
-	defer os.Remove(claimPath) //nolint:errcheck // one-shot cleanup is best effort
-
-	data, err := os.ReadFile(claimPath)
-	if err != nil {
 		return Receipt{}, false
 	}
 	var envelope receiptEnvelope
@@ -218,16 +214,27 @@ func trimReceipts(dir, preserve string) {
 	}
 	files := make([]receiptFile, 0, len(entries))
 	for _, entry := range entries {
-		if entry.IsDir() || !strings.HasSuffix(entry.Name(), ".json") {
+		if entry.IsDir() {
 			continue
 		}
-		path := filepath.Join(dir, entry.Name())
+		name := entry.Name()
+		receipt := strings.HasSuffix(name, ".json")
+		// A claim marker outlives its consumer only when that process died
+		// mid-claim; age it out with the receipts but never count it against
+		// the cap, so a marker cannot evict a live receipt.
+		if !receipt && !strings.HasSuffix(name, platform.ClaimMarkerSuffix) {
+			continue
+		}
+		path := filepath.Join(dir, name)
 		info, err := entry.Info()
 		if err != nil {
 			continue
 		}
 		if time.Since(info.ModTime()) > receiptTTL && path != preserve {
 			_ = os.Remove(path)
+			continue
+		}
+		if !receipt {
 			continue
 		}
 		files = append(files, receiptFile{path: path, modTime: info.ModTime()})

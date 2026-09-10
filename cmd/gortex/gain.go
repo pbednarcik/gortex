@@ -335,6 +335,10 @@ func loadHistory(cacheDir string, since time.Duration) (*gainHistory, error) {
 	if err != nil {
 		return nil, err
 	}
+	// One-shot read: release the sidecar handle before returning. Leaving it
+	// open pins the sqlite file for the rest of the process, which on Windows
+	// makes the containing directory undeletable.
+	defer func() { _ = store.Close() }()
 	// Same rule as `gortex savings`: the legacy import only runs against
 	// the default location — a --cache-dir read must not rename files.
 	if cacheDir == "" {

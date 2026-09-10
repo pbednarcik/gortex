@@ -99,7 +99,7 @@ func (idx *Indexer) semanticDependencyFrontierForDeletedFiles(relPaths []string)
 	graphPaths := make([]string, 0, len(relPaths))
 	for _, relPath := range relPaths {
 		if relPath != "" {
-			graphPaths = append(graphPaths, idx.prefixPath(filepath.FromSlash(relPath)))
+			graphPaths = append(graphPaths, idx.prefixPath(relPath))
 		}
 	}
 	graphPaths = appendUniqueSorted(nil, graphPaths...)

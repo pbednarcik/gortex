@@ -8,6 +8,7 @@ import (
 	"sort"
 	"strconv"
 	"sync"
+	"time"
 
 	"github.com/knights-analytics/hugot"
 	"github.com/knights-analytics/hugot/pipelines"
@@ -239,11 +240,81 @@ func ensureHugotModel(spec HugotVariant) (string, error) {
 
 	opts := hugot.NewDownloadOptions()
 	opts.OnnxFilePath = spec.OnnxFile
-	path, err := hugot.DownloadModel(context.Background(), spec.RepoID, dest, opts)
+	path, err := downloadHugotModel(spec, dest, opts)
 	if err != nil {
 		return "", fmt.Errorf("download %s (%s): %w", spec.RepoID, spec.OnnxFile, err)
 	}
 	return path, nil
+}
+
+// embeddingDownloadBudgetEnv overrides how long a first-use model
+// download may take before it is abandoned. Accepts any Go duration
+// ("90s", "5m"); an unset or unparseable value keeps the default.
+const embeddingDownloadBudgetEnv = "GORTEX_EMBEDDING_DOWNLOAD_TIMEOUT"
+
+// defaultDownloadBudget bounds a cold model fetch. MiniLM is ~90MB and
+// lands in well under a minute on a working link, so ten minutes is
+// generous for a slow one and still short enough that a wedged
+// connection degrades to the static provider instead of stalling the
+// process that asked for an embedder.
+const defaultDownloadBudget = 10 * time.Minute
+
+// downloadBudget resolves the wall-clock budget for one model download.
+func downloadBudget() time.Duration {
+	if d, err := time.ParseDuration(os.Getenv(embeddingDownloadBudgetEnv)); err == nil && d > 0 {
+		return d
+	}
+	return defaultDownloadBudget
+}
+
+// hugotDownloadModel is the upstream fetch, indirected so the watchdog
+// below can be tested against a stalled download without a network.
+var hugotDownloadModel = hugot.DownloadModel
+
+// downloadHugotModel fetches a model repo under a wall-clock budget and
+// gives up rather than blocking forever on a stalled transfer. The
+// returned error wraps context.DeadlineExceeded when the budget ran out,
+// so a caller can tell "the network stalled" from "the model is broken".
+//
+// The budget has to be enforced out here because nothing inside the
+// download honours one. hugot.DownloadModel takes a context but only
+// passes it to the post-download file copy: the fetch itself goes
+// through hub.Repo.DownloadFiles, which starts from
+// context.Background(). Under that, go-huggingface builds its own
+// http.Client per request with no Timeout and exposes no hook to supply
+// one, and its worker pool waits on a plain sync.Cond that no context
+// can interrupt — which is exactly how a stalled transfer parks the
+// caller in Semaphore.Acquire indefinitely. So the fetch runs on its own
+// goroutine and this call abandons it when the budget is spent; the
+// orphan finishes into a buffered channel and exits whenever the
+// connection finally breaks, leaving only a discarded ".part" file the
+// next download overwrites.
+func downloadHugotModel(spec HugotVariant, dest string, opts hugot.DownloadOptions) (string, error) {
+	budget := downloadBudget()
+	ctx, cancel := context.WithTimeout(context.Background(), budget)
+	defer cancel()
+
+	type outcome struct {
+		path string
+		err  error
+	}
+	// Read the indirection here, not inside the goroutine: the goroutine
+	// can outlive this call by design, and a test that restores the
+	// original fetch would otherwise be writing the variable while the
+	// abandoned goroutine still reads it.
+	fetch := hugotDownloadModel
+	done := make(chan outcome, 1)
+	go func() {
+		path, err := fetch(ctx, spec.RepoID, dest, opts)
+		done <- outcome{path: path, err: err}
+	}()
+
+	select {
+	case got := <-done:
+		return got.path, got.err
+	case <-ctx.Done():
+		return "", fmt.Errorf("no progress within %s: %w", budget, ctx.Err())
+	}
 }
 
 // hfCacheDirName turns a HuggingFace repo path ("org/name") into the

@@ -53,10 +53,17 @@ func TestRead_StaleIgnored(t *testing.T) {
 	Write("/work/repo", "claude-opus-4-8", "claude-code")
 
 	// Backdate the per-cwd file beyond the trust window by rewriting it
-	// through the same path with a stale Updated stamp.
-	stale := Hint{CWD: "/work/repo", Model: "claude-opus-4-8", Updated: time.Now().Add(-2 * ttl).UnixNano()}
+	// through the same path with a stale Updated stamp. Write and Read both
+	// key the file on filepath.Abs(cwd), which on Windows turns "/work/repo"
+	// into "<drive>:\work\repo" — hashing the raw spelling here would target a
+	// different file and leave the fresh hint in place.
+	abs, err := filepath.Abs("/work/repo")
+	if err != nil {
+		t.Fatal(err)
+	}
+	stale := Hint{CWD: abs, Model: "claude-opus-4-8", Updated: time.Now().Add(-2 * ttl).UnixNano()}
 	data, _ := json.Marshal(stale)
-	writeFileAtomic(cwdFile(dir, "/work/repo"), data)
+	writeFileAtomic(cwdFile(dir, abs), data)
 	writeFileAtomic(filepath.Join(dir, lastFile), data)
 
 	if h, ok := Read("/work/repo"); ok {
